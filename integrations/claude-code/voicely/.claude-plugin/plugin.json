@@ -1,0 +1,22 @@
+{
+  "name": "voicely",
+  "displayName": "Voicely",
+  "version": "1.0.0",
+  "description": "Offline voice-to-text for your agent. Exposes Voicely's local WhisperKit transcription and FluidAudio speaker diarization as MCP tools: transcribe audio/video files and read saved dictations, calls, and file transcripts.",
+  "author": {
+    "name": "Voicely",
+    "url": "https://github.com/StulkovLD/Voicely"
+  },
+  "homepage": "https://voicely.art",
+  "repository": "https://github.com/StulkovLD/Voicely",
+  "license": "MIT",
+  "keywords": [
+    "voice",
+    "transcription",
+    "speech-to-text",
+    "diarization",
+    "whisper",
+    "offline",
+    "mcp"
+  ]
+}
