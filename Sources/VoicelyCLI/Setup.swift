@@ -76,7 +76,16 @@ struct Setup: ParsableCommand {
             logErr("Note: \(binDir) is not on your PATH. Add it, e.g.:")
             logErr("  echo 'export PATH=\"\(binDir):$PATH\"' >> ~/.zshrc && source ~/.zshrc")
         }
-        emitLine("Now agents can run `voicely mcp` (e.g. via the Claude Code plugin).")
+        // Turnkey: register the MCP server in every agent harness the user has,
+        // so `voicely setup` (and the website installer that calls it) wires up
+        // Claude Code / Codex / Cursor / Hermes / OpenClaw in one shot.
+        emitLine("\nConnecting installed agent harnesses…")
+        let out = HarnessRegistry.connect([], voicelyPath: Self.currentExecutablePath())
+        if out.connected.isEmpty && out.failed.isEmpty {
+            emitLine("No agent harness detected. Install one, then run `voicely connect`.")
+        } else {
+            emitLine("Restart your agent(s) to pick up the 'voicely' tools.")
+        }
     }
 
     private func isSymlink(_ path: String) -> Bool {

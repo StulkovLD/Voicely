@@ -3,10 +3,11 @@
 **Local-first voice toolkit for macOS.** Dictation with cursor injection + call recording with speaker diarization. Fully offline. Open source.
 
 <p align="center">
-  <img src="https://img.shields.io/badge/platform-macOS-lightgrey" />
+  <a href="https://github.com/StulkovLD/Voicely/actions/workflows/ci.yml"><img src="https://github.com/StulkovLD/Voicely/actions/workflows/ci.yml/badge.svg" /></a>
+  <img src="https://img.shields.io/badge/platform-macOS%2014%2B-lightgrey" />
   <img src="https://img.shields.io/badge/swift-6.0-orange" />
   <img src="https://img.shields.io/badge/license-MIT-green" />
-  <img src="https://img.shields.io/badge/engine-Apple%20Speech%20%2B%20WhisperKit-blue" />
+  <img src="https://img.shields.io/badge/engine-WhisperKit%20%2B%20FluidAudio-blue" />
 </p>
 
 ## What it does
@@ -107,46 +108,39 @@ swift build -c release --product VoicelyCLI
 > such collision. No daemon: the server loads the WhisperKit model itself on the
 > first `transcribe_file` call (models download once, on first use).
 
-### 2a. Claude Code (plugin)
+### 2. Connect your agents — one command
 
-A ready-made plugin lives in [`integrations/claude-code/voicely/`](integrations/claude-code/voicely/)
-(manifest + `.mcp.json` + skill). Point Claude Code at that directory, enable the
-plugin, and approve the `voicely` MCP server when prompted. The bundled skill
-teaches the agent when to reach for each tool. See its
-[README](integrations/claude-code/voicely/README.md) for details and a no-install
-(absolute-path-to-binary) variant.
+`voicely mcp` speaks standard stdio MCP, so it works with **any** MCP-capable
+harness. `voicely setup` (run automatically by the website installer) detects the
+agents you have and registers Voicely in each of them for you:
 
-### 2b. Any stdio-MCP harness (Codex and others)
-
-Register `voicely mcp` as an MCP server. The shape is the same everywhere:
-
-```json
-{
-  "mcpServers": {
-    "voicely": {
-      "command": "voicely",
-      "args": ["mcp"]
-    }
-  }
-}
+```bash
+voicely connect            # every installed harness
+voicely connect codex      # just one
 ```
 
-Or point straight at the built binary with no install:
+It uses each harness's own `mcp add` command, so it never hand-edits a config
+file it doesn't own. Currently wires up **Claude Code, Codex, Cursor, Hermes, and
+OpenClaw**. Restart the agent afterward and ask it: *"transcribe
+~/Downloads/interview.m4a and pull the action items"*, *"look at my last call and
+draft a project plan"*, *"what did I dictate earlier?"*.
 
-```json
-{
-  "mcpServers": {
-    "voicely": {
-      "command": "/absolute/path/to/.build/release/VoicelyCLI",
-      "args": ["mcp"]
-    }
-  }
-}
-```
+### 3. Manual config (if you'd rather)
 
-Then ask your agent: "transcribe ~/Downloads/interview.m4a and pull the action
-items", "look at my last call and draft a project plan", "what did I dictate
-earlier?".
+Register `voicely mcp` as a stdio MCP server. The exact file differs per harness;
+the shape is always `command: voicely`, `args: ["mcp"]`.
+
+| Harness | Where | How |
+|---|---|---|
+| Claude Code | plugin or `claude mcp add` | `claude mcp add voicely -- voicely mcp` (or the [bundled plugin](integrations/claude-code/voicely/)) |
+| Codex | `~/.codex/config.toml` | `[mcp_servers.voicely]`<br>`command = "voicely"`<br>`args = ["mcp"]` |
+| Cursor | user settings | `cursor --add-mcp '{"name":"voicely","command":"voicely","args":["mcp"]}'` |
+| Hermes | `~/.hermes/config.yaml` | `hermes mcp add voicely --command voicely --args mcp` |
+| OpenClaw | `openclaw.json` | `openclaw mcp set voicely --command voicely --args mcp` |
+| Anything else | its MCP config | `{"mcpServers":{"voicely":{"command":"voicely","args":["mcp"]}}}` |
+
+No daemon: the server loads the WhisperKit model itself on the first
+`transcribe_file` call (the model downloads once, on first use).
 
 ## Architecture
 

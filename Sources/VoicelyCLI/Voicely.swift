@@ -25,6 +25,7 @@ struct Voicely: AsyncParsableCommand {
             Status.self,
             Mcp.self,  // N3b: stdio MCP server (`voicely mcp`).
             Setup.self,  // install `voicely` on PATH for MCP harnesses.
+            Connect.self,  // register the MCP server in agent harnesses (turnkey).
         ],
         defaultSubcommand: nil
     )
