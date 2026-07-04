@@ -8,7 +8,7 @@ import Foundation
 // NOTE (#107): vlog() opens/seeks/closes the file handle on every call.
 // This is acceptable because it only runs in DEBUG builds and is not called
 // in hot loops. If profiling shows I/O overhead, refactor to a retained handle.
-private func vlog(_ message: String) {
+func vlog(_ message: String) {
     #if DEBUG
     let line = "[\(Date())] \(message)\n"
     let logDir = FileManager.default.homeDirectoryForCurrentUser
@@ -32,20 +32,43 @@ public protocol TranscriberEngine: Sendable {
     func transcribe(audio: AVAudioPCMBuffer, translate: Bool, language: String?) async throws -> String
 }
 
+protocol PreloadableTranscriberEngine: TranscriberEngine {
+    func preload() async throws
+}
+
+protocol CancelableTranscriberEngine: TranscriberEngine {
+    func cancel()
+}
+
+protocol DownloadReportingTranscriberEngine: TranscriberEngine {
+    var isCurrentlyDownloading: Bool { get }
+}
+
+protocol LanguageSessionResettable: TranscriberEngine {
+    func resetLanguageSession()
+}
+
 // MARK: - Model Selection
 
 public struct WhisperModel: Sendable, Equatable {
+    public enum Backend: Sendable, Equatable {
+        case whisperKit
+        case gigaAMV3E2ERNNT
+    }
+
     public let variant: String
     public let displayName: String
     public let sizeLabel: String
     public let sizeBytes: UInt64
     public let minRAMGB: UInt64
+    public let backend: Backend
 
     public static let all: [WhisperModel] = [
-        WhisperModel(variant: "large-v3_turbo", displayName: "Large V3 Turbo", sizeLabel: "~3 GB", sizeBytes: 3_200_000_000, minRAMGB: 16),
-        WhisperModel(variant: "large-v3-v20240930_turbo_632MB", displayName: "Large V3 Turbo Q", sizeLabel: "~632 MB", sizeBytes: 650_000_000, minRAMGB: 8),
-        WhisperModel(variant: "small", displayName: "Small", sizeLabel: "~460 MB", sizeBytes: 460_000_000, minRAMGB: 4),
-        WhisperModel(variant: "base", displayName: "Base", sizeLabel: "~140 MB", sizeBytes: 140_000_000, minRAMGB: 4),
+        WhisperModel(variant: "large-v3_turbo", displayName: "Large V3 Turbo", sizeLabel: "~3 GB", sizeBytes: 3_200_000_000, minRAMGB: 16, backend: .whisperKit),
+        WhisperModel(variant: "large-v3-v20240930_turbo_632MB", displayName: "Large V3 Turbo Q", sizeLabel: "~632 MB", sizeBytes: 650_000_000, minRAMGB: 8, backend: .whisperKit),
+        WhisperModel(variant: "small", displayName: "Small", sizeLabel: "~460 MB", sizeBytes: 460_000_000, minRAMGB: 4, backend: .whisperKit),
+        WhisperModel(variant: "base", displayName: "Base", sizeLabel: "~140 MB", sizeBytes: 140_000_000, minRAMGB: 4, backend: .whisperKit),
+        WhisperModel(variant: "gigaam-v3-e2e-rnnt", displayName: "GigaAM V3 RU", sizeLabel: "~426 MB", sizeBytes: 430_000_000, minRAMGB: 8, backend: .gigaAMV3E2ERNNT),
     ]
 
     public static var systemRAMGB: UInt64 {
@@ -96,11 +119,47 @@ public struct WhisperModel: Sendable, Equatable {
         return candidate
     }
 
+    /// Resolve the model directory for a specific working directory context.
+    ///
+    /// GigaAM gets a repo-local override when the current process is running
+    /// from a checkout of this repo, so local-only/community assets can live in
+    /// `.local/models/...` and stay untracked. Installed app / non-repo runs
+    /// fall back to the user-wide Documents cache.
+    func resolvedModelDirectory(currentDirectoryPath: String) -> URL {
+        switch backend {
+        case .whisperKit:
+            return FileManager.default.homeDirectoryForCurrentUser
+                .appendingPathComponent("Documents/huggingface/models/argmaxinc/whisperkit-coreml")
+                .appendingPathComponent("openai_whisper-\(variant)")
+        case .gigaAMV3E2ERNNT:
+            if let repoRoot = Self.repoRoot(startingAt: URL(fileURLWithPath: currentDirectoryPath, isDirectory: true)) {
+                return repoRoot
+                    .appendingPathComponent(".local/models/gigaam/v3-e2e-rnnt")
+            }
+            return FileManager.default.homeDirectoryForCurrentUser
+                .appendingPathComponent("Documents/huggingface/models/smkrv/gigaam-v3-e2e-rnnt-coreml")
+        }
+    }
+
     /// Model directory on disk.
     public var modelDirectory: URL {
-        FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Documents/huggingface/models/argmaxinc/whisperkit-coreml")
-            .appendingPathComponent("openai_whisper-\(variant)")
+        resolvedModelDirectory(currentDirectoryPath: FileManager.default.currentDirectoryPath)
+    }
+
+    private static func repoRoot(startingAt start: URL) -> URL? {
+        var candidate = start.standardizedFileURL
+        let fm = FileManager.default
+        for _ in 0..<8 {
+            let package = candidate.appendingPathComponent("Package.swift")
+            let sources = candidate.appendingPathComponent("Sources")
+            if fm.fileExists(atPath: package.path), fm.fileExists(atPath: sources.path) {
+                return candidate
+            }
+            let parent = candidate.deletingLastPathComponent()
+            if parent.path == candidate.path { break }
+            candidate = parent
+        }
+        return nil
     }
 
     /// Filesystem path of `modelDirectory`. Public so the headless CLI can report
@@ -188,8 +247,15 @@ public final class Transcriber {
     private func resolveEngine() -> any TranscriberEngine {
         if let engine = self.engine { return engine }
 
-        vlog("Using WhisperKit, model: \(selectedModel.variant) (RAM: \(WhisperModel.systemRAMGB) GB)")
-        let e = WhisperKitEngine(model: selectedModel, onProgress: onProgress)
+        let e: any TranscriberEngine
+        switch selectedModel.backend {
+        case .whisperKit:
+            vlog("Using WhisperKit, model: \(selectedModel.variant) (RAM: \(WhisperModel.systemRAMGB) GB)")
+            e = WhisperKitEngine(model: selectedModel, onProgress: onProgress)
+        case .gigaAMV3E2ERNNT:
+            vlog("Using GigaAM v3, model: \(selectedModel.variant) (RAM: \(WhisperModel.systemRAMGB) GB)")
+            e = GigaAMEngine(model: selectedModel, onProgress: onProgress)
+        }
         self.engine = e
         return e
     }
@@ -206,19 +272,19 @@ public final class Transcriber {
     /// fresh detect-then-latch cycle runs (Fix 1.1). Does not change
     /// `preferredLanguage`. No-op until the engine has been created.
     public func resetLanguageSession() {
-        (engine as? WhisperKitEngine)?.resetLanguageSession()
+        (engine as? any LanguageSessionResettable)?.resetLanguageSession()
     }
 
     /// Whether a download is currently in progress.
     public var isDownloading: Bool {
-        guard let whisper = engine as? WhisperKitEngine else { return false }
-        return whisper.isCurrentlyDownloading
+        guard let downloadable = engine as? any DownloadReportingTranscriberEngine else { return false }
+        return downloadable.isCurrentlyDownloading
     }
 
     /// Cancel any in-progress download, model load, or transcription.
     public func cancelCurrentTask() {
-        guard let whisper = engine as? WhisperKitEngine else { return }
-        whisper.cancel()
+        guard let cancelable = engine as? any CancelableTranscriberEngine else { return }
+        cancelable.cancel()
     }
 
     /// Cancel and reset engine without deleting downloaded model files.
@@ -250,9 +316,9 @@ public final class Transcriber {
     /// Download and load model on first launch so it's ready when user dictates.
     public func preloadModel() async throws {
         let engine = resolveEngine()
-        guard let whisper = engine as? WhisperKitEngine else { return }
+        guard let preloadable = engine as? any PreloadableTranscriberEngine else { return }
         do {
-            try await whisper.preload()
+            try await preloadable.preload()
             vlog("Model preloaded successfully")
         } catch {
             // Fix 1.2: do NOT delete here. Deletion of a corrupted model now
@@ -309,12 +375,12 @@ public final class Transcriber {
         samples: [Float],
         sampleRate: Double,
         speaker: CallSpeaker,
-        startOffsetSec: Double
+        startOffsetSec: Double,
+        forcedLanguage: String? = nil
     ) async throws -> [DialogueSegment] {
         guard !samples.isEmpty else { return [] }
         let engine = resolveEngine()
         syncEnginePreferences(engine)
-        guard let whisper = engine as? WhisperKitEngine else { return [] }
 
         let resampled = try Self.resampleSamples(samples, fromRate: sampleRate, toRate: 16000)
         guard !resampled.isEmpty else { return [] }
@@ -323,11 +389,22 @@ public final class Transcriber {
 
         let result: WhisperTranscription
         do {
-            result = try await whisper.transcribeChannelSamples(
-                resampled,
-                translate: translateToEnglish,
-                speaker: speaker
-            )
+            if let whisper = engine as? WhisperKitEngine {
+                result = try await whisper.transcribeChannelSamples(
+                    resampled,
+                    translate: translateToEnglish,
+                    speaker: speaker,
+                    forcedLanguage: forcedLanguage
+                )
+            } else if let sampleEngine = engine as? any SampleTranscribing {
+                result = try await sampleEngine.transcribeSamples(
+                    resampled,
+                    translate: translateToEnglish,
+                    language: forcedLanguage
+                )
+            } else {
+                return []
+            }
         } catch TranscriberError.silentAudio {
             return []
         } catch TranscriberError.recordingTooShort {
@@ -733,7 +810,7 @@ private func withDeadline<T>(
 
 // MARK: - WhisperKit Engine (primary - SFSpeechRecognizer broken on macOS 26)
 
-final class WhisperKitEngine: @unchecked Sendable, TranscriberEngine, SampleTranscribing {
+final class WhisperKitEngine: @unchecked Sendable, TranscriberEngine, SampleTranscribing, PreloadableTranscriberEngine, CancelableTranscriberEngine, DownloadReportingTranscriberEngine, LanguageSessionResettable {
     /// WhisperKit stages the model into `.cache/...incomplete` then moves it
     /// into place, and CoreML compiles it for local hardware. That pipeline
     /// peaks at roughly 2.5x the final model size on disk.
@@ -878,12 +955,19 @@ final class WhisperKitEngine: @unchecked Sendable, TranscriberEngine, SampleTran
     /// treated as ambiguous and biased toward `candidateLanguages()`.
     nonisolated static let languageConfidenceThreshold: Float = 0.6
 
-    /// The user's likely languages: the system locale's language plus English.
+    /// The user's likely languages: preferred system languages, current locale,
+    /// plus English as a safe fallback.
     nonisolated static func candidateLanguages() -> Set<String> {
         var set: Set<String> = ["en"]
         if let code = Locale.current.language.languageCode?.identifier.lowercased(),
            !code.isEmpty {
             set.insert(code)
+        }
+        for preferred in Locale.preferredLanguages {
+            if let code = Locale(identifier: preferred).language.languageCode?.identifier.lowercased(),
+               !code.isEmpty {
+                set.insert(code)
+            }
         }
         return set
     }
@@ -1219,13 +1303,14 @@ final class WhisperKitEngine: @unchecked Sendable, TranscriberEngine, SampleTran
     func transcribeChannelSamples(
         _ samples: [Float],
         translate: Bool,
-        speaker: CallSpeaker
+        speaker: CallSpeaker,
+        forcedLanguage: String? = nil
     ) async throws -> WhisperTranscription {
         try await transcribeSamplesCore(
             samples,
             translate: translate,
             latchKey: .channel(speaker),
-            forcedLanguage: nil
+            forcedLanguage: forcedLanguage
         )
     }
 
@@ -1695,7 +1780,7 @@ final class WhisperKitEngine: @unchecked Sendable, TranscriberEngine, SampleTran
     // MARK: - Resampling
 
     /// Resample audio to 16kHz mono Float32 (WhisperKit requirement).
-    private static func resampleTo16kHz(_ buffer: AVAudioPCMBuffer) throws -> AVAudioPCMBuffer {
+    static func resampleTo16kHz(_ buffer: AVAudioPCMBuffer) throws -> AVAudioPCMBuffer {
         let targetRate: Double = 16000
         let currentRate = buffer.format.sampleRate
 
