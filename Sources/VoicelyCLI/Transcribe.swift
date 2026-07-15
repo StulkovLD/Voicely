@@ -59,23 +59,27 @@ struct Transcribe: AsyncParsableCommand {
             throw ValidationError("File not found: \(fileURL.path)")
         }
 
-        let job = await TranscribeJob(
+        let job = TranscribeJob(
             fileURL: fileURL,
             diarize: diarize,
             forcedLanguage: language.forcedCode,
             modelVariant: model
         )
         let result = try await job.execute()
+        try Task.checkCancellation()
 
         let rendered = Self.render(
             result,
             format: format,
             timestamps: timestamps
         )
+        try Task.checkCancellation()
         emit(rendered.hasSuffix("\n") ? rendered : rendered + "\n")
 
         if save {
+            try Task.checkCancellation()
             try await result.persist(timestamps: timestamps, format: format)
+            try Task.checkCancellation()
             logErr("Saved transcript under \(TranscriptStore.directory(for: .files).path)")
         }
     }
@@ -94,45 +98,21 @@ struct Transcribe: AsyncParsableCommand {
         case .jsonl:
             return CallTranscriptMerger.jsonlFormat(segments: result.dialogue)
         case .md, .txt:
-            if result.hasSpeakers {
-                // File-appropriate labelled output: "Speaker N" per segment, no
-                // microphone "You" line (that's call-only). Mirrors the writer's
-                // diarized document so stdout matches --save output.
-                return renderLabelled(result.dialogue, timestamps: timestamps)
-            }
-            if timestamps {
-                return result.segments.map { seg in
-                    "[\(mmss(seg.start)) → \(mmss(seg.end))] \(seg.text.trimmingCharacters(in: .whitespacesAndNewlines))"
-                }.joined(separator: "\n")
-            }
-            return result.transcript
+            let options = FileTranscriptionOptions(
+                content: timestamps ? .timestamps : .plain,
+                format: format == .txt ? .plainText : .markdown,
+                diarize: result.diarizedSegments != nil
+            )
+            let input = FileTranscriptWriter.Input(
+                sourceURL: result.sourceURL,
+                transcript: result.transcript,
+                segments: result.segments,
+                options: options,
+                language: result.language,
+                modelName: result.modelName,
+                diarizedSegments: result.diarizedSegments
+            )
+            return FileTranscriptWriter.renderBody(input: input)
         }
-    }
-
-    /// "Speaker N:" prefixed body with a leading legend, optionally timestamped.
-    private static func renderLabelled(
-        _ segments: [DialogueSegment],
-        timestamps: Bool
-    ) -> String {
-        let ids = CallTranscriptMerger.detectedSpeakerIDs(in: segments)
-        var legendLines = ["Speakers detected: \(ids.count)"]
-        for id in ids { legendLines.append("- Speaker \(id)") }
-        let legend = legendLines.joined(separator: "\n")
-
-        let body = segments.map { seg -> String in
-            let label = seg.speakerID.map { "Speaker \($0)" } ?? "Speaker ?"
-            let text = seg.text.trimmingCharacters(in: .whitespacesAndNewlines)
-            if timestamps {
-                return "[\(mmss(seg.start)) → \(mmss(seg.end))] \(label): \(text)"
-            }
-            return "\(label): \(text)"
-        }.joined(separator: "\n")
-
-        return ids.isEmpty ? body : (legend + "\n\n" + body)
-    }
-
-    private static func mmss(_ seconds: Double) -> String {
-        let total = Int(seconds.rounded())
-        return String(format: "%02d:%02d", total / 60, total % 60)
     }
 }

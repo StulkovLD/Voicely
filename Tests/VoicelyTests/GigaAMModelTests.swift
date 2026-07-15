@@ -16,40 +16,68 @@ final class GigaAMModelTests: XCTestCase {
             return
         }
         XCTAssertTrue(
-            model.modelDirectoryPath.contains(".local/models/gigaam/v3-e2e-rnnt")
-                || model.modelDirectoryPath.contains("Documents/huggingface/models/smkrv/gigaam-v3-e2e-rnnt-coreml"),
-            "GigaAM model must not reuse WhisperKit's openai_whisper-* cache path; got: \(model.modelDirectoryPath)"
+            model.resolvedModelDirectory(environment: [:]).path
+                .contains("Documents/huggingface/models/smkrv/gigaam-v3-e2e-rnnt-coreml"),
+            "GigaAM production storage must be stable and independent of cwd"
         )
     }
 
-    func testGigaAMModelPrefersRepoLocalUntrackedDirectoryWhenRepoRootDetected() throws {
+    func testGigaAMModelUsesRepoLocalDirectoryOnlyForExplicitVerifiedDebugOverride() throws {
         guard let model = WhisperModel.all.first(where: { $0.variant == "gigaam-v3-e2e-rnnt" }) else {
             XCTFail("expected GigaAM v3 model in WhisperModel.all")
             return
         }
         let repoRoot = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
-        try FileManager.default.createDirectory(at: repoRoot, withIntermediateDirectories: true)
+        try makeRepositoryFixture(at: repoRoot)
         defer { try? FileManager.default.removeItem(at: repoRoot) }
-        FileManager.default.createFile(atPath: repoRoot.appendingPathComponent("Package.swift").path, contents: Data("// marker".utf8))
-        try FileManager.default.createDirectory(at: repoRoot.appendingPathComponent("Sources"), withIntermediateDirectories: true)
 
-        let resolved = model.resolvedModelDirectory(currentDirectoryPath: repoRoot.path)
+        let resolved = model.resolvedModelDirectory(environment: [
+            "VOICELY_GIGAAM_DEV_REPO_ROOT": repoRoot.path,
+        ])
         XCTAssertEqual(
             resolved.path,
             repoRoot.appendingPathComponent(".local/models/gigaam/v3-e2e-rnnt").path
         )
     }
 
-    func testGigaAMModelFallsBackToDocumentsCacheOutsideRepo() {
+    func testGigaAMModelRejectsGenericPackageAsDevelopmentOverride() throws {
         guard let model = WhisperModel.all.first(where: { $0.variant == "gigaam-v3-e2e-rnnt" }) else {
             XCTFail("expected GigaAM v3 model in WhisperModel.all")
             return
         }
-        let resolved = model.resolvedModelDirectory(currentDirectoryPath: "/tmp/not-a-repo")
+        let fakeRoot = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: fakeRoot.appendingPathComponent("Sources"), withIntermediateDirectories: true)
+        FileManager.default.createFile(
+            atPath: fakeRoot.appendingPathComponent("Package.swift").path,
+            contents: Data("let package = Package(name: \"AnotherProduct\")".utf8)
+        )
+        defer { try? FileManager.default.removeItem(at: fakeRoot) }
+
+        let resolved = model.resolvedModelDirectory(environment: [
+            "VOICELY_GIGAAM_DEV_REPO_ROOT": fakeRoot.path,
+        ])
         XCTAssertTrue(
             resolved.path.contains("Documents/huggingface/models/smkrv/gigaam-v3-e2e-rnnt-coreml"),
-            "outside repo root, GigaAM must fall back to Documents cache; got: \(resolved.path)"
+            "a generic Swift package must not redirect model storage"
         )
+    }
+
+    func testGigaAMModelRejectsSymlinkedDevelopmentRoot() throws {
+        guard let model = WhisperModel.all.first(where: { $0.variant == "gigaam-v3-e2e-rnnt" }) else {
+            XCTFail("expected GigaAM v3 model in WhisperModel.all")
+            return
+        }
+        let parent = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let repoRoot = parent.appendingPathComponent("repo")
+        let link = parent.appendingPathComponent("repo-link")
+        try makeRepositoryFixture(at: repoRoot)
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: repoRoot)
+        defer { try? FileManager.default.removeItem(at: parent) }
+
+        let resolved = model.resolvedModelDirectory(environment: [
+            "VOICELY_GIGAAM_DEV_REPO_ROOT": link.path,
+        ])
+        XCTAssertTrue(resolved.path.contains("Documents/huggingface/models/smkrv/gigaam-v3-e2e-rnnt-coreml"))
     }
 
     func testGigaAMTokenDecoderTurnsSentencePieceBoundariesIntoReadableText() {
@@ -58,5 +86,37 @@ final class GigaAMModelTests: XCTestCase {
             pieces: ["▁Привет", ",", "▁мир", "!"]
         )
         XCTAssertEqual(text, "Привет, мир!")
+    }
+
+    func testCancellationInvalidatesCurrentRequestButNotTheNextOne() throws {
+        let cancellation = GigaAMRequestCancellation()
+        let first = cancellation.begin()
+        cancellation.cancelCurrentRequests()
+        let second = cancellation.begin()
+
+        XCTAssertThrowsError(try cancellation.check(first)) { error in
+            XCTAssertTrue(error is CancellationError)
+        }
+        XCTAssertNoThrow(try cancellation.check(second))
+    }
+
+    private func makeRepositoryFixture(at root: URL) throws {
+        let core = root.appendingPathComponent("Sources/VoicelyCore")
+        let cli = root.appendingPathComponent("Sources/VoicelyCLI")
+        try FileManager.default.createDirectory(at: root.appendingPathComponent(".git"), withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: core, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: cli, withIntermediateDirectories: true)
+        FileManager.default.createFile(
+            atPath: root.appendingPathComponent("Package.swift").path,
+            contents: Data("let package = Package(name: \"Voicely\", targets: [.target(name: \"VoicelyCore\")])".utf8)
+        )
+        FileManager.default.createFile(
+            atPath: core.appendingPathComponent("GigaAMEngine.swift").path,
+            contents: Data("// identity".utf8)
+        )
+        FileManager.default.createFile(
+            atPath: cli.appendingPathComponent("Voicely.swift").path,
+            contents: Data("// identity".utf8)
+        )
     }
 }

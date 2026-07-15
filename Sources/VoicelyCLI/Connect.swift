@@ -1,4 +1,5 @@
 import ArgumentParser
+import Darwin
 import Foundation
 
 // MARK: - `voicely connect`
@@ -10,8 +11,35 @@ import Foundation
 // no risk of us corrupting a TOML/YAML/JSON file we don't own), detecting which
 // harnesses are installed and skipping the rest.
 //
-// `voicely setup` and the website installer call `connect` with no arguments, so
-// a fresh install registers Voicely in every agent the user already has.
+// Registration is explicit. `voicely setup` does not execute PATH-discovered
+// programs unless the user adds `--connect-agents`; `voicely connect` is the
+// dedicated opt-in command.
+
+enum AgentConnectionPolicyError: LocalizedError {
+    case rootForbidden
+
+    var errorDescription: String? {
+        switch self {
+        case .rootForbidden:
+            return AgentConnectionPolicy.rootRefusalMessage
+        }
+    }
+}
+
+enum AgentConnectionPolicy {
+    static let rootRefusalMessage =
+        "Refusing to run agent harness commands as root. Run `voicely connect` as your normal user."
+
+    static func isAllowed(effectiveUserID: uid_t = geteuid()) -> Bool {
+        effectiveUserID != 0
+    }
+
+    static func requireAllowed(effectiveUserID: uid_t = geteuid()) throws {
+        guard isAllowed(effectiveUserID: effectiveUserID) else {
+            throw AgentConnectionPolicyError.rootForbidden
+        }
+    }
+}
 
 /// One supported harness and how to (re)register an MCP server with its CLI.
 struct HarnessSpec: Sendable {
@@ -82,7 +110,8 @@ enum HarnessRegistry {
 
     /// Register the `voicely mcp` server in each requested (or every installed)
     /// harness. `voicelyPath` is the absolute path the harness will launch.
-    static func connect(_ wanted: [String], voicelyPath: String) -> Outcome {
+    static func connect(_ wanted: [String], voicelyPath: String) throws -> Outcome {
+        try AgentConnectionPolicy.requireAllowed()
         let targets = wanted.isEmpty ? all : all.filter { wanted.contains($0.id) }
         var out = Outcome()
         for h in targets {
@@ -121,6 +150,13 @@ struct Connect: ParsableCommand {
     var harnesses: [String] = []
 
     func run() throws {
+        do {
+            try AgentConnectionPolicy.requireAllowed()
+        } catch {
+            logErr(error.localizedDescription)
+            throw ExitCode.failure
+        }
+
         let known = Set(HarnessRegistry.all.map(\.id))
         let unknown = harnesses.filter { !known.contains($0) }
         if !unknown.isEmpty {
@@ -129,7 +165,7 @@ struct Connect: ParsableCommand {
         }
         let voicely = Setup.currentExecutablePath()
         emitLine("Connecting Voicely (\(voicely)) to \(harnesses.isEmpty ? "every installed harness" : harnesses.joined(separator: ", "))…")
-        let out = HarnessRegistry.connect(harnesses, voicelyPath: voicely)
+        let out = try HarnessRegistry.connect(harnesses, voicelyPath: voicely)
         emitLine("\nConnected: \(out.connected.isEmpty ? "none" : out.connected.joined(separator: ", "))" +
                  (out.skipped.isEmpty ? "" : " · skipped (not installed): \(out.skipped.joined(separator: ", "))") +
                  (out.failed.isEmpty ? "" : " · failed: \(out.failed.joined(separator: ", "))"))
@@ -164,7 +200,16 @@ enum ProcessRunner {
         proc.standardOutput = pipe
         proc.standardError = pipe
         let inPipe = Pipe()
-        if stdin != nil { proc.standardInput = inPipe }
+        if stdin != nil {
+            proc.standardInput = inPipe
+        } else {
+            // Never inherit the parent's stdin. Under `curl | sh` the parent's
+            // stdin IS the rest of the install script; a harness CLI that reads
+            // it swallows the remaining commands — that's why `open` and the
+            // final summary silently vanished and the app never launched.
+            // /dev/null makes any child read return immediate EOF.
+            proc.standardInput = FileHandle.nullDevice
+        }
         do {
             try proc.run()
             if let stdin, let data = stdin.data(using: .utf8) {

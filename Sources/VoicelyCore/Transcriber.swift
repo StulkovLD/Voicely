@@ -1,5 +1,6 @@
 @preconcurrency import Speech
-import AVFoundation
+@preconcurrency import AVFoundation
+import Darwin
 import Foundation
 @preconcurrency import WhisperKit
 
@@ -16,6 +17,10 @@ func vlog(_ message: String) {
     let path = logDir.appendingPathComponent("debug.log").path
     // Ensure log directory exists
     try? FileManager.default.createDirectory(at: logDir, withIntermediateDirectories: true)
+    try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: logDir.path)
+    if FileManager.default.fileExists(atPath: path) {
+        try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: path)
+    }
     if let handle = FileHandle(forWritingAtPath: path) {
         handle.seekToEndOfFile()
         handle.write(Data(line.utf8))
@@ -30,6 +35,18 @@ func vlog(_ message: String) {
 
 public protocol TranscriberEngine: Sendable {
     func transcribe(audio: AVAudioPCMBuffer, translate: Bool, language: String?) async throws -> String
+}
+
+/// Session-aware engine entry point used by the runtime scheduler. Engines that
+/// do not keep per-session state can continue implementing `TranscriberEngine`;
+/// `Transcriber` falls back to its original method for them.
+protocol SessionTranscriberEngine: TranscriberEngine {
+    func transcribe(
+        audio: AVAudioPCMBuffer,
+        translate: Bool,
+        language: String?,
+        sessionID: TranscriptionCoordinator.SessionID
+    ) async throws -> String
 }
 
 protocol PreloadableTranscriberEngine: TranscriberEngine {
@@ -48,12 +65,46 @@ protocol LanguageSessionResettable: TranscriberEngine {
     func resetLanguageSession()
 }
 
+/// Clears state for one logical transcription session without disturbing
+/// queued or paused work owned by another session.
+protocol SessionLanguageResettable: Sendable {
+    func resetLanguageSession(_ sessionID: TranscriptionCoordinator.SessionID)
+}
+
 // MARK: - Model Selection
 
 public struct WhisperModel: Sendable, Equatable {
+    enum SharedDefaults {
+        static let suiteName = "art.voicely.app"
+        static var store: UserDefaults {
+            UserDefaults(suiteName: suiteName) ?? .standard
+        }
+    }
+
     public enum Backend: Sendable, Equatable {
         case whisperKit
         case gigaAMV3E2ERNNT
+    }
+
+    public struct Capabilities: Sendable, Equatable {
+        /// Nil means multilingual. A set means the backend is fixed to those
+        /// language codes.
+        public let supportedLanguages: Set<String>?
+        public let supportsLanguageDetection: Bool
+        public let supportsTranslationToEnglish: Bool
+        public let minimumMacOSMajorVersion: Int
+
+        public init(
+            supportedLanguages: Set<String>?,
+            supportsLanguageDetection: Bool,
+            supportsTranslationToEnglish: Bool,
+            minimumMacOSMajorVersion: Int = 14
+        ) {
+            self.supportedLanguages = supportedLanguages
+            self.supportsLanguageDetection = supportsLanguageDetection
+            self.supportsTranslationToEnglish = supportsTranslationToEnglish
+            self.minimumMacOSMajorVersion = minimumMacOSMajorVersion
+        }
     }
 
     public let variant: String
@@ -63,21 +114,91 @@ public struct WhisperModel: Sendable, Equatable {
     public let minRAMGB: UInt64
     public let backend: Backend
 
+    public var capabilities: Capabilities {
+        switch backend {
+        case .whisperKit:
+            return Capabilities(
+                supportedLanguages: nil,
+                supportsLanguageDetection: true,
+                supportsTranslationToEnglish: true
+            )
+        case .gigaAMV3E2ERNNT:
+            return Capabilities(
+                supportedLanguages: ["ru"],
+                supportsLanguageDetection: false,
+                supportsTranslationToEnglish: false,
+                minimumMacOSMajorVersion: 15
+            )
+        }
+    }
+
+    public func requestValidationError(
+        translateToEnglish: Bool,
+        language: String?
+    ) -> String? {
+        let capabilities = capabilities
+        if translateToEnglish, !capabilities.supportsTranslationToEnglish {
+            return "\(displayName) cannot translate to English. Select a Whisper model or use Russian transcription."
+        }
+        if let language,
+           let supported = capabilities.supportedLanguages,
+           !supported.contains(language.lowercased()) {
+            return "\(displayName) supports only: \(supported.sorted().joined(separator: ", "))."
+        }
+        return nil
+    }
+
     public static let all: [WhisperModel] = [
-        WhisperModel(variant: "large-v3_turbo", displayName: "Large V3 Turbo", sizeLabel: "~3 GB", sizeBytes: 3_200_000_000, minRAMGB: 16, backend: .whisperKit),
-        WhisperModel(variant: "large-v3-v20240930_turbo_632MB", displayName: "Large V3 Turbo Q", sizeLabel: "~632 MB", sizeBytes: 650_000_000, minRAMGB: 8, backend: .whisperKit),
-        WhisperModel(variant: "small", displayName: "Small", sizeLabel: "~460 MB", sizeBytes: 460_000_000, minRAMGB: 4, backend: .whisperKit),
-        WhisperModel(variant: "base", displayName: "Base", sizeLabel: "~140 MB", sizeBytes: 140_000_000, minRAMGB: 4, backend: .whisperKit),
         WhisperModel(variant: "gigaam-v3-e2e-rnnt", displayName: "GigaAM V3 RU", sizeLabel: "~426 MB", sizeBytes: 430_000_000, minRAMGB: 8, backend: .gigaAMV3E2ERNNT),
+        WhisperModel(variant: "large-v3-v20240930_turbo_632MB", displayName: "Large V3 Turbo Q", sizeLabel: "~632 MB", sizeBytes: 650_000_000, minRAMGB: 8, backend: .whisperKit),
+        WhisperModel(variant: "large-v3_turbo", displayName: "Large V3 Turbo", sizeLabel: "~3 GB", sizeBytes: 3_200_000_000, minRAMGB: 24, backend: .whisperKit),
+        WhisperModel(variant: "medium", displayName: "Medium", sizeLabel: "~1.5 GB", sizeBytes: 1_500_000_000, minRAMGB: 16, backend: .whisperKit),
     ]
 
     public static var systemRAMGB: UInt64 {
         ProcessInfo.processInfo.physicalMemory / (1024 * 1024 * 1024)
     }
 
+    public var ramRequirementLabel: String {
+        if minRAMGB >= 24 {
+            return "24+ GB RAM"
+        }
+        return "\(minRAMGB) GB RAM"
+    }
+
+    public var onboardingHint: String? {
+        switch backend {
+        case .gigaAMV3E2ERNNT:
+            return "Russian only, no translation, macOS 15+"
+        case .whisperKit:
+            return nil
+        }
+    }
+
+    public func userFacingLabel(isRecommended: Bool) -> String {
+        var label = "\(displayName) (\(sizeLabel)), needs \(ramRequirementLabel)"
+        if let hint = onboardingHint {
+            label += " — \(hint)"
+        }
+        if isRecommended {
+            label += "  - Recommended"
+        }
+        return label
+    }
+
+    public static func available(forSystemRAMGB ram: UInt64) -> [WhisperModel] {
+        all.filter { $0.minRAMGB <= ram }
+    }
+
     public static func available() -> [WhisperModel] {
-        let ram = systemRAMGB
-        return all.filter { $0.minRAMGB <= ram }
+        let version = ProcessInfo.processInfo.operatingSystemVersion
+        return available(forSystemRAMGB: systemRAMGB).filter {
+            $0.isSupported(on: version)
+        }
+    }
+
+    public func isSupported(on version: OperatingSystemVersion) -> Bool {
+        version.majorVersion >= capabilities.minimumMacOSMajorVersion
     }
 
     /// Available disk space in bytes, or nil if the check fails.
@@ -89,53 +210,109 @@ public struct WhisperModel: Sendable, Equatable {
         return free
     }
 
-    public static func recommended() -> WhisperModel {
-        let ram = systemRAMGB
-        let disk = availableDiskBytes
-
-        // #34: Pick by RAM first, then verify disk space (need 1.5x for download + extraction)
-        let candidate: WhisperModel
-        if ram >= 16 {
-            candidate = all[0] // large-v3_turbo - best quality
+    public static func recommended(
+        forSystemRAMGB ram: UInt64,
+        availableDiskBytes disk: UInt64?
+    ) -> WhisperModel {
+        let preferredVariants: [String]
+        if ram >= 24 {
+            preferredVariants = [
+                "large-v3_turbo",
+                "medium",
+                "large-v3-v20240930_turbo_632MB",
+                "gigaam-v3-e2e-rnnt",
+            ]
+        } else if ram >= 16 {
+            preferredVariants = [
+                "medium",
+                "large-v3-v20240930_turbo_632MB",
+                "gigaam-v3-e2e-rnnt",
+            ]
         } else {
-            candidate = all[1] // quantized turbo - fits 8 GB
+            preferredVariants = [
+                "large-v3-v20240930_turbo_632MB",
+                "gigaam-v3-e2e-rnnt",
+            ]
         }
 
-        // If disk space is available and sufficient, use the candidate
-        if let disk, disk >= candidate.sizeBytes * 3 / 2 {
-            return candidate
+        let candidates = preferredVariants.compactMap { variant in
+            all.first(where: { $0.variant == variant && $0.minRAMGB <= ram })
         }
 
-        // Disk check failed or insufficient - fall back to a smaller model that fits
         if let disk {
-            for model in all where model.minRAMGB <= ram {
-                if disk >= model.sizeBytes * 3 / 2 {
-                    return model
-                }
+            for model in candidates where disk >= model.sizeBytes * 3 / 2 {
+                return model
             }
         }
 
-        // Filesystem check failed entirely - return RAM-based candidate (best effort)
-        return candidate
+        return candidates.first ?? all[0]
     }
 
-    /// Resolve the model directory for a specific working directory context.
-    ///
-    /// GigaAM gets a repo-local override when the current process is running
-    /// from a checkout of this repo, so local-only/community assets can live in
-    /// `.local/models/...` and stay untracked. Installed app / non-repo runs
-    /// fall back to the user-wide Documents cache.
-    func resolvedModelDirectory(currentDirectoryPath: String) -> URL {
+    public static func recommended() -> WhisperModel {
+        recommended(forSystemRAMGB: systemRAMGB, availableDiskBytes: availableDiskBytes)
+    }
+
+    public static func savedSelection() -> WhisperModel? {
+        savedSelection(in: SharedDefaults.store)
+    }
+
+    public static func savedSelection(in defaults: UserDefaults) -> WhisperModel? {
+        savedSelection(
+            in: defaults,
+            systemRAMGB: systemRAMGB,
+            operatingSystemVersion: ProcessInfo.processInfo.operatingSystemVersion
+        )
+    }
+
+    public static func savedSelection(
+        in defaults: UserDefaults,
+        systemRAMGB: UInt64,
+        operatingSystemVersion: OperatingSystemVersion
+    ) -> WhisperModel? {
+        guard let saved = defaults.string(forKey: "whisperModel") else { return nil }
+        guard let model = all.first(where: { $0.variant == saved }) else { return nil }
+        guard model.minRAMGB <= systemRAMGB,
+              model.isSupported(on: operatingSystemVersion) else {
+            return nil
+        }
+        return model
+    }
+
+    public static func hasSavedSelection() -> Bool {
+        hasSavedSelection(in: SharedDefaults.store)
+    }
+
+    public static func hasSavedSelection(in defaults: UserDefaults) -> Bool {
+        savedSelection(in: defaults) != nil
+    }
+
+    public static func clearSavedSelection() {
+        clearSavedSelection(in: SharedDefaults.store)
+    }
+
+    static func clearSavedSelection(in defaults: UserDefaults) {
+        defaults.removeObject(forKey: "whisperModel")
+    }
+
+    /// Resolve model storage without consulting the process working directory.
+    /// A checkout-local GigaAM path is available only in debug builds and only
+    /// through an explicit, identity-checked environment override.
+    func resolvedModelDirectory(
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> URL {
         switch backend {
         case .whisperKit:
             return FileManager.default.homeDirectoryForCurrentUser
                 .appendingPathComponent("Documents/huggingface/models/argmaxinc/whisperkit-coreml")
                 .appendingPathComponent("openai_whisper-\(variant)")
         case .gigaAMV3E2ERNNT:
-            if let repoRoot = Self.repoRoot(startingAt: URL(fileURLWithPath: currentDirectoryPath, isDirectory: true)) {
+            #if DEBUG
+            if let override = environment["VOICELY_GIGAAM_DEV_REPO_ROOT"],
+               let repoRoot = Self.validatedDevelopmentRepositoryRoot(override) {
                 return repoRoot
                     .appendingPathComponent(".local/models/gigaam/v3-e2e-rnnt")
             }
+            #endif
             return FileManager.default.homeDirectoryForCurrentUser
                 .appendingPathComponent("Documents/huggingface/models/smkrv/gigaam-v3-e2e-rnnt-coreml")
         }
@@ -143,24 +320,44 @@ public struct WhisperModel: Sendable, Equatable {
 
     /// Model directory on disk.
     public var modelDirectory: URL {
-        resolvedModelDirectory(currentDirectoryPath: FileManager.default.currentDirectoryPath)
+        resolvedModelDirectory()
     }
 
-    private static func repoRoot(startingAt start: URL) -> URL? {
-        var candidate = start.standardizedFileURL
-        let fm = FileManager.default
-        for _ in 0..<8 {
-            let package = candidate.appendingPathComponent("Package.swift")
-            let sources = candidate.appendingPathComponent("Sources")
-            if fm.fileExists(atPath: package.path), fm.fileExists(atPath: sources.path) {
-                return candidate
-            }
-            let parent = candidate.deletingLastPathComponent()
-            if parent.path == candidate.path { break }
-            candidate = parent
+    #if DEBUG
+    private static func validatedDevelopmentRepositoryRoot(_ path: String) -> URL? {
+        guard !path.isEmpty else { return nil }
+        let supplied = URL(fileURLWithPath: path, isDirectory: true).standardizedFileURL
+        let canonical = supplied.resolvingSymlinksInPath().standardizedFileURL
+        guard supplied.path == canonical.path,
+              secureItem(at: canonical, expectedType: .typeDirectory),
+              secureItem(at: canonical.appendingPathComponent(".git"), expectedType: nil),
+              secureItem(at: canonical.appendingPathComponent("Package.swift"), expectedType: .typeRegular),
+              secureItem(at: canonical.appendingPathComponent("Sources/VoicelyCore/GigaAMEngine.swift"), expectedType: .typeRegular),
+              secureItem(at: canonical.appendingPathComponent("Sources/VoicelyCLI/Voicely.swift"), expectedType: .typeRegular),
+              let package = try? String(
+                contentsOf: canonical.appendingPathComponent("Package.swift"),
+                encoding: .utf8
+              ),
+              package.contains("name: \"Voicely\""),
+              package.contains("name: \"VoicelyCore\"") else {
+            return nil
         }
-        return nil
+        return canonical
     }
+
+    private static func secureItem(
+        at url: URL,
+        expectedType: FileAttributeType?
+    ) -> Bool {
+        let fm = FileManager.default
+        guard let attributes = try? fm.attributesOfItem(atPath: url.path),
+              (attributes[.ownerAccountID] as? NSNumber)?.uint32Value == getuid(),
+              attributes[.type] as? FileAttributeType != .typeSymbolicLink else {
+            return false
+        }
+        return expectedType == nil || attributes[.type] as? FileAttributeType == expectedType
+    }
+    #endif
 
     /// Filesystem path of `modelDirectory`. Public so the headless CLI can report
     /// whether a model is already downloaded (`voicely status`) without exposing
@@ -170,6 +367,20 @@ public struct WhisperModel: Sendable, Equatable {
     public static func == (lhs: WhisperModel, rhs: WhisperModel) -> Bool {
         lhs.variant == rhs.variant
     }
+}
+
+/// Immutable request state captured before a request waits for the shared ASR
+/// lease. Later menu or runtime mutations cannot change the model, engine,
+/// language, translation mode, session identity, or priority of queued work.
+public struct TranscriptionSession: Sendable {
+    public let id: TranscriptionCoordinator.SessionID
+    public let priority: TranscriptionCoordinator.Priority
+    public let model: WhisperModel
+    public let translateToEnglish: Bool
+    public let preferredLanguage: String?
+
+    fileprivate let engine: any TranscriberEngine
+    fileprivate let coordinator: TranscriptionCoordinator
 }
 
 // MARK: - Progress Status
@@ -203,8 +414,19 @@ public enum TranscriberStatus: Sendable {
 
 @MainActor
 public final class Transcriber {
+    typealias EngineFactory = @Sendable (
+        WhisperModel,
+        (@Sendable (TranscriberStatus) -> Void)?
+    ) -> any TranscriberEngine
+
     private var engine: (any TranscriberEngine)?
     private let locale: Locale
+    private let engineFactory: EngineFactory
+    private var legacySessionID = TranscriptionCoordinator.SessionID()
+
+    /// Process/runtime-level scheduler shared with file and CLI consumers.
+    public let coordinator: TranscriptionCoordinator
+
     public private(set) var selectedModel: WhisperModel
     public var translateToEnglish = false
 
@@ -216,16 +438,30 @@ public final class Transcriber {
 
     public var onProgress: (@Sendable (TranscriberStatus) -> Void)?
 
-    public init(locale: Locale = .current) {
+    public init(
+        locale: Locale = .current,
+        coordinator: TranscriptionCoordinator = TranscriptionCoordinator()
+    ) {
         self.locale = locale
-        // Restore saved model or use RAM-based recommendation
-        if let saved = UserDefaults.standard.string(forKey: "whisperModel"),
-           let model = WhisperModel.all.first(where: { $0.variant == saved }),
-           model.minRAMGB <= WhisperModel.systemRAMGB {
-            self.selectedModel = model
-        } else {
-            self.selectedModel = WhisperModel.recommended()
-        }
+        self.coordinator = coordinator
+        self.engineFactory = Self.makeProductionEngine
+        self.selectedModel = WhisperModel.savedSelection() ?? WhisperModel.recommended()
+    }
+
+    init(
+        locale: Locale = .current,
+        coordinator: TranscriptionCoordinator,
+        selectedModel: WhisperModel,
+        engineFactory: @escaping EngineFactory
+    ) {
+        self.locale = locale
+        self.coordinator = coordinator
+        self.engineFactory = engineFactory
+        self.selectedModel = selectedModel
+    }
+
+    public var hasSavedModelSelection: Bool {
+        WhisperModel.hasSavedSelection()
     }
 
     /// Exposes the underlying engine so specialized call paths (file
@@ -233,13 +469,35 @@ public final class Transcriber {
     /// like `SampleTranscribing`. Nil until the engine has been loaded.
     public var currentEngine: (any TranscriberEngine)? { engine }
 
+    /// Capture all mutable request settings and the resolved engine before the
+    /// request can suspend in the coordinator queue.
+    public func makeSession(
+        id: TranscriptionCoordinator.SessionID = TranscriptionCoordinator.SessionID(),
+        priority: TranscriptionCoordinator.Priority
+    ) throws -> TranscriptionSession {
+        try makeSession(
+            id: id,
+            priority: priority,
+            language: preferredLanguage
+        )
+    }
+
+    /// A `SampleTranscribing` view pinned to one immutable session. File and
+    /// CLI consumers can keep their existing chunk-processing interfaces while
+    /// every chunk still goes through the shared runtime coordinator.
+    public func sampleTranscriber(
+        for session: TranscriptionSession
+    ) -> any SampleTranscribing {
+        CoordinatedSampleTranscriber(session: session)
+    }
+
     /// Change model. Resets engine so next transcription downloads/loads new model.
     public func selectModel(_ model: WhisperModel) {
         guard model != selectedModel || engine == nil else { return }
         cancelCurrentTask()
         selectedModel = model
         engine = nil
-        UserDefaults.standard.set(model.variant, forKey: "whisperModel")
+        WhisperModel.SharedDefaults.store.set(model.variant, forKey: "whisperModel")
         vlog("Model changed to '\(model.variant)'")
     }
 
@@ -247,32 +505,45 @@ public final class Transcriber {
     private func resolveEngine() -> any TranscriberEngine {
         if let engine = self.engine { return engine }
 
-        let e: any TranscriberEngine
-        switch selectedModel.backend {
-        case .whisperKit:
-            vlog("Using WhisperKit, model: \(selectedModel.variant) (RAM: \(WhisperModel.systemRAMGB) GB)")
-            e = WhisperKitEngine(model: selectedModel, onProgress: onProgress)
-        case .gigaAMV3E2ERNNT:
-            vlog("Using GigaAM v3, model: \(selectedModel.variant) (RAM: \(WhisperModel.systemRAMGB) GB)")
-            e = GigaAMEngine(model: selectedModel, onProgress: onProgress)
-        }
+        let e = engineFactory(selectedModel, onProgress)
         self.engine = e
         return e
     }
 
-    /// Push the current forced-language preference onto the engine so the
-    /// engine's decode-option logic (Fix 1.1) sees it. Call right after
-    /// resolving the engine in each transcription entry point.
-    private func syncEnginePreferences(_ engine: any TranscriberEngine) {
-        (engine as? WhisperKitEngine)?.preferredLanguage = preferredLanguage
+    nonisolated private static func makeProductionEngine(
+        model: WhisperModel,
+        onProgress: (@Sendable (TranscriberStatus) -> Void)?
+    ) -> any TranscriberEngine {
+        switch model.backend {
+        case .whisperKit:
+            vlog("Using WhisperKit, model: \(model.variant) (RAM: \(WhisperModel.systemRAMGB) GB)")
+            return WhisperKitEngine(model: model, onProgress: onProgress)
+        case .gigaAMV3E2ERNNT:
+            vlog("Using GigaAM v3, model: \(model.variant) (RAM: \(WhisperModel.systemRAMGB) GB)")
+            return GigaAMEngine(model: model, onProgress: onProgress)
+        }
     }
 
-    /// Reset all language latches (dictation + sample path + every call
-    /// channel). Call at the start of each dictation/call/file session so a
-    /// fresh detect-then-latch cycle runs (Fix 1.1). Does not change
-    /// `preferredLanguage`. No-op until the engine has been created.
+    /// Rotate the compatibility session used by existing app entry points.
+    /// Explicit `TranscriptionSession` callers should reset that session
+    /// directly when it ends.
     public func resetLanguageSession() {
-        (engine as? any LanguageSessionResettable)?.resetLanguageSession()
+        let completedSessionID = legacySessionID
+        legacySessionID = TranscriptionCoordinator.SessionID()
+
+        if let scoped = engine as? any SessionLanguageResettable {
+            scoped.resetLanguageSession(completedSessionID)
+        } else {
+            (engine as? any LanguageSessionResettable)?.resetLanguageSession()
+        }
+    }
+
+    public func resetLanguageSession(_ session: TranscriptionSession) {
+        if let scoped = session.engine as? any SessionLanguageResettable {
+            scoped.resetLanguageSession(session.id)
+        } else {
+            (session.engine as? any LanguageSessionResettable)?.resetLanguageSession()
+        }
     }
 
     /// Whether a download is currently in progress.
@@ -315,10 +586,29 @@ public final class Transcriber {
 
     /// Download and load model on first launch so it's ready when user dictates.
     public func preloadModel() async throws {
-        let engine = resolveEngine()
-        guard let preloadable = engine as? any PreloadableTranscriberEngine else { return }
+        let session = TranscriptionSession(
+            id: TranscriptionCoordinator.SessionID(),
+            priority: .background,
+            model: selectedModel,
+            translateToEnglish: false,
+            preferredLanguage: nil,
+            engine: resolveEngine(),
+            coordinator: coordinator
+        )
+        try await preloadModel(for: session)
+    }
+
+    public func preloadModel(for session: TranscriptionSession) async throws {
+        guard let preloadable = session.engine as? any PreloadableTranscriberEngine else {
+            return
+        }
         do {
-            try await preloadable.preload()
+            try await session.coordinator.withLease(
+                sessionID: session.id,
+                priority: .background
+            ) {
+                try await preloadable.preload()
+            }
             vlog("Model preloaded successfully")
         } catch {
             // Fix 1.2: do NOT delete here. Deletion of a corrupted model now
@@ -334,20 +624,41 @@ public final class Transcriber {
 
     public func transcribe(audio: AVAudioPCMBuffer?) async throws -> String {
         guard let audio = audio else { return "" }
+        let session = try makeSession(id: legacySessionID, priority: .live)
+        return try await transcribe(audio: audio, session: session)
+    }
+
+    public func transcribe(
+        audio: AVAudioPCMBuffer,
+        session: TranscriptionSession
+    ) async throws -> String {
 
         // WhisperKit doesn't need Speech Recognition permission (runs on CoreML).
         // Authorization check skipped - only microphone permission is required (handled by Recorder).
 
         onProgress?(.processing)
 
-        let resolved = resolveEngine()
-        syncEnginePreferences(resolved)
-        // language: nil — the engine drives language selection: it forces
-        // `preferredLanguage` when set, otherwise auto-detects on the first
-        // window and latches for the rest of the session (Fix 1.1).
         let raw: String
         do {
-            raw = try await resolved.transcribe(audio: audio, translate: translateToEnglish, language: nil)
+            let engine = session.engine
+            raw = try await session.coordinator.withLease(
+                sessionID: session.id,
+                priority: session.priority
+            ) {
+                if let sessionEngine = engine as? any SessionTranscriberEngine {
+                    return try await sessionEngine.transcribe(
+                        audio: audio,
+                        translate: session.translateToEnglish,
+                        language: session.preferredLanguage,
+                        sessionID: session.id
+                    )
+                }
+                return try await engine.transcribe(
+                    audio: audio,
+                    translate: session.translateToEnglish,
+                    language: session.preferredLanguage
+                )
+            }
         } catch let error as TranscriberError {
             // Fix 1.2: do NOT delete the model directory here. A network
             // failure (.modelDownloadFailed) must never wipe the ~3 GB model —
@@ -379,8 +690,28 @@ public final class Transcriber {
         forcedLanguage: String? = nil
     ) async throws -> [DialogueSegment] {
         guard !samples.isEmpty else { return [] }
-        let engine = resolveEngine()
-        syncEnginePreferences(engine)
+        let session = try makeSession(
+            id: legacySessionID,
+            priority: .live,
+            language: forcedLanguage ?? preferredLanguage
+        )
+        return try await transcribeChannel(
+            samples: samples,
+            sampleRate: sampleRate,
+            speaker: speaker,
+            startOffsetSec: startOffsetSec,
+            session: session
+        )
+    }
+
+    public func transcribeChannel(
+        samples: [Float],
+        sampleRate: Double,
+        speaker: CallSpeaker,
+        startOffsetSec: Double,
+        session: TranscriptionSession
+    ) async throws -> [DialogueSegment] {
+        guard !samples.isEmpty else { return [] }
 
         let resampled = try Self.resampleSamples(samples, fromRate: sampleRate, toRate: 16000)
         guard !resampled.isEmpty else { return [] }
@@ -389,21 +720,36 @@ public final class Transcriber {
 
         let result: WhisperTranscription
         do {
-            if let whisper = engine as? WhisperKitEngine {
-                result = try await whisper.transcribeChannelSamples(
-                    resampled,
-                    translate: translateToEnglish,
-                    speaker: speaker,
-                    forcedLanguage: forcedLanguage
-                )
-            } else if let sampleEngine = engine as? any SampleTranscribing {
-                result = try await sampleEngine.transcribeSamples(
-                    resampled,
-                    translate: translateToEnglish,
-                    language: forcedLanguage
-                )
-            } else {
-                return []
+            let engine = session.engine
+            result = try await session.coordinator.withLease(
+                sessionID: session.id,
+                priority: session.priority
+            ) {
+                if let whisper = engine as? WhisperKitEngine {
+                    return try await whisper.transcribeChannelSamples(
+                        resampled,
+                        translate: session.translateToEnglish,
+                        speaker: speaker,
+                        forcedLanguage: session.preferredLanguage,
+                        sessionID: session.id
+                    )
+                }
+                if let sessionEngine = engine as? any SessionSampleTranscribing {
+                    return try await sessionEngine.transcribeSamples(
+                        resampled,
+                        translate: session.translateToEnglish,
+                        language: session.preferredLanguage,
+                        sessionID: session.id
+                    )
+                }
+                if let sampleEngine = engine as? any SampleTranscribing {
+                    return try await sampleEngine.transcribeSamples(
+                        resampled,
+                        translate: session.translateToEnglish,
+                        language: session.preferredLanguage
+                    )
+                }
+                return WhisperTranscription(text: "", segments: [], detectedLanguage: nil)
             }
         } catch TranscriberError.silentAudio {
             return []
@@ -459,18 +805,40 @@ public final class Transcriber {
             throw TranscriberError.whisperKitFailed("resample output alloc failed")
         }
         var err: NSError?
-        var consumed = false
+        let input = SingleBufferAudioConverterInput(srcBuf)
         converter.convert(to: dstBuf, error: &err) { _, outStatus in
-            if consumed { outStatus.pointee = .endOfStream; return nil }
-            consumed = true
-            outStatus.pointee = .haveData
-            return srcBuf
+            input.provide(status: outStatus)
         }
         if let err { throw TranscriberError.whisperKitFailed("resample failed: \(err)") }
         guard let data = dstBuf.floatChannelData?[0] else {
             throw TranscriberError.whisperKitFailed("resample output missing data")
         }
         return Array(UnsafeBufferPointer(start: data, count: Int(dstBuf.frameLength)))
+    }
+
+    private func makeSession(
+        id: TranscriptionCoordinator.SessionID,
+        priority: TranscriptionCoordinator.Priority,
+        language: String?
+    ) throws -> TranscriptionSession {
+        let model = selectedModel
+        let translate = translateToEnglish
+        if let message = model.requestValidationError(
+            translateToEnglish: translate,
+            language: language
+        ) {
+            throw TranscriberError.unsupportedModelCapability(message)
+        }
+
+        return TranscriptionSession(
+            id: id,
+            priority: priority,
+            model: model,
+            translateToEnglish: translate,
+            preferredLanguage: language,
+            engine: resolveEngine(),
+            coordinator: coordinator
+        )
     }
 
     // MARK: - Model Directory Cleanup
@@ -486,26 +854,7 @@ public final class Transcriber {
         try? FileManager.default.removeItem(at: dir)
     }
 
-    // MARK: - Hallucination filter
-
-    nonisolated static let hallucinations: Set<String> = [
-        // Common WhisperKit hallucinations on silent/noisy audio
-        "Thank you.", "Thank you", "Thanks for watching!",
-        "Thanks for watching.", "Thank you for watching.",
-        "Thank you so much.", "Thank you very much.",
-        "Subscribe to my channel.", "Like and subscribe.", "Please subscribe.",
-        "Bye.", "Bye-bye.", "Goodbye.", "Bye",
-        "you", "You.", "...", ".",
-        "Спасибо.", "Спасибо за просмотр!",
-        "Субтитры сделал DimaTorzworworwork",
-        "Субтитры сделаны",
-        "Субтитры делал",
-        "Продолжение следует...",
-        "Редактор субтитров А.Семкин",
-        "Переведено и отредактировано",
-        "Music", "music", "♪", "♫",
-        "Музыка",
-    ]
+    // MARK: - Decoder-output filter
 
     private static func filterHallucinations(_ text: String, audioDuration: Double) -> String {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -514,21 +863,15 @@ public final class Transcriber {
         return trimmed
     }
 
-    /// Whether a trimmed string is a known WhisperKit hallucination (the
-    /// "Продолжение следует…" / "Subtitles by…" filler models emit on silence
-    /// or trailing music). Shared so the SEGMENT path (transcribeSamplesCore,
-    /// which feeds diarized "Speaker N" / timestamped / call transcripts) filters
-    /// the same fillers as the joined-string dictation path — otherwise they
-    /// leak into diarized output. `nonisolated` so the engine can call it.
+    /// Reject output that contains no letters or numbers. Phrase blacklists are
+    /// intentionally forbidden here: ordinary speech such as "Спасибо", "Bye",
+    /// or "Thank you" is valid product data and cannot be classified from text
+    /// alone. Silence/no-speech decisions happen from audio/model evidence before
+    /// this stage. `nonisolated` so every output surface shares the same rule.
     nonisolated static func isHallucinationText(_ trimmed: String) -> Bool {
-        if hallucinations.contains(trimmed) { return true }
-        let lower = trimmed.lowercased()
-        if lower.hasPrefix("субтитры") || lower.hasPrefix("редактор субтитров") { return true }
-        if lower.hasPrefix("переведено") || lower.hasPrefix("subtitles by") { return true }
-        // Prefix (not exact) so trailing-punctuation variants are caught too:
-        // "Продолжение следует", "…следует.", "…следует…" (unicode ellipsis).
-        if lower.hasPrefix("продолжение следует") { return true }
-        return false
+        !trimmed.unicodeScalars.contains {
+            CharacterSet.letters.contains($0) || CharacterSet.decimalDigits.contains($0)
+        }
     }
 }
 
@@ -545,6 +888,7 @@ public enum TranscriberError: Error, LocalizedError {
     case modelNotReady
     case engineBusy
     case insufficientDiskSpace(needed: UInt64, available: UInt64)
+    case unsupportedModelCapability(String)
 
     public var errorDescription: String? {
         switch self {
@@ -571,6 +915,8 @@ public enum TranscriberError: Error, LocalizedError {
             let availGB = Double(available) / 1_000_000_000
             let fmt = { (gb: Double) -> String in String(format: "%.1f GB", gb) }
             return "Not enough disk space. Need \(fmt(neededGB)) free, have \(fmt(availGB)). Free up space and try again."
+        case .unsupportedModelCapability(let message):
+            return message
         }
     }
 }
@@ -614,6 +960,56 @@ public protocol SampleTranscribing: Sendable {
         translate: Bool,
         language: String?
     ) async throws -> WhisperTranscription
+}
+
+/// Sample entry point with a stable language-state namespace.
+protocol SessionSampleTranscribing: SampleTranscribing {
+    func transcribeSamples(
+        _ samples: [Float],
+        translate: Bool,
+        language: String?,
+        sessionID: TranscriptionCoordinator.SessionID
+    ) async throws -> WhisperTranscription
+}
+
+/// Adapts an immutable session back to the existing chunk-oriented protocol.
+/// Call-site arguments are intentionally ignored: the session snapshot is the
+/// source of truth once work has entered the runtime queue.
+private final class CoordinatedSampleTranscriber: SampleTranscribing {
+    private let session: TranscriptionSession
+
+    init(session: TranscriptionSession) {
+        self.session = session
+    }
+
+    func transcribeSamples(
+        _ samples: [Float],
+        translate _: Bool,
+        language _: String?
+    ) async throws -> WhisperTranscription {
+        guard let sampleEngine = session.engine as? any SampleTranscribing else {
+            throw TranscriberError.modelNotReady
+        }
+
+        return try await session.coordinator.withLease(
+            sessionID: session.id,
+            priority: session.priority
+        ) {
+            if let sessionEngine = sampleEngine as? any SessionSampleTranscribing {
+                return try await sessionEngine.transcribeSamples(
+                    samples,
+                    translate: session.translateToEnglish,
+                    language: session.preferredLanguage,
+                    sessionID: session.id
+                )
+            }
+            return try await sampleEngine.transcribeSamples(
+                samples,
+                translate: session.translateToEnglish,
+                language: session.preferredLanguage
+            )
+        }
+    }
 }
 
 // MARK: - Call diarization segments
@@ -702,18 +1098,12 @@ final class AppleSpeechEngine: TranscriberEngine {
         request.shouldReportPartialResults = true
 
         return try await withCheckedThrowingContinuation { continuation in
-            let lock = NSLock()
-            var finished = false
-            var lastPartialResult = ""
+            let state = SpeechRecognitionCompletionState()
 
             let task = recognizer.recognitionTask(with: request) { result, error in
-                lock.lock()
-                guard !finished else { lock.unlock(); return }
-
                 if let error = error {
-                    finished = true
-                    let partial = lastPartialResult
-                    lock.unlock()
+                    let (claimed, partial) = state.claimCompletion()
+                    guard claimed else { return }
                     if !partial.isEmpty {
                         continuation.resume(returning: partial)
                     } else {
@@ -722,25 +1112,19 @@ final class AppleSpeechEngine: TranscriberEngine {
                     return
                 }
                 if let result = result {
-                    lastPartialResult = result.bestTranscription.formattedString
+                    let text = result.bestTranscription.formattedString
+                    guard state.storePartial(text) else { return }
                     if result.isFinal {
-                        finished = true
-                        let text = result.bestTranscription.formattedString
-                        lock.unlock()
+                        guard state.claimFinal() else { return }
                         continuation.resume(returning: text)
-                        return
                     }
                 }
-                lock.unlock()
             }
 
             // Timeout: if recognition hasn't completed in 30s, use best partial result
             DispatchQueue.global().asyncAfter(deadline: .now() + 30) {
-                lock.lock()
-                guard !finished else { lock.unlock(); return }
-                finished = true
-                let partial = lastPartialResult
-                lock.unlock()
+                let (claimed, partial) = state.claimCompletion()
+                guard claimed else { return }
                 task.cancel()
                 if !partial.isEmpty {
                     continuation.resume(returning: partial)
@@ -756,6 +1140,36 @@ final class AppleSpeechEngine: TranscriberEngine {
 
 /// Sentinel error for timeout detection.
 private struct DeadlineExceeded: Error {}
+
+private final class SpeechRecognitionCompletionState: @unchecked Sendable {
+    private let lock = NSLock()
+    private var finished = false
+    private var partial = ""
+
+    func storePartial(_ value: String) -> Bool {
+        lock.withLock {
+            guard !finished else { return false }
+            partial = value
+            return true
+        }
+    }
+
+    func claimFinal() -> Bool {
+        lock.withLock {
+            guard !finished else { return false }
+            finished = true
+            return true
+        }
+    }
+
+    func claimCompletion() -> (Bool, String) {
+        lock.withLock {
+            guard !finished else { return (false, "") }
+            finished = true
+            return (true, partial)
+        }
+    }
+}
 
 /// Thread-safe one-shot flag for deadline coordination. Uses DispatchQueue for serialization
 /// to avoid NSLock restrictions in async contexts.
@@ -810,7 +1224,7 @@ private func withDeadline<T>(
 
 // MARK: - WhisperKit Engine (primary - SFSpeechRecognizer broken on macOS 26)
 
-final class WhisperKitEngine: @unchecked Sendable, TranscriberEngine, SampleTranscribing, PreloadableTranscriberEngine, CancelableTranscriberEngine, DownloadReportingTranscriberEngine, LanguageSessionResettable {
+final class WhisperKitEngine: @unchecked Sendable, SessionTranscriberEngine, SessionSampleTranscribing, PreloadableTranscriberEngine, CancelableTranscriberEngine, DownloadReportingTranscriberEngine, LanguageSessionResettable, SessionLanguageResettable {
     /// WhisperKit stages the model into `.cache/...incomplete` then moves it
     /// into place, and CoreML compiles it for local hardware. That pipeline
     /// peaks at roughly 2.5x the final model size on disk.
@@ -822,6 +1236,7 @@ final class WhisperKitEngine: @unchecked Sendable, TranscriberEngine, SampleTran
     private let pipeLock = NSLock()
     private let model: WhisperModel
     private let onProgress: (@Sendable (TranscriberStatus) -> Void)?
+    private let compatibilitySessionID = TranscriptionCoordinator.SessionID()
 
     /// Whether a model download is currently in progress.
     private var isDownloadInProgress = false
@@ -853,15 +1268,19 @@ final class WhisperKitEngine: @unchecked Sendable, TranscriberEngine, SampleTran
     /// latch so e.g. the other party speaking English never forces the mic's
     /// Russian to be detected as English on a later window.
     enum LatchKey: Hashable, Sendable {
-        case dictation
-        case samples
-        case channel(CallSpeaker)
-    }
+        case dictation(TranscriptionCoordinator.SessionID)
+        case samples(TranscriptionCoordinator.SessionID)
+        case channel(TranscriptionCoordinator.SessionID, CallSpeaker)
 
-    /// Forced language ("ru"/"en"). When set, every decode is hard-forced to
-    /// this language with no detection and the latch is bypassed entirely.
-    /// `nil` = auto-detect-then-latch per session.
-    var preferredLanguage: String?
+        var sessionID: TranscriptionCoordinator.SessionID {
+            switch self {
+            case .dictation(let sessionID), .samples(let sessionID):
+                return sessionID
+            case .channel(let sessionID, _):
+                return sessionID
+            }
+        }
+    }
 
     /// Detected-and-latched language per session, keyed by `LatchKey`.
     /// Populated from the first window's `result.language` so later windows
@@ -888,8 +1307,7 @@ final class WhisperKitEngine: @unchecked Sendable, TranscriberEngine, SampleTran
     }
 
     /// Clear all language latches (dictation + sample path + every channel).
-    /// Called at the start of each dictation/call/file session so a fresh
-    /// detect-then-latch cycle runs. Does not touch `preferredLanguage`.
+    /// Compatibility reset for legacy callers that do not supply a session ID.
     func resetLanguageSession() {
         pipeLock.lock()
         latchedLanguage.removeAll()
@@ -897,10 +1315,15 @@ final class WhisperKitEngine: @unchecked Sendable, TranscriberEngine, SampleTran
         vlog("WhisperKit: language session reset")
     }
 
+    func resetLanguageSession(_ sessionID: TranscriptionCoordinator.SessionID) {
+        pipeLock.lock()
+        latchedLanguage = latchedLanguage.filter { $0.key.sessionID != sessionID }
+        pipeLock.unlock()
+        vlog("WhisperKit: language session reset \(sessionID)")
+    }
+
     /// Build decode options applying the sticky-language contract (Fix 1.1):
     /// - translate: task=.translate, language=nil, prefill on, detect off (unchanged).
-    /// - forced (preferredLanguage != nil): force that language, prefill on,
-    ///   detect off, never latch.
     /// - already latched: force the latched language, prefill on, detect off.
     /// - first window (no latch, no force): language=nil, prefill on, detect on
     ///   so WhisperKit detects AND writes the prefill itself; caller latches
@@ -922,7 +1345,7 @@ final class WhisperKitEngine: @unchecked Sendable, TranscriberEngine, SampleTran
                 noSpeechThreshold: 0.6
             )
         }
-        let pinned = preferredLanguage ?? latched(for: latchKey)
+        let pinned = latched(for: latchKey)
         return DecodingOptions(
             task: task,
             language: pinned,
@@ -937,7 +1360,7 @@ final class WhisperKitEngine: @unchecked Sendable, TranscriberEngine, SampleTran
     /// After a decode, latch the detected language for this session if we were
     /// in auto mode (not translate, not forced) and nothing is latched yet.
     private func latchIfNeeded(translate: Bool, latchKey: LatchKey, detected: String?) {
-        guard !translate, preferredLanguage == nil else { return }
+        guard !translate else { return }
         setLatched(detected, for: latchKey)
     }
 
@@ -1105,6 +1528,20 @@ final class WhisperKitEngine: @unchecked Sendable, TranscriberEngine, SampleTran
 
     // NOTE: keep in sync with transcribeSamples() — shared decoding pipeline is duplicated.
     func transcribe(audio: AVAudioPCMBuffer, translate: Bool = false, language: String? = nil) async throws -> String {
+        try await transcribe(
+            audio: audio,
+            translate: translate,
+            language: language,
+            sessionID: compatibilitySessionID
+        )
+    }
+
+    func transcribe(
+        audio: AVAudioPCMBuffer,
+        translate: Bool,
+        language: String?,
+        sessionID: TranscriptionCoordinator.SessionID
+    ) async throws -> String {
         // #19: Guard against concurrent transcribe() calls
         let alreadyTranscribing = trySetTranscribing(true)
         guard !alreadyTranscribing else {
@@ -1181,9 +1618,8 @@ final class WhisperKitEngine: @unchecked Sendable, TranscriberEngine, SampleTran
         }
 
         // Sticky language (Fix 1.1): dictation has its own latch. `language`
-        // arg, when non-nil, is treated as a hard force via preferredLanguage
-        // upstream; here we honor an explicit per-call override too.
-        let latchKey: LatchKey = .dictation
+        // arg, when non-nil, is treated as a hard per-session force.
+        let latchKey: LatchKey = .dictation(sessionID)
         // Fix 1.5: confidence-gated, candidate-biased pre-detection. Runs once
         // per session (until something latches) so an ambiguous first window
         // never poisons the rest with an exotic misfire. No-op if it returns nil
@@ -1232,10 +1668,8 @@ final class WhisperKitEngine: @unchecked Sendable, TranscriberEngine, SampleTran
             latchIfNeeded(translate: translate, latchKey: latchKey, detected: detected)
         }
 
-        // Build from cleaned segments (strip tokens, drop hallucinations) so a
-        // trailing "Продолжение следует…" never reaches injected dictation —
-        // same filter as the sample/diarized paths. Fall back to the raw join if
-        // segmentation produced nothing usable.
+        // Build from cleaned segments (strip decoder tokens and empty symbolic
+        // output) so every surface uses the same evidence-based filter.
         let cleaned = result
             .flatMap { $0.segments }
             .compactMap { Self.cleanSegmentText($0.text) }
@@ -1273,11 +1707,9 @@ final class WhisperKitEngine: @unchecked Sendable, TranscriberEngine, SampleTran
             .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    /// Clean one raw decoder segment: strip special tokens, then return nil if
-    /// it is empty or a known hallucination ("Продолжение следует…"). Single
-    /// source of truth so BOTH the joined-string transcript and the per-segment
-    /// (diarized / timestamped / call) output filter identically — otherwise a
-    /// trailing hallucination survives in whichever path skips this.
+    /// Clean one raw decoder segment: strip special tokens, then return nil only
+    /// when no linguistic/numeric content remains. Both joined and timestamped
+    /// outputs use this path.
     nonisolated static func cleanSegmentText(_ raw: String) -> String? {
         let clean = stripSpecialTokens(raw)
         if clean.isEmpty || Transcriber.isHallucinationText(clean) { return nil }
@@ -1289,10 +1721,24 @@ final class WhisperKitEngine: @unchecked Sendable, TranscriberEngine, SampleTran
         translate: Bool,
         language: String?
     ) async throws -> WhisperTranscription {
+        try await transcribeSamples(
+            samples,
+            translate: translate,
+            language: language,
+            sessionID: compatibilitySessionID
+        )
+    }
+
+    func transcribeSamples(
+        _ samples: [Float],
+        translate: Bool,
+        language: String?,
+        sessionID: TranscriptionCoordinator.SessionID
+    ) async throws -> WhisperTranscription {
         try await transcribeSamplesCore(
             samples,
             translate: translate,
-            latchKey: .samples,
+            latchKey: .samples(sessionID),
             forcedLanguage: language
         )
     }
@@ -1306,10 +1752,26 @@ final class WhisperKitEngine: @unchecked Sendable, TranscriberEngine, SampleTran
         speaker: CallSpeaker,
         forcedLanguage: String? = nil
     ) async throws -> WhisperTranscription {
+        try await transcribeChannelSamples(
+            samples,
+            translate: translate,
+            speaker: speaker,
+            forcedLanguage: forcedLanguage,
+            sessionID: compatibilitySessionID
+        )
+    }
+
+    func transcribeChannelSamples(
+        _ samples: [Float],
+        translate: Bool,
+        speaker: CallSpeaker,
+        forcedLanguage: String?,
+        sessionID: TranscriptionCoordinator.SessionID
+    ) async throws -> WhisperTranscription {
         try await transcribeSamplesCore(
             samples,
             translate: translate,
-            latchKey: .channel(speaker),
+            latchKey: .channel(sessionID, speaker),
             forcedLanguage: forcedLanguage
         )
     }
@@ -1317,7 +1779,7 @@ final class WhisperKitEngine: @unchecked Sendable, TranscriberEngine, SampleTran
     /// Shared decode core for the sample-based paths. `latchKey` selects which
     /// independent language latch this session uses; `forcedLanguage`, when
     /// non-nil, hard-forces that language for this single call (no detect, no
-    /// latch) and overrides both `preferredLanguage` and the latch.
+    /// latch) and overrides the session latch.
     private func transcribeSamplesCore(
         _ samples: [Float],
         translate: Bool,
@@ -1416,8 +1878,7 @@ final class WhisperKitEngine: @unchecked Sendable, TranscriberEngine, SampleTran
                 detectedLang = r.language
             }
             for seg in r.segments {
-                // Strip tokens + drop empty/hallucination segments so they never
-                // reach the diarized/timestamped/call transcripts.
+                // Strip tokens and empty symbolic segments before publishing.
                 guard let clean = Self.cleanSegmentText(seg.text) else { continue }
                 allSegments.append(WhisperSegment(
                     start: Double(seg.start),
@@ -1433,9 +1894,8 @@ final class WhisperKitEngine: @unchecked Sendable, TranscriberEngine, SampleTran
             latchIfNeeded(translate: translate, latchKey: latchKey, detected: detectedLang)
         }
 
-        // Build the plain transcript from the ALREADY-CLEANED segments (not the
-        // raw result text) so a trailing hallucination filtered out of `segments`
-        // is also gone from the joined string the CLI/file plain output uses.
+        // Build the plain transcript from the already-cleaned segments so every
+        // output surface follows the same token/symbol filtering rule.
         // Fall back to the raw join only if there were no usable segments.
         let joinedText = allSegments.isEmpty
             ? results.map { $0.text }.joined(separator: " ")
@@ -1809,15 +2269,9 @@ final class WhisperKitEngine: @unchecked Sendable, TranscriberEngine, SampleTran
         }
 
         var error: NSError?
-        var consumed = false
+        let input = SingleBufferAudioConverterInput(buffer)
         converter.convert(to: output, error: &error) { _, outStatus in
-            if consumed {
-                outStatus.pointee = .endOfStream
-                return nil
-            }
-            consumed = true
-            outStatus.pointee = .haveData
-            return buffer
+            input.provide(status: outStatus)
         }
         if let error = error {
             throw TranscriberError.whisperKitFailed("Resampling failed: \(error)")

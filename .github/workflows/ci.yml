@@ -10,31 +10,149 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 jobs:
   build-test:
     name: Build & test (macOS)
     runs-on: macos-15
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout pinned source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
-      # Swift 6 toolchain — Package.swift declares swift-tools-version 6.0.
-      - uses: maxim-lobanov/setup-xcode@v1
-        with:
-          xcode-version: latest-stable
+      - name: Fixed Xcode and Swift versions
+        run: |
+          test "$(/usr/bin/uname -m)" = arm64
+          test -d "$DEVELOPER_DIR"
+          xcodebuild -version
+          swift --version
 
-      - name: Swift version
-        run: swift --version
+      - name: Clean packaging and installer fault gates
+        run: |
+          sh scripts/tests/release-pipeline-tests.sh
+          test -z "$(git status --porcelain --untracked-files=all)"
 
-      # Cache resolved SPM dependencies (WhisperKit, FluidAudio, …) between runs.
-      - name: Cache SwiftPM
-        uses: actions/cache@v4
-        with:
-          path: .build
-          key: spm-${{ runner.os }}-${{ hashFiles('Package.resolved') }}
-          restore-keys: spm-${{ runner.os }}-
-
-      - name: Build
-        run: swift build
+      - name: Strict build and test bundle
+        run: |
+          swift package clean
+          swift build --build-tests --disable-automatic-resolution --skip-update \
+            -Xswiftc -warnings-as-errors
 
       - name: Test
-        run: swift test
+        run: swift test --skip-build --disable-automatic-resolution --skip-update
+
+      - name: CLI smoke
+        run: |
+          BIN_PATH="$(swift build --show-bin-path)"
+          test "$("$BIN_PATH/VoicelyCLI" --version)" = "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' Sources/Voicely/Resources/Info.plist)"
+          "$BIN_PATH/VoicelyCLI" --help >/dev/null
+
+  package-public-unsigned:
+    name: Package public unsigned DMG
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    needs: build-test
+    runs-on: macos-15
+    env:
+      VOICELY_RELEASE_MODE: public-unsigned
+      VOICELY_ALLOW_PUBLIC_UNSIGNED: I_UNDERSTAND_GATEKEEPER
+      VOICELY_RELEASE_PACKAGE_ONLY: "1"
+      VOICELY_RELEASE_DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
+    steps:
+      - name: Checkout exact source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Verify package provenance
+        run: |
+          test "$(/usr/bin/uname -m)" = arm64
+          test -d "$VOICELY_RELEASE_DEVELOPER_DIR"
+          test "$(/usr/bin/git rev-parse HEAD)" = "$GITHUB_SHA"
+          test -z "$(/usr/bin/git status --porcelain --untracked-files=all)"
+          DEVELOPER_DIR="$VOICELY_RELEASE_DEVELOPER_DIR" /usr/bin/xcodebuild -version
+          DEVELOPER_DIR="$VOICELY_RELEASE_DEVELOPER_DIR" /usr/bin/xcrun swift --version
+
+      - name: Build verified release bundle
+        run: |
+          ./scripts/autodeploy.sh | /usr/bin/tee "$RUNNER_TEMP/voicely-package.log"
+          /usr/bin/grep -F 'Publish:  pending (package-only; no network or git commit executed)' \
+            "$RUNNER_TEMP/voicely-package.log" >/dev/null
+
+      - name: Verify packaged architecture and trust manifest
+        run: |
+          set -eu
+          VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' Sources/Voicely/Resources/Info.plist)"
+          GIT12="$(printf '%s' "$GITHUB_SHA" | /usr/bin/cut -c1-12)"
+          EXPECTED_BUNDLE="dist/release-bundle-${VERSION}-${GIT12}"
+          set -- dist/release-bundle-*
+          test "$#" -eq 1
+          test "$1" = "$EXPECTED_BUNDLE"
+          test -d "$EXPECTED_BUNDLE"
+          BUNDLE=$EXPECTED_BUNDLE
+
+          set -- "$BUNDLE"/Voicely-*.dmg
+          test "$#" -eq 1
+          test -f "$1"
+          DMG=$1
+          DMG_SHA="$(/usr/bin/shasum -a 256 "$DMG" | /usr/bin/awk '{print $1}')"
+          EXPECTED_DMG="Voicely-${VERSION}-${GIT12}-${DMG_SHA}.dmg"
+          test "$(/usr/bin/basename "$DMG")" = "$EXPECTED_DMG"
+          MANIFEST="$DMG.manifest.json"
+          test -f "$MANIFEST"
+
+          test "$(/usr/bin/plutil -extract gitRevision raw -o - "$MANIFEST")" = "$GITHUB_SHA"
+          test "$(/usr/bin/plutil -extract version raw -o - "$MANIFEST")" = "$VERSION"
+          test "$(/usr/bin/plutil -extract architectures.0 raw -o - "$MANIFEST")" = arm64
+          ! /usr/bin/plutil -extract architectures.1 raw -o - "$MANIFEST" >/dev/null 2>&1
+          test "$(/usr/bin/plutil -extract artifact raw -o - "$MANIFEST")" = "$EXPECTED_DMG"
+          test "$(/usr/bin/plutil -extract artifactSHA256 raw -o - "$MANIFEST")" = "$DMG_SHA"
+          test "$(/usr/bin/plutil -extract releaseMode raw -o - "$MANIFEST")" = public-unsigned
+          test "$(/usr/bin/plutil -extract signatureKind raw -o - "$MANIFEST")" = ad-hoc
+          test "$(/usr/bin/plutil -extract developerIDSigned raw -o - "$MANIFEST")" = false
+          test "$(/usr/bin/plutil -extract notarized raw -o - "$MANIFEST")" = false
+          test "$(/usr/bin/plutil -extract gatekeeperExpected raw -o - "$MANIFEST")" = blocked
+          test -z "$(/usr/bin/plutil -extract appNotarizationID raw -o - "$MANIFEST")"
+          test -z "$(/usr/bin/plutil -extract dmgNotarizationID raw -o - "$MANIFEST")"
+
+          INSTALLER="$BUNDLE/install.sh"
+          test -f "$INSTALLER"
+          test ! -L "$INSTALLER"
+          test "$(/usr/bin/stat -f '%Lp' "$INSTALLER")" = 644
+          metadata_value() {
+            key=$1
+            test "$(/usr/bin/grep -c "^${key}=\"" "$INSTALLER")" -eq 1
+            /usr/bin/grep "^${key}=\"" "$INSTALLER" | /usr/bin/awk -F'"' '{print $2}'
+          }
+          test "$(metadata_value VERSION)" = "$VERSION"
+          test "$(metadata_value DMG_FILE)" = "$EXPECTED_DMG"
+          test "$(metadata_value EXPECTED_SHA256)" = "$DMG_SHA"
+          test "$(metadata_value INSTALL_TRUST_MODE)" = public-unsigned
+          test "$(metadata_value INSTALL_ARTIFACT_READY)" = 1
+
+          MOUNT_POINT="$RUNNER_TEMP/voicely-release-mount"
+          /bin/mkdir -m 700 "$MOUNT_POINT"
+          cleanup() {
+            /usr/bin/hdiutil detach "$MOUNT_POINT" -quiet 2>/dev/null || true
+          }
+          trap cleanup EXIT HUP INT TERM
+          /usr/bin/hdiutil attach "$DMG" -readonly -nobrowse -mountpoint "$MOUNT_POINT" >/dev/null
+
+          for binary in \
+            "$MOUNT_POINT/Voicely.app/Contents/MacOS/Voicely" \
+            "$MOUNT_POINT/Voicely.app/Contents/Helpers/voicely"
+          do
+            test -f "$binary"
+            test ! -L "$binary"
+            test "$(/usr/bin/lipo -archs "$binary")" = arm64
+            /usr/bin/file "$binary" | /usr/bin/grep -F 'Mach-O 64-bit executable arm64' >/dev/null
+          done
+
+      - name: Upload verified release bundle
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: voicely-public-unsigned-${{ github.sha }}
+          path: dist/release-bundle-*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7

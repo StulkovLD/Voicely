@@ -90,7 +90,7 @@ let package = Package(
         ),
         .testTarget(
             name: "VoicelyTests",
-            dependencies: ["Voicely", "VoicelyCore"],
+            dependencies: ["Voicely", "VoicelyCore", "VoicelyCLI"],
             path: "Tests/VoicelyTests",
             resources: [.copy("Fixtures")]
         ),

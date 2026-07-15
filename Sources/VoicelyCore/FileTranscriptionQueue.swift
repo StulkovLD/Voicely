@@ -1,6 +1,13 @@
 import Foundation
 import AVFoundation
 
+@MainActor
+private final class FileTranscriptionAccumulator {
+    var textFragments: [String] = []
+    var segments: [WhisperSegment] = []
+    var detectedLanguage: String?
+}
+
 /// Serial, main-actor-confined queue that runs file transcription jobs.
 ///
 /// Wraps three collaborators:
@@ -20,21 +27,42 @@ public final class FileTranscriptionQueue {
 
     // MARK: - Nested types
 
+    /// Immutable ASR semantics captured when a file enters the queue. Menu
+    /// changes made while an earlier file is running cannot alter queued work.
+    public struct RequestSettings: Sendable, Equatable {
+        public let modelName: String
+        public let translateToEnglish: Bool
+        public let preferredLanguage: String?
+
+        public init(
+            modelName: String,
+            translateToEnglish: Bool,
+            preferredLanguage: String?
+        ) {
+            self.modelName = modelName
+            self.translateToEnglish = translateToEnglish
+            self.preferredLanguage = preferredLanguage
+        }
+    }
+
     public struct Job: Identifiable, Sendable {
         public let id: UUID
         public let sourceURL: URL
         public let options: FileTranscriptionOptions
+        public let requestSettings: RequestSettings
         public var status: Status
 
         public init(
             id: UUID = UUID(),
             sourceURL: URL,
             options: FileTranscriptionOptions,
+            requestSettings: RequestSettings,
             status: Status = .pending
         ) {
             self.id = id
             self.sourceURL = sourceURL
             self.options = options
+            self.requestSettings = requestSettings
             self.status = status
         }
     }
@@ -67,25 +95,38 @@ public final class FileTranscriptionQueue {
     // MARK: - Inputs
 
     private let transcriber: any SampleTranscribing
-    private let modelName: String
+    private let defaultRequestSettings: RequestSettings
     private let centralRoot: URL
     private let chunkSampleCount: Int
+    private let coordinator: TranscriptionCoordinator
     /// Optional speaker-diarization backend. When nil, the "Identify speakers"
     /// option is silently a no-op (tests construct the queue without one). When
     /// present, a job whose options request `diarize` runs a single global pass
     /// over the whole file before writing.
-    private let diarizer: DiarizationService?
+    private let diarizer: (any FileDiarizing)?
 
     // MARK: - Mutable state (main-actor isolated)
 
     public private(set) var jobs: [Job] = []
     private var runTask: Task<Void, Never>?
+    /// Monotonic ownership token for the task currently allowed to mutate queue
+    /// state. A cancelled task keeps this token until it has actually unwound;
+    /// enqueueing more work cannot make a stale task the owner of a new batch.
+    private var nextRunGeneration: UInt64 = 0
+    private var activeRunGeneration: UInt64?
+    /// Jobs present when `cancelAll()` was requested. They remain addressable
+    /// until the cancelled task exits, then are removed as one batch. Jobs
+    /// enqueued while cancellation drains are deliberately not included.
+    private var cancelledJobIDs: Set<UUID> = []
     private var isPaused: Bool = false
     private var resumeContinuation: CheckedContinuation<Void, Never>?
     private var lastNotifiedState: QueueState?
     /// True while a `transcribeSamples` call is in flight on the engine.
     /// `awaitPaused()` polls this so dictation can safely run the engine.
     private var isEngineBusy: Bool = false
+    /// Diagnostic high-water mark for decoded PCM retained by the streaming
+    /// extractor during the latest job. Internal so tests can enforce the bound.
+    private(set) var maximumBufferedSamplesObserved: Int = 0
 
     public var onStateChange: (@MainActor @Sendable (QueueState, [Job]) -> Void)?
 
@@ -96,20 +137,43 @@ public final class FileTranscriptionQueue {
         modelName: String,
         centralRoot: URL,
         chunkSampleCount: Int = 16000 * 30,
-        diarizer: DiarizationService? = nil
+        coordinator: TranscriptionCoordinator = TranscriptionCoordinator(),
+        diarizer: (any FileDiarizing)? = nil
     ) {
         self.transcriber = transcriber
-        self.modelName = modelName
+        self.defaultRequestSettings = RequestSettings(
+            modelName: modelName,
+            translateToEnglish: false,
+            preferredLanguage: nil
+        )
         self.centralRoot = centralRoot
         self.chunkSampleCount = max(1, chunkSampleCount)
+        self.coordinator = coordinator
         self.diarizer = diarizer
     }
 
     // MARK: - Public API
 
-    public func enqueue(_ urls: [URL], options: FileTranscriptionOptions) {
+    public func enqueue(
+        _ urls: [URL],
+        options: FileTranscriptionOptions,
+        requestSettings: RequestSettings? = nil
+    ) {
+        // Starting a fresh batch (run loop idle): drop the previous batch's
+        // finished jobs first. The loop walks `jobs` by index from 0, so a
+        // leftover terminal job would be re-transcribed and the n/total counter
+        // would still include the old batch. Mid-batch enqueues (runTask != nil)
+        // keep the running jobs intact and just append.
+        if runTask == nil {
+            jobs.removeAll { $0.status.isTerminal }
+        }
+        let settingsSnapshot = requestSettings ?? defaultRequestSettings
         for url in urls {
-            jobs.append(Job(sourceURL: url, options: options))
+            jobs.append(Job(
+                sourceURL: url,
+                options: options,
+                requestSettings: settingsSnapshot
+            ))
         }
         // New work clears any stale "idle" dedupe so the next idle still fires.
         if !jobs.isEmpty { lastNotifiedState = nil }
@@ -117,11 +181,7 @@ public final class FileTranscriptionQueue {
         // running and will notify on its own, or we're about to start it
         // and it will notify from processJob. Emitting now would produce a
         // phantom .processing callback before any real work began.
-        if runTask == nil {
-            runTask = Task { [weak self] in
-                await self?.runLoop()
-            }
-        }
+        startRunIfNeeded()
     }
 
     public func pause() {
@@ -141,8 +201,16 @@ public final class FileTranscriptionQueue {
     }
 
     public func cancelAll() {
-        runTask?.cancel()
-        runTask = nil
+        guard let runTask else {
+            jobs.removeAll()
+            notifyState(force: .idle)
+            return
+        }
+
+        // Do not clear `runTask`, the engine-busy flag, or the jobs here. Some
+        // model and writer backends ignore cooperative cancellation. The task
+        // remains the sole owner until its awaited operation really returns.
+        cancelledJobIDs.formUnion(jobs.map(\.id))
         // Mark non-terminal jobs as .cancelled so the UI can tell a
         // user-initiated stop apart from a real failure.
         for i in jobs.indices {
@@ -152,13 +220,11 @@ public final class FileTranscriptionQueue {
         }
         // Release any pending pause wait so the loop can unwind.
         isPaused = false
-        isEngineBusy = false
         if let cont = resumeContinuation {
             resumeContinuation = nil
             cont.resume()
         }
-        notifyState(force: .idle)
-        jobs.removeAll()
+        runTask.cancel()
     }
 
     /// Wait until the queue is actually paused AND no transcribe call is
@@ -181,133 +247,166 @@ public final class FileTranscriptionQueue {
 
     // MARK: - Run loop
 
-    private func runLoop() async {
+    private func startRunIfNeeded() {
+        guard runTask == nil,
+              jobs.contains(where: { !$0.status.isTerminal }) else { return }
+
+        nextRunGeneration &+= 1
+        let generation = nextRunGeneration
+        activeRunGeneration = generation
+        runTask = Task { [weak self] in
+            await self?.runLoop(generation: generation)
+        }
+    }
+
+    private func runLoop(generation: UInt64) async {
+        defer { finishRun(generation: generation) }
         var index = 0
         while index < jobs.count {
-            if Task.isCancelled { return }
+            guard activeRunGeneration == generation, !Task.isCancelled else { return }
             await waitIfPaused(currentIndex: index)
-            if Task.isCancelled { return }
+            guard activeRunGeneration == generation, !Task.isCancelled else { return }
+
+            // Enqueues only append while a run is active, so this identity is
+            // stable even when more jobs arrive while the current await runs.
+            let jobID = jobs[index].id
 
             do {
-                try await processJob(at: index)
+                try await processJob(id: jobID, generation: generation)
             } catch is CancellationError {
                 return
             } catch {
-                jobs[index].status = .failed(error.localizedDescription)
+                guard let currentIndex = mutableJobIndex(
+                    id: jobID,
+                    generation: generation
+                ) else { return }
+                jobs[currentIndex].status = .failed(error.localizedDescription)
                 notifyState()
             }
 
             index += 1
         }
-        // Loop done.
-        runTask = nil
-        notifyState(force: .idle)
     }
 
-    private func processJob(at index: Int) async throws {
-        // 1. Extract audio
+    private func finishRun(generation: UInt64) {
+        guard activeRunGeneration == generation else { return }
+
+        runTask = nil
+        activeRunGeneration = nil
+        // Every engine call has returned before runLoop reaches this point.
+        isEngineBusy = false
+
+        let cancelledSnapshot = jobs.filter { cancelledJobIDs.contains($0.id) }
+        if !cancelledJobIDs.isEmpty {
+            jobs.removeAll { cancelledJobIDs.contains($0.id) }
+            cancelledJobIDs.removeAll()
+        }
+
+        if jobs.contains(where: { !$0.status.isTerminal }) {
+            // Work enqueued while a cancellation-ignoring backend was draining
+            // starts only after that backend released the old generation.
+            startRunIfNeeded()
+            return
+        }
+
+        if !cancelledSnapshot.isEmpty {
+            // Preserve the historical callback contract: observers receive the
+            // cancelled statuses once, but only after the old task is truly idle.
+            if case .idle = lastNotifiedState { return }
+            lastNotifiedState = .idle
+            onStateChange?(.idle, cancelledSnapshot)
+        } else {
+            notifyState(force: .idle)
+        }
+    }
+
+    private func processJob(id jobID: UUID, generation: UInt64) async throws {
+        let index = try requireMutableJobIndex(id: jobID, generation: generation)
+        // Defensive: never re-run a job already in a terminal state. `enqueue`
+        // prunes finished jobs before a fresh batch, but the loop advances by
+        // index — this guard makes re-transcribing a completed file impossible
+        // even if a terminal job ever survives into the array.
+        guard !jobs[index].status.isTerminal else { return }
+        let requestSettings = jobs[index].requestSettings
+        let sessionID = TranscriptionCoordinator.SessionID(rawValue: jobID)
+        defer {
+            (transcriber as? any SessionLanguageResettable)?
+                .resetLanguageSession(sessionID)
+        }
+
+        // 1. Stream-decode + transcribe. AudioExtractor applies backpressure:
+        // AVFoundation does not decode the next buffer until this chunk returns.
         jobs[index].status = .extracting
         notifyState()
 
-        let samples = try await AudioExtractor.extractPCM(
+        let accumulator = FileTranscriptionAccumulator()
+        maximumBufferedSamplesObserved = 0
+
+        let streamSummary = try await AudioExtractor.streamPCM(
             from: jobs[index].sourceURL,
+            chunkSampleCount: chunkSampleCount,
             onProgress: { _ in }
+        ) { [weak self, accumulator] chunk in
+            guard let self else { throw CancellationError() }
+            try await self.transcribeStreamedChunk(
+                chunk,
+                jobID: jobID,
+                generation: generation,
+                requestSettings: requestSettings,
+                accumulator: accumulator
+            )
+        }
+        _ = try requireMutableJobIndex(id: jobID, generation: generation)
+        maximumBufferedSamplesObserved = max(
+            maximumBufferedSamplesObserved,
+            streamSummary.maxBufferedSamples
         )
-
-        if Task.isCancelled { throw CancellationError() }
-        await waitIfPaused(currentIndex: index)
-        if Task.isCancelled { throw CancellationError() }
-
-        // 2. Chunk + transcribe
-        let chunkSize = chunkSampleCount
-        let totalChunks = samples.isEmpty
-            ? 0
-            : max(1, Int(ceil(Double(samples.count) / Double(chunkSize))))
-
-        var accumulatedText: [String] = []
-        var accumulatedSegments: [WhisperSegment] = []
-        var detectedLanguage: String? = nil
-
-        if totalChunks > 0 {
-            var chunkIndex = 0
-            var cursor = 0
-            while cursor < samples.count {
-                if Task.isCancelled { throw CancellationError() }
-                await waitIfPaused(currentIndex: index)
-                if Task.isCancelled { throw CancellationError() }
-
-                let end = min(cursor + chunkSize, samples.count)
-                let chunk = Array(samples[cursor..<end])
-                let chunkStartSeconds = Double(cursor) / 16000.0
-
-                do {
-                    let result = try await callTranscribe(chunk)
-                    let trimmed = result.text.trimmingCharacters(in: .whitespacesAndNewlines)
-                    if !trimmed.isEmpty {
-                        accumulatedText.append(trimmed)
-                    }
-                    for seg in result.segments {
-                        accumulatedSegments.append(WhisperSegment(
-                            start: seg.start + chunkStartSeconds,
-                            end: seg.end + chunkStartSeconds,
-                            text: seg.text
-                        ))
-                    }
-                    if detectedLanguage == nil {
-                        detectedLanguage = result.detectedLanguage
-                    }
-                } catch TranscriberError.silentAudio {
-                    // Silent chunk — skip without failing the job.
-                } catch is CancellationError {
-                    throw CancellationError()
-                }
-                // Any other error bubbles up and fails the job.
-
-                chunkIndex += 1
-                let progress = Double(chunkIndex) / Double(totalChunks)
-                jobs[index].status = .transcribing(progress: progress)
-                notifyState()
-
-                cursor = end
-            }
+        if streamSummary.chunkCount > 0 {
+            jobs[index].status = .transcribing(progress: 1)
+            notifyState()
         }
 
-        if Task.isCancelled { throw CancellationError() }
+        try requireRunOwnership(generation: generation)
         await waitIfPaused(currentIndex: index)
-        if Task.isCancelled { throw CancellationError() }
+        _ = try requireMutableJobIndex(id: jobID, generation: generation)
 
-        // 3. Optional diarization (single global pass over the whole file).
+        let accumulatedText = accumulator.textFragments
+        let accumulatedSegments = accumulator.segments
+        let outputLanguage = requestSettings.translateToEnglish
+            ? "en"
+            : requestSettings.preferredLanguage ?? accumulator.detectedLanguage
+
+        // 2. Optional diarization (single global disk-backed pass).
         //    Runs after transcription so the progress bar reaches 100% first;
-        //    the brief stall here is end-of-job only. `samples` are already
-        //    16 kHz mono Float32 (AudioExtractor's output), the same timeline as
-        //    the accumulated segments' absolute offsets, so the stamped speaker
-        //    turns line up with `assignSpeakers`. Any failure degrades to an
-        //    unlabelled transcript — it never sinks the job or the queue.
+        //    the brief stall here is end-of-job only. Chunk PCM has already been
+        //    released; FluidAudio maps/streams from the source URL instead of
+        //    materializing another full-file `[Float]`. Any failure degrades to
+        //    an unlabelled transcript — it never sinks the job or the queue.
         //    Surface the `.writing` phase up front so the (possibly slow, first-
         //    run model download) pass shows activity instead of a frozen bar.
         jobs[index].status = .writing
         notifyState()
 
-        let diarizedSegments = await diarizeIfRequested(
+        let diarizedSegments = try await diarizeIfRequested(
             options: jobs[index].options,
-            samples: samples,
+            sourceURL: jobs[index].sourceURL,
             segments: accumulatedSegments,
-            language: detectedLanguage
+            language: outputLanguage
         )
 
-        if Task.isCancelled { throw CancellationError() }
+        _ = try requireMutableJobIndex(id: jobID, generation: generation)
         await waitIfPaused(currentIndex: index)
-        if Task.isCancelled { throw CancellationError() }
+        _ = try requireMutableJobIndex(id: jobID, generation: generation)
 
-        // 4. Write
+        // 3. Write
         let joinedText = accumulatedText.joined(separator: " ")
         let writerInput = FileTranscriptWriter.Input(
             sourceURL: jobs[index].sourceURL,
             transcript: joinedText,
             segments: accumulatedSegments,
             options: jobs[index].options,
-            language: detectedLanguage,
-            modelName: modelName,
+            language: outputLanguage,
+            modelName: requestSettings.modelName,
             diarizedSegments: diarizedSegments
         )
 
@@ -317,10 +416,68 @@ public final class FileTranscriptionQueue {
             onNextToSourceFailure: { _, _ in nil }
         )
 
-        jobs[index].status = .completed(
+        let completionIndex = try requireMutableJobIndex(
+            id: jobID,
+            generation: generation
+        )
+
+        jobs[completionIndex].status = .completed(
             nextToSourceURL: result.nextToSourceURL,
             centralURL: result.centralURL
         )
+        notifyState()
+    }
+
+    private func transcribeStreamedChunk(
+        _ chunk: AudioExtractor.PCMChunk,
+        jobID: UUID,
+        generation: UInt64,
+        requestSettings: RequestSettings,
+        accumulator: FileTranscriptionAccumulator
+    ) async throws {
+        var index = try requireMutableJobIndex(id: jobID, generation: generation)
+        await waitIfPaused(currentIndex: index)
+        index = try requireMutableJobIndex(id: jobID, generation: generation)
+
+        maximumBufferedSamplesObserved = max(
+            maximumBufferedSamplesObserved,
+            chunk.samples.count
+        )
+        let chunkStartSeconds = Double(chunk.startSample) / AudioExtractor.outputSampleRate
+
+        do {
+            let sessionID = TranscriptionCoordinator.SessionID(rawValue: jobID)
+            let result = try await callTranscribe(
+                chunk.samples,
+                sessionID: sessionID,
+                jobID: jobID,
+                generation: generation,
+                requestSettings: requestSettings
+            )
+            index = try requireMutableJobIndex(id: jobID, generation: generation)
+            let trimmed = result.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty {
+                accumulator.textFragments.append(trimmed)
+            }
+            for segment in result.segments {
+                accumulator.segments.append(WhisperSegment(
+                    start: segment.start + chunkStartSeconds,
+                    end: segment.end + chunkStartSeconds,
+                    text: segment.text
+                ))
+            }
+            if accumulator.detectedLanguage == nil {
+                accumulator.detectedLanguage = result.detectedLanguage
+            }
+        } catch TranscriberError.silentAudio {
+            // Silent chunk — skip without failing the job.
+        } catch is CancellationError {
+            throw CancellationError()
+        }
+        // Any other error bubbles up and fails the job.
+
+        index = try requireMutableJobIndex(id: jobID, generation: generation)
+        jobs[index].status = .transcribing(progress: chunk.progress)
         notifyState()
     }
 
@@ -338,18 +495,18 @@ public final class FileTranscriptionQueue {
     ///   read failure) — logged, transcript written without speaker labels.
     private func diarizeIfRequested(
         options: FileTranscriptionOptions,
-        samples: [Float],
+        sourceURL: URL,
         segments: [WhisperSegment],
         language: String?
-    ) async -> [DialogueSegment]? {
+    ) async throws -> [DialogueSegment]? {
         guard options.diarize, let diarizer, !segments.isEmpty else { return nil }
 
         let turns: [SpeakerTurn]
         do {
-            turns = try await diarizer.diarize(
-                samples: samples,
-                sampleRate: DiarizationService.requiredSampleRate
-            )
+            turns = try await diarizer.diarize(fileURL: sourceURL)
+            try Task.checkCancellation()
+        } catch is CancellationError {
+            throw CancellationError()
         } catch {
             // Heavy one-pass diarization can fail on giant files (RAM/time) or
             // when models can't be fetched. Keep the transcript; drop the labels.
@@ -376,11 +533,69 @@ public final class FileTranscriptionQueue {
 
     /// Wrapper around `transcribeSamples` that tracks engine busy state so
     /// `awaitPaused()` can tell callers when the engine is actually free.
-    private func callTranscribe(_ chunk: [Float]) async throws -> WhisperTranscription {
+    private func callTranscribe(
+        _ chunk: [Float],
+        sessionID: TranscriptionCoordinator.SessionID,
+        jobID: UUID,
+        generation: UInt64,
+        requestSettings: RequestSettings
+    ) async throws -> WhisperTranscription {
         isEngineBusy = true
         defer { isEngineBusy = false }
-        return try await transcriber.transcribeSamples(
-            chunk, translate: false, language: nil)
+        let result = try await coordinator.withLease(
+            sessionID: sessionID,
+            priority: .file
+        ) {
+            if let sessionTranscriber = transcriber as? any SessionSampleTranscribing {
+                return try await sessionTranscriber.transcribeSamples(
+                    chunk,
+                    translate: requestSettings.translateToEnglish,
+                    language: requestSettings.preferredLanguage,
+                    sessionID: sessionID
+                )
+            }
+            return try await transcriber.transcribeSamples(
+                chunk,
+                translate: requestSettings.translateToEnglish,
+                language: requestSettings.preferredLanguage
+            )
+        }
+        _ = try requireMutableJobIndex(id: jobID, generation: generation)
+        return result
+    }
+
+    // MARK: - Run ownership
+
+    private func requireRunOwnership(generation: UInt64) throws {
+        try Task.checkCancellation()
+        guard activeRunGeneration == generation else {
+            throw CancellationError()
+        }
+    }
+
+    private func requireMutableJobIndex(
+        id: UUID,
+        generation: UInt64
+    ) throws -> Int {
+        try requireRunOwnership(generation: generation)
+        guard !cancelledJobIDs.contains(id),
+              let index = jobs.firstIndex(where: { $0.id == id }),
+              !jobs[index].status.isTerminal else {
+            throw CancellationError()
+        }
+        return index
+    }
+
+    private func mutableJobIndex(
+        id: UUID,
+        generation: UInt64
+    ) -> Int? {
+        guard !Task.isCancelled,
+              activeRunGeneration == generation,
+              !cancelledJobIDs.contains(id),
+              let index = jobs.firstIndex(where: { $0.id == id }),
+              !jobs[index].status.isTerminal else { return nil }
+        return index
     }
 
     // MARK: - Pause coordination

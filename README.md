@@ -12,9 +12,9 @@
 
 ## What it does
 
-**Dictation mode** (Option+Space): Press hotkey, speak, press again. Text appears at your cursor - any app, any text field. Floating glass pill shows audio waveform while recording, loading animation while transcribing.
+**Dictation mode** (Option+Space): Press hotkey, speak, press again. Voicely inserts text only into the same non-secure Accessibility target that was focused when recording began. If focus changes or direct insertion is unavailable, it copies the transcript for manual paste; secure targets remain save-only. A floating glass pill shows the audio waveform while recording and a loading animation while transcribing.
 
-**Call recording mode** (menubar): Records system audio + microphone simultaneously. Transcribes with speaker diarization (who said what). Saves to `~/Transcripts/` as markdown with timestamps.
+**Call recording mode** (menu bar): Records system audio + microphone simultaneously. Transcribes with speaker diarization (who said what). Saves to `~/Documents/Voicely/calls/<id>/` as markdown + JSONL + WAV artifacts.
 
 ## Why Voicely
 
@@ -29,43 +29,75 @@
 
 ## Install
 
-**Prerequisites:**
-- macOS 14+ (Apple Silicon recommended)
-- Xcode Command Line Tools (`xcode-select --install`)
+To download and verify the current community DMG:
 
 ```bash
-# Clone
-git clone https://github.com/StulkovLD/Voicely.git
-cd Voicely
-
-# Build
-swift build -c release
-
-# Run
-.build/release/Voicely
+curl -fsSL https://voicely.art/install.sh | sh
 ```
 
-**Speech recognition:** WhisperKit (on-device, CoreML/ANE). On first use it downloads a Whisper model sized to your RAM — Large V3 Turbo (~3 GB) on 16 GB+, a quantized turbo (~632 MB) on 8 GB, or small/base on less. The first transcription also compiles the model for the Neural Engine, which can take a few minutes; subsequent runs are fast.
+The current public build is ad-hoc signed and is not notarized by Apple. The
+helper verifies the DMG SHA-256 and the app's ad-hoc code integrity in a private
+staging directory, applies and verifies macOS quarantine, saves the versioned
+DMG in `~/Downloads`, and opens the exact verified read-only volume in Finder.
+It does not bypass Gatekeeper, copy the app, launch it, or run setup.
+
+Drag `Voicely.app` to **Applications** yourself. If macOS blocks the first open,
+go to **System Settings → Privacy & Security**, review the warning, and choose
+**Open Anyway** only if you trust this community build. A future Developer ID +
+notarized release can use the automatic transactional install path.
+
+Ad-hoc code identity can change between releases, so macOS may ask you to grant
+Microphone, Accessibility, or Screen Recording again after an update.
+
+**What happens on first launch**
+1. Look for the Voicely menu-bar icon.
+2. Approve **Microphone** and **Accessibility** when macOS asks.
+3. Choose a local voice model.
+4. Wait for the first model download + prepare step.
+5. **Screen Recording** is only requested later, when you first use **Record Call**.
+
+Current first-model lineup:
+- **GigaAM V3 RU** — ~426 MB, needs 8 GB RAM, best Russian experience
+- **Large V3 Turbo Q** — ~632 MB, needs 8 GB RAM
+- **Medium** — ~1.5 GB, needs 16 GB RAM
+- **Large V3 Turbo** — ~3 GB, needs 24+ GB RAM
+
+Clean installs ask you to choose explicitly; Voicely does not silently auto-pick a model anymore. The first prepare step can take a minute; later launches are fast.
 
 **Call recording** captures system audio via **ScreenCaptureKit** (macOS Screen Recording permission) — no BlackHole or virtual audio device needed.
 
-**Speaker diarization** runs fully on-device via **FluidAudio** (pyannote + WeSpeaker models). The models download automatically on first use — no Hugging Face account or token required.
+**Speaker diarization** runs fully on-device via **FluidAudio** (pyannote + WeSpeaker models). The diarization models download automatically on first use — no Hugging Face account or token required.
+
+**Build from source**
+
+Prerequisites:
+- macOS 14+ on Apple Silicon for the prebuilt app
+- Xcode Command Line Tools (`xcode-select --install`)
+
+```bash
+git clone https://github.com/StulkovLD/Voicely.git
+cd Voicely
+
+swift build -c release --product Voicely
+swift build -c release --product VoicelyCLI
+
+.build/release/Voicely
+```
 
 ## Usage
 
 | Action | How |
 |--------|-----|
 | Dictate | **Option+Space** to start/stop. Text pastes at cursor. |
-| Record call | Menubar VC -> "Record Call" / "Stop Recording" |
-| Open transcripts | Menubar VC -> "Open Transcripts" |
+| Record call | Menu bar → "Record Call" / "Stop Recording" |
+| Open transcripts | Menu bar → "Open Transcripts" |
 
-First dictation downloads the Whisper model (~1.5 GB). Subsequent uses are instant.
+On a clean install, Voicely asks you to choose a voice model. The first local-model download can be ~426 MB to ~3 GB depending on what you pick, and the first prepare step can take a minute.
 
 **macOS permissions required** (the onboarding wizard requests these; grant to **Voicely**):
 - **Microphone** — record your voice for dictation and your side of calls
 - **Accessibility** — paste the transcript into the focused app
-- **Input Monitoring** — the global Option+Space hotkey
-- **Screen Recording** — capture the other side of a call (system audio)
+- **Screen Recording** — capture the other side of a call (system audio); requested only when you first use Record Call
 
 ## Use Voicely from your agent
 
@@ -111,8 +143,10 @@ swift build -c release --product VoicelyCLI
 ### 2. Connect your agents — one command
 
 `voicely mcp` speaks standard stdio MCP, so it works with **any** MCP-capable
-harness. `voicely setup` (run automatically by the website installer) detects the
-agents you have and registers Voicely in each of them for you:
+harness. After you drag the app to Applications, approve the first open, and
+finish onboarding, run the setup command from step 1 yourself. It exposes the
+CLI and detects the agents you have. Use `voicely connect` to register all of
+them or one by name:
 
 ```bash
 voicely connect            # every installed harness
@@ -145,15 +179,14 @@ No daemon: the server loads the WhisperKit model itself on the first
 ## Architecture
 
 ```
-Option+Space ──> MicRecorder ──> Whisper large-v3-turbo ──> Clipboard + Cmd+V
-                     |                                           |
-                     v                                           v
-              AudioOverlay                               CursorInjector
-           (liquid glass pill)                         (paste at cursor)
-                                                             |
-                                                             v
-                                                      TranscriptStore
-                                              (~/Documents/Voicely/*.md)
+Option+Space ──> MicRecorder ──> Selected local model ──> CursorInjector
+                     |                                  (target-bound AX insert)
+                     v                                           |
+              AudioOverlay                                      +──> Clipboard fallback
+           (liquid glass pill)                                  |    (manual paste only)
+                                                                v
+                                                         TranscriptStore
+                                                 (~/Documents/Voicely/*.md)
 ```
 
 **Call recording flow:**

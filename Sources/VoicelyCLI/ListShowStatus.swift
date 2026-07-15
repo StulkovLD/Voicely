@@ -111,39 +111,19 @@ struct Status: ParsableCommand {
     var json = false
 
     func run() throws {
-        let recommended = WhisperModel.recommended()
-        let modelOnDisk = FileManager.default.fileExists(atPath: recommended.modelDirectoryPath)
-        let ramGB = WhisperModel.systemRAMGB
+        let snapshot = StatusSnapshot.gather()
 
         if json {
-            let obj: [String: Any] = [
-                "version": VoicelyCLIVersion.current,
-                "recommendedModel": recommended.variant,
-                "recommendedModelName": recommended.displayName,
-                "modelDownloaded": modelOnDisk,
-                "systemRAMGB": ramGB,
-                "paths": [
-                    "base": TranscriptStore.baseDir.path,
-                    "dictations": TranscriptStore.directory(for: .dictations).path,
-                    "calls": TranscriptStore.directory(for: .calls).path,
-                    "files": TranscriptStore.directory(for: .files).path,
-                ],
-            ]
             if let data = try? JSONSerialization.data(
-                withJSONObject: obj, options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]),
+                withJSONObject: snapshot.jsonObject,
+                options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
+            ),
                let s = String(data: data, encoding: .utf8) {
                 emitLine(s)
             }
             return
         }
 
-        emitLine("voicely \(VoicelyCLIVersion.current)")
-        emitLine("Recommended model: \(recommended.displayName) (\(recommended.variant)) — \(recommended.sizeLabel)")
-        emitLine("Model downloaded:  \(modelOnDisk ? "yes" : "no")")
-        emitLine("System RAM:        \(ramGB) GB")
-        emitLine("Transcripts:       \(TranscriptStore.baseDir.path)")
-        emitLine("  dictations:      \(TranscriptStore.directory(for: .dictations).path)")
-        emitLine("  calls:           \(TranscriptStore.directory(for: .calls).path)")
-        emitLine("  files:           \(TranscriptStore.directory(for: .files).path)")
+        snapshot.textLines.forEach(emitLine)
     }
 }

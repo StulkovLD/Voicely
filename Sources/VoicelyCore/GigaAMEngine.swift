@@ -61,7 +61,11 @@ private struct GigaAMConvertInfo: Decodable {
     }
 }
 
-private struct GigaAMRuntime {
+/// Core ML model instances are published once after loading and never mutated.
+/// GigaAMEngine serializes runtime publication and admits one transcription at
+/// a time, so crossing the loader Task boundary cannot create concurrent model
+/// mutation. Keep this invariant if runtime ownership changes.
+private struct GigaAMRuntime: @unchecked Sendable {
     let encoder: MLModel
     let decoder: MLModel
     let joint: MLModel
@@ -70,34 +74,37 @@ private struct GigaAMRuntime {
     let convert: GigaAMConvertInfo
 }
 
-private struct GigaAMAsset {
-    let relativePath: String
-}
-
 private enum GigaAMConstants {
-    static let repo = "smkrv/gigaam-v3-e2e-rnnt-coreml"
     static let supportedLanguage = "ru"
     static let maxSymbolsPerFrame = 10
     static let computeUnits: MLComputeUnits = .cpuAndGPU
     static let windowSamples = 30 * 16000
     static let minNonSilentRMS: Float = 0.005
-    static let requiredAssets: [GigaAMAsset] = [
-        .init(relativePath: "GigaAMv3Encoder.mlpackage/Manifest.json"),
-        .init(relativePath: "GigaAMv3Encoder.mlpackage/Data/com.apple.CoreML/model.mlmodel"),
-        .init(relativePath: "GigaAMv3Encoder.mlpackage/Data/com.apple.CoreML/weights/weight.bin"),
-        .init(relativePath: "GigaAMv3DecoderStep.mlpackage/Manifest.json"),
-        .init(relativePath: "GigaAMv3DecoderStep.mlpackage/Data/com.apple.CoreML/model.mlmodel"),
-        .init(relativePath: "GigaAMv3DecoderStep.mlpackage/Data/com.apple.CoreML/weights/weight.bin"),
-        .init(relativePath: "GigaAMv3JointStep.mlpackage/Manifest.json"),
-        .init(relativePath: "GigaAMv3JointStep.mlpackage/Data/com.apple.CoreML/model.mlmodel"),
-        .init(relativePath: "GigaAMv3JointStep.mlpackage/Data/com.apple.CoreML/weights/weight.bin"),
-        .init(relativePath: "tokens.json"),
-        .init(relativePath: "model_info.json"),
-        .init(relativePath: "convert_info.json"),
-    ]
+}
 
-    static func resolveURL(for relativePath: String) -> URL {
-        URL(string: "https://huggingface.co/\(repo)/resolve/main/\(relativePath)?download=1")!
+/// A cancellation epoch invalidates work already in flight without poisoning
+/// the next request. Tokens are request-scoped and never reset globally.
+final class GigaAMRequestCancellation: @unchecked Sendable {
+    typealias Token = UInt64
+
+    private let lock = NSLock()
+    private var epoch: Token = 0
+
+    func begin() -> Token {
+        lock.withLock { epoch }
+    }
+
+    func cancelCurrentRequests() {
+        lock.withLock { epoch &+= 1 }
+    }
+
+    func isCurrent(_ token: Token) -> Bool {
+        lock.withLock { epoch == token }
+    }
+
+    func check(_ token: Token) throws {
+        try Task.checkCancellation()
+        guard isCurrent(token) else { throw CancellationError() }
     }
 }
 
@@ -113,6 +120,14 @@ private extension MLMultiArray {
     }
 
     func float(atFlatIndex index: Int) -> Float {
+        // CoreML exposes Int8 multi-arrays starting with the macOS 26 SDK.
+        // Compare the stable Objective-C raw value so this target still
+        // compiles with Xcode 16.4 while decoding Int8 on newer runtimes.
+        if dataType.rawValue == (0x20000 | 8) {
+            let ptr = dataPointer.bindMemory(to: Int8.self, capacity: elementCount)
+            return Float(ptr[index])
+        }
+
         switch dataType {
         case .float32:
             let ptr = dataPointer.bindMemory(to: Float32.self, capacity: elementCount)
@@ -126,10 +141,7 @@ private extension MLMultiArray {
         case .int32:
             let ptr = dataPointer.bindMemory(to: Int32.self, capacity: elementCount)
             return Float(ptr[index])
-        case .int8:
-            let ptr = dataPointer.bindMemory(to: Int8.self, capacity: elementCount)
-            return Float(ptr[index])
-        @unknown default:
+        default:
             return self[index].floatValue
         }
     }
@@ -147,12 +159,13 @@ final class GigaAMEngine: @unchecked Sendable, TranscriberEngine, SampleTranscri
     private let model: WhisperModel
     private let onProgress: (@Sendable (TranscriberStatus) -> Void)?
     private let stateLock = NSLock()
+    private let requestCancellation = GigaAMRequestCancellation()
 
     private var runtime: GigaAMRuntime?
     private var isLoading = false
     private var isDownloadInProgress = false
     private var isTranscribing = false
-    private var cancelled = false
+    private var activeLoadTask: Task<GigaAMRuntime, Error>?
 
     var isCurrentlyDownloading: Bool {
         stateLock.lock()
@@ -166,14 +179,19 @@ final class GigaAMEngine: @unchecked Sendable, TranscriberEngine, SampleTranscri
     }
 
     func preload() async throws {
-        _ = try await ensureRuntimeLoaded()
+        try GigaAMPlatformReadiness.requireSupported()
+        let token = requestCancellation.begin()
+        _ = try await ensureRuntimeLoaded(cancellationToken: token)
     }
 
     func cancel() {
+        let loadTask: Task<GigaAMRuntime, Error>?
+        requestCancellation.cancelCurrentRequests()
         stateLock.lock()
-        cancelled = true
         isDownloadInProgress = false
+        loadTask = activeLoadTask
         stateLock.unlock()
+        loadTask?.cancel()
         vlog("GigaAM: cancel requested")
     }
 
@@ -201,6 +219,7 @@ final class GigaAMEngine: @unchecked Sendable, TranscriberEngine, SampleTranscri
         let alreadyTranscribing = trySetTranscribing(true)
         guard !alreadyTranscribing else { throw TranscriberError.engineBusy }
         defer { _ = trySetTranscribing(false) }
+        let cancellationToken = requestCancellation.begin()
 
         guard !samples.isEmpty else { throw TranscriberError.recordingTooShort }
         let rms = Self.peakWindowRMS(samples)
@@ -212,11 +231,15 @@ final class GigaAMEngine: @unchecked Sendable, TranscriberEngine, SampleTranscri
         var cursor = 0
         let chunkSize = GigaAMConstants.windowSamples
         while cursor < samples.count {
-            try checkCancellation()
+            try checkCancellation(cancellationToken)
             let end = min(cursor + chunkSize, samples.count)
             let chunk = Array(samples[cursor..<end])
             let offsetSec = Double(cursor) / 16000.0
-            let chunkResult = try await transcribeSingleWindow(chunk, offsetSec: offsetSec)
+            let chunkResult = try await transcribeSingleWindow(
+                chunk,
+                offsetSec: offsetSec,
+                cancellationToken: cancellationToken
+            )
             allSegments.append(contentsOf: chunkResult.segments)
             cursor = end
         }
@@ -225,15 +248,19 @@ final class GigaAMEngine: @unchecked Sendable, TranscriberEngine, SampleTranscri
         return WhisperTranscription(text: text, segments: allSegments, detectedLanguage: text.isEmpty ? nil : GigaAMConstants.supportedLanguage)
     }
 
-    private func transcribeSingleWindow(_ samples: [Float], offsetSec: Double) async throws -> WhisperTranscription {
-        let runtime = try await ensureRuntimeLoaded()
-        try checkCancellation()
+    private func transcribeSingleWindow(
+        _ samples: [Float],
+        offsetSec: Double,
+        cancellationToken: GigaAMRequestCancellation.Token
+    ) async throws -> WhisperTranscription {
+        let runtime = try await ensureRuntimeLoaded(cancellationToken: cancellationToken)
+        try checkCancellation(cancellationToken)
 
         let durationSec = Double(samples.count) / 16000.0
         guard durationSec > 0 else { return WhisperTranscription(text: "", segments: [], detectedLanguage: nil) }
 
         let (features, trueFrames) = try Self.makeFeatures(from: samples, info: runtime.info, convert: runtime.convert)
-        try checkCancellation()
+        try checkCancellation(cancellationToken)
 
         let encodedOut = try await runtime.encoder.prediction(from: MLDictionaryFeatureProvider(dictionary: [
             "features": features,
@@ -254,7 +281,7 @@ final class GigaAMEngine: @unchecked Sendable, TranscriberEngine, SampleTranscri
         var lastToken = runtime.info.blankID
 
         for frame in 0..<encodedLen {
-            try checkCancellation()
+            try checkCancellation(cancellationToken)
             let encT = Self.extractFrame(encoded, frame: frame, hiddenSize: runtime.info.encHidden)
             for _ in 0..<GigaAMConstants.maxSymbolsPerFrame {
                 let decoderOut = try await runtime.decoder.prediction(from: MLDictionaryFeatureProvider(dictionary: [
@@ -305,15 +332,32 @@ final class GigaAMEngine: @unchecked Sendable, TranscriberEngine, SampleTranscri
         }
     }
 
-    private func ensureRuntimeLoaded() async throws -> GigaAMRuntime {
+    private func ensureRuntimeLoaded(
+        cancellationToken: GigaAMRequestCancellation.Token
+    ) async throws -> GigaAMRuntime {
+        try GigaAMPlatformReadiness.requireSupported()
+        try checkCancellation(cancellationToken)
         if let runtime = currentRuntime() { return runtime }
         if tryStartLoading() {
-            resetCancellation()
+            let task = Task {
+                try await Self.loadRuntime(
+                    model: model,
+                    onProgress: onProgress,
+                    engine: self,
+                    cancellationToken: cancellationToken
+                )
+            }
+            setActiveLoadTask(task, cancellationToken: cancellationToken)
             do {
-                let runtime = try await Self.loadRuntime(model: model, onProgress: onProgress, engine: self)
-                finishLoading(runtime)
+                let runtime = try await withTaskCancellationHandler {
+                    try await task.value
+                } onCancel: {
+                    task.cancel()
+                }
+                try checkCancellation(cancellationToken)
+                finishLoading(runtime, cancellationToken: cancellationToken)
             } catch {
-                finishLoading(nil)
+                finishLoading(nil, cancellationToken: cancellationToken)
                 throw error
             }
         } else {
@@ -322,7 +366,16 @@ final class GigaAMEngine: @unchecked Sendable, TranscriberEngine, SampleTranscri
             while currentRuntime() == nil && isLoadInProgress() && waited < maxWait {
                 try await Task.sleep(nanoseconds: 100_000_000)
                 waited += 100_000_000
-                try checkCancellation()
+                try checkCancellation(cancellationToken)
+            }
+            if currentRuntime() == nil && !isLoadInProgress() {
+                // The loader this request observed may belong to an older,
+                // cancelled epoch. The current request becomes the next loader
+                // instead of inheriting modelNotReady from that operation.
+                try checkCancellation(cancellationToken)
+                return try await ensureRuntimeLoaded(
+                    cancellationToken: cancellationToken
+                )
             }
         }
         guard let runtime = currentRuntime() else {
@@ -351,13 +404,28 @@ final class GigaAMEngine: @unchecked Sendable, TranscriberEngine, SampleTranscri
         return true
     }
 
-    private func finishLoading(_ runtime: GigaAMRuntime?) {
+    private func setActiveLoadTask(
+        _ task: Task<GigaAMRuntime, Error>,
+        cancellationToken: GigaAMRequestCancellation.Token
+    ) {
         stateLock.lock()
-        if !cancelled {
+        activeLoadTask = task
+        stateLock.unlock()
+        if !requestCancellation.isCurrent(cancellationToken) { task.cancel() }
+    }
+
+    private func finishLoading(
+        _ runtime: GigaAMRuntime?,
+        cancellationToken: GigaAMRequestCancellation.Token
+    ) {
+        let mayPublish = requestCancellation.isCurrent(cancellationToken)
+        stateLock.lock()
+        if mayPublish {
             self.runtime = runtime
         }
         isLoading = false
         isDownloadInProgress = false
+        activeLoadTask = nil
         stateLock.unlock()
     }
 
@@ -375,51 +443,63 @@ final class GigaAMEngine: @unchecked Sendable, TranscriberEngine, SampleTranscri
         return was
     }
 
-    private func resetCancellation() {
-        stateLock.lock()
-        cancelled = false
-        stateLock.unlock()
-    }
-
-    private func checkCancellation() throws {
-        stateLock.lock()
-        let cancelled = self.cancelled
-        stateLock.unlock()
-        if cancelled {
-            throw CancellationError()
-        }
+    private func checkCancellation(_ token: GigaAMRequestCancellation.Token) throws {
+        try requestCancellation.check(token)
     }
 
     private static func loadRuntime(
         model: WhisperModel,
         onProgress: (@Sendable (TranscriberStatus) -> Void)?,
-        engine: GigaAMEngine
+        engine: GigaAMEngine,
+        cancellationToken: GigaAMRequestCancellation.Token
     ) async throws -> GigaAMRuntime {
+        try GigaAMPlatformReadiness.requireSupported()
+        try engine.checkCancellation(cancellationToken)
+
         let root = model.modelDirectory
         let sourceRoot = root.appendingPathComponent("source")
         let compiledRoot = root.appendingPathComponent("compiled")
-        try FileManager.default.createDirectory(at: sourceRoot, withIntermediateDirectories: true)
-        try FileManager.default.createDirectory(at: compiledRoot, withIntermediateDirectories: true)
+        let fileSystem = FoundationGigaAMAssetFileSystem()
+        try fileSystem.createPrivateDirectory(at: root)
+        try GigaAMSecureStorage.requireDirectory(root)
+        let interprocessLock = try GigaAMInterprocessLock(modelRoot: root)
+        defer { withExtendedLifetime(interprocessLock) {} }
+        try engine.checkCancellation(cancellationToken)
+        try fileSystem.createPrivateDirectory(at: sourceRoot)
+        let preflightCompiledCacheReady = GigaAMCompiledCache.isReady(compiledRoot: compiledRoot)
 
-        let totalAssets = max(1, GigaAMConstants.requiredAssets.count)
-        var completedAssets = 0
+        let downloader = GigaAMAssetDownloader(fileSystem: fileSystem)
+        let installResult: GigaAMAssetInstallResult
         engine.setDownloading(true)
-        for asset in GigaAMConstants.requiredAssets {
-            try engine.checkCancellation()
-            let destination = sourceRoot.appendingPathComponent(asset.relativePath)
-            if !FileManager.default.fileExists(atPath: destination.path) {
-                try FileManager.default.createDirectory(at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
-                onProgress?(.downloadingModel(progress: Double(completedAssets) / Double(totalAssets)))
-                let (tmpURL, _) = try await URLSession.shared.download(from: GigaAMConstants.resolveURL(for: asset.relativePath))
-                if FileManager.default.fileExists(atPath: destination.path) {
-                    try? FileManager.default.removeItem(at: destination)
-                }
-                try FileManager.default.moveItem(at: tmpURL, to: destination)
+        do {
+            installResult = try await downloader.ensureAssets(
+                in: sourceRoot,
+                additionalRequiredBytes: preflightCompiledCacheReady
+                    ? 0
+                    : GigaAMAssetCatalog.totalExpectedByteCount
+            ) { completed, total in
+                let progress = total > 0 ? Double(completed) / Double(total) : 1
+                onProgress?(.downloadingModel(progress: min(0.95, progress)))
             }
-            completedAssets += 1
-            onProgress?(.downloadingModel(progress: min(0.95, Double(completedAssets) / Double(totalAssets))))
+            engine.setDownloading(false)
+        } catch {
+            engine.setDownloading(false)
+            throw error
         }
-        engine.setDownloading(false)
+        try engine.checkCancellation(cancellationToken)
+        try GigaAMSecureStorage.hardenTree(at: sourceRoot)
+
+        _ = installResult
+        let compiledCacheWasReady = GigaAMCompiledCache.isReady(compiledRoot: compiledRoot)
+        let mustRebuildCompiledCache = !compiledCacheWasReady
+
+        if mustRebuildCompiledCache {
+            if FileManager.default.fileExists(atPath: compiledRoot.path)
+                || (try? FileManager.default.attributesOfItem(atPath: compiledRoot.path)) != nil {
+                try FileManager.default.removeItem(at: compiledRoot)
+            }
+        }
+        try fileSystem.createPrivateDirectory(at: compiledRoot)
         onProgress?(.loadingModel)
 
         let decoder = JSONDecoder()
@@ -432,18 +512,28 @@ final class GigaAMEngine: @unchecked Sendable, TranscriberEngine, SampleTranscri
         let encoderModel = try loadCompiledModel(
             packageURL: sourceRoot.appendingPathComponent("GigaAMv3Encoder.mlpackage"),
             compiledRoot: compiledRoot,
-            configuration: config
+            configuration: config,
+            allowCompilation: mustRebuildCompiledCache
         )
         let decoderModel = try loadCompiledModel(
             packageURL: sourceRoot.appendingPathComponent("GigaAMv3DecoderStep.mlpackage"),
             compiledRoot: compiledRoot,
-            configuration: config
+            configuration: config,
+            allowCompilation: mustRebuildCompiledCache
         )
         let jointModel = try loadCompiledModel(
             packageURL: sourceRoot.appendingPathComponent("GigaAMv3JointStep.mlpackage"),
             compiledRoot: compiledRoot,
-            configuration: config
+            configuration: config,
+            allowCompilation: mustRebuildCompiledCache
         )
+        try engine.checkCancellation(cancellationToken)
+        if mustRebuildCompiledCache {
+            try GigaAMCompiledCache.seal(compiledRoot: compiledRoot)
+        }
+        guard GigaAMCompiledCache.isReady(compiledRoot: compiledRoot) else {
+            throw GigaAMAssetDownloadError.insecureTopology(compiledRoot.path)
+        }
         return GigaAMRuntime(
             encoder: encoderModel,
             decoder: decoderModel,
@@ -457,13 +547,17 @@ final class GigaAMEngine: @unchecked Sendable, TranscriberEngine, SampleTranscri
     private static func loadCompiledModel(
         packageURL: URL,
         compiledRoot: URL,
-        configuration: MLModelConfiguration
+        configuration: MLModelConfiguration,
+        allowCompilation: Bool
     ) throws -> MLModel {
         try FileManager.default.createDirectory(at: compiledRoot, withIntermediateDirectories: true)
         let compiledURL = compiledRoot.appendingPathComponent(
             packageURL.deletingPathExtension().lastPathComponent + ".mlmodelc"
         )
         if !FileManager.default.fileExists(atPath: compiledURL.path) {
+            guard allowCompilation else {
+                throw GigaAMAssetDownloadError.insecureTopology(compiledURL.path)
+            }
             let temporaryCompiledURL = try MLModel.compileModel(at: packageURL)
             if FileManager.default.fileExists(atPath: compiledURL.path) {
                 try? FileManager.default.removeItem(at: compiledURL)
@@ -498,7 +592,16 @@ final class GigaAMEngine: @unchecked Sendable, TranscriberEngine, SampleTranscri
         let powerBins = info.melNFFT / 2 + 1
         let filterBank = buildMelFilterBank(sampleRate: 16000, nFFT: info.melNFFT, melBins: melBins)
         let window = buildHannWindow(count: info.melWinLength)
-        guard let dft = vDSP.DFT(count: info.melNFFT, direction: .forward, transformType: .complexComplex, ofType: Float.self) else {
+        let dft: vDSP.DiscreteFourierTransform<Float>
+        do {
+            dft = try vDSP.DiscreteFourierTransform(
+                previous: nil,
+                count: info.melNFFT,
+                direction: .forward,
+                transformType: .complexComplex,
+                ofType: Float.self
+            )
+        } catch {
             throw TranscriberError.whisperKitFailed("Failed to create DFT for GigaAM mel frontend")
         }
 
@@ -670,15 +773,9 @@ final class GigaAMEngine: @unchecked Sendable, TranscriberEngine, SampleTranscri
             throw TranscriberError.whisperKitFailed("Failed to create resampling buffer")
         }
         var error: NSError?
-        var consumed = false
+        let input = SingleBufferAudioConverterInput(buffer)
         converter.convert(to: output, error: &error) { _, outStatus in
-            if consumed {
-                outStatus.pointee = .endOfStream
-                return nil
-            }
-            consumed = true
-            outStatus.pointee = .haveData
-            return buffer
+            input.provide(status: outStatus)
         }
         if let error {
             throw TranscriberError.whisperKitFailed("Resampling failed: \(error)")

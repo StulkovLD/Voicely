@@ -38,6 +38,8 @@ final class Recorder: @unchecked Sendable {
     private var maxDurationTimer: Timer?
     private var warningTimer: Timer?
     private var configChangeObserver: Any?
+    private var dictationRecoverySession: DictationRecoverySession?
+    private(set) var lastStartErrorMessage: String?
     var onMaxDuration: (@Sendable () -> Void)?
     /// Max dictation length. `nil` = unlimited — no auto-stop timer is scheduled,
     /// so dictation runs as long as the user keeps the session open. Was 1 h;
@@ -104,10 +106,14 @@ final class Recorder: @unchecked Sendable {
 
     /// Start recording from default microphone. Returns false if engine failed to start.
     @discardableResult
-    func startMic() -> Bool {
+    func startMic(
+        recoveryStore: DictationRecoveryStore? = nil,
+        sourceApp: String? = nil
+    ) -> Bool {
         // #21: Serialize engine creation to prevent concurrent calls leaking engines
         stateLock.lock()
         defer { stateLock.unlock() }
+        lastStartErrorMessage = nil
 
         if let existing = engine, existing.isRunning { return true }
 
@@ -118,8 +124,26 @@ final class Recorder: @unchecked Sendable {
         // #6 minor: Validate format instead of checking numberOfInputs
         guard format.channelCount > 0, format.sampleRate > 0 else {
             print("[Voicely] Invalid input format: channels=\(format.channelCount), sampleRate=\(format.sampleRate)")
+            lastStartErrorMessage = "Microphone format unavailable"
             return false
         }
+
+        let recoverySession: DictationRecoverySession?
+        do {
+            recoverySession = try recoveryStore?.begin(
+                startTime: Date(),
+                sourceApp: sourceApp,
+                sampleRate: format.sampleRate
+            )
+        } catch {
+            lastStartErrorMessage = "Cannot create private recovery recording"
+            NSLog(
+                "[Voicely] Dictation recovery start failed: %@",
+                error.localizedDescription
+            )
+            return false
+        }
+        dictationRecoverySession = recoverySession
 
         let channelCount = Int(format.channelCount)
 
@@ -157,6 +181,7 @@ final class Recorder: @unchecked Sendable {
             self.bufferLock.lock()
             self.audioBuffer.append(contentsOf: samples)
             self.bufferLock.unlock()
+            recoverySession?.append(samples)
 
             // Calculate RMS for visualization (from mono samples)
             var rms: Float = 0
@@ -235,6 +260,9 @@ final class Recorder: @unchecked Sendable {
             print("[Voicely] Failed to start recording: \(error)")
             inputNode.removeTap(onBus: 0)
             capturedFormat = nil
+            lastStartErrorMessage = error.localizedDescription
+            recoverySession?.discardEmptyStart()
+            dictationRecoverySession = nil
             return false
         }
     }
@@ -258,6 +286,7 @@ final class Recorder: @unchecked Sendable {
         }
 
         guard let engine = self.engine else {
+            dictationRecoverySession?.finishCapture(reason: "recorder_engine_missing")
             return .failure(.noEngine)
         }
 
@@ -271,12 +300,14 @@ final class Recorder: @unchecked Sendable {
             engine.stop()
             self.engine = nil
             self.capturedFormat = nil
+            dictationRecoverySession?.finishCapture(reason: "recorder_format_error")
             return .failure(.formatError)
         }
 
         // #100: Safe cleanup - removeTap before stop, nil engine even if stop fails
         engine.inputNode.removeTap(onBus: 0)
         engine.stop()
+        dictationRecoverySession?.finishCapture(reason: "capture_stopped")
 
         bufferLock.lock()
         let samples = audioBuffer
@@ -315,6 +346,13 @@ final class Recorder: @unchecked Sendable {
         }
 
         return .success(buffer)
+    }
+
+    func takeDictationRecoverySession() -> DictationRecoverySession? {
+        stateLock.withLock {
+            defer { dictationRecoverySession = nil }
+            return dictationRecoverySession
+        }
     }
 
     /// Get the sample rate of the current/last engine

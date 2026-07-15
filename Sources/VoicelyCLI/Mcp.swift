@@ -41,16 +41,237 @@ struct Mcp: AsyncParsableCommand {
 
 // MARK: - Server loop
 
-/// Drives the blocking stdin read loop and routes each JSON-RPC message. Kept
-/// as an actor-free struct: the loop is sequential (one request at a time, as a
-/// stdio server is), and the only async hop is into @MainActor for transcription.
+/// Serializes protocol responses so concurrent tool requests can never
+/// interleave bytes on stdout.
+private actor MCPResponseSink {
+    func write(_ response: JSONRPCResponse) {
+        let value = response.jsonValue
+        guard let data = try? JSONValue.encode(value) else {
+            logErr("Failed to serialize response.")
+            return
+        }
+        var output = data
+        output.append(0x0A)
+        FileHandle.standardOutput.write(output)
+    }
+}
+
+/// Owns in-flight JSON-RPC tasks. Cancellation removes the publication token
+/// before cancelling the task, so a cancellation-ignoring backend still cannot
+/// publish a stale result after `notifications/cancelled` or shutdown.
+actor MCPRequestCoordinator {
+    typealias Publisher = @Sendable (JSONRPCResponse) async -> Void
+    static let defaultMaximumRequests = 32
+
+    enum SubmissionResult: Equatable {
+        case accepted
+        case duplicateID
+        case shuttingDown
+        case serverBusy
+    }
+
+    private struct Entry {
+        let token: UUID
+        let task: Task<Void, Never>
+    }
+
+    private let publish: Publisher
+    private let maximumRequests: Int
+    private var entries: [JSONRPCID: Entry] = [:]
+    private var acceptingRequests = true
+
+    init(
+        maximumRequests: Int = MCPRequestCoordinator.defaultMaximumRequests,
+        publish: @escaping Publisher
+    ) {
+        self.maximumRequests = max(1, maximumRequests)
+        self.publish = publish
+    }
+
+    func submit(
+        id: JSONRPCID,
+        operation: @Sendable @escaping () async -> JSONRPCResponse?
+    ) -> SubmissionResult {
+        guard acceptingRequests else { return .shuttingDown }
+        guard entries[id] == nil else { return .duplicateID }
+        guard entries.count < maximumRequests else { return .serverBusy }
+
+        let token = UUID()
+        // Detached by design: shutdown must not wait indefinitely for a model
+        // backend that ignores cooperative cancellation. Publication remains
+        // safe because cancel/shutdown removes this task's token first.
+        let task = Task.detached { [weak self] in
+            let response = await operation()
+            await self?.complete(id: id, token: token, response: response)
+        }
+        entries[id] = Entry(token: token, task: task)
+        return .accepted
+    }
+
+    @discardableResult
+    func cancel(id: JSONRPCID) -> Bool {
+        guard let entry = entries.removeValue(forKey: id) else { return false }
+        entry.task.cancel()
+        return true
+    }
+
+    func shutdown() {
+        acceptingRequests = false
+        let tasks = entries.values.map(\.task)
+        // Remove every publication token before cancellation. Detached work may
+        // unwind later, but `complete` cannot publish it and server exit is not
+        // held hostage by a cancellation-ignoring backend.
+        entries.removeAll()
+        for task in tasks { task.cancel() }
+    }
+
+    var activeRequestCount: Int { entries.count }
+    var isAcceptingRequests: Bool { acceptingRequests }
+
+    private func complete(
+        id: JSONRPCID,
+        token: UUID,
+        response: JSONRPCResponse?
+    ) async {
+        guard let entry = entries[id], entry.token == token else { return }
+        entries.removeValue(forKey: id)
+        guard !Task.isCancelled, let response else { return }
+        await publish(response)
+    }
+}
+
+/// Admission control for the memory-heavy `transcribe_file` path. One request
+/// may decode/load/diarize, two more may wait, and the fourth is rejected before
+/// any model or audio allocation begins. Read-only MCP requests bypass it.
+actor MCPHeavyRequestAdmission {
+    static let defaultMaximumQueued = 2
+
+    struct Permit: Sendable, Equatable {
+        fileprivate let token: UUID
+    }
+
+    enum AdmissionError: Error, Equatable {
+        case serverBusy
+    }
+
+    private struct Waiter {
+        let token: UUID
+        let continuation: CheckedContinuation<Void, Error>
+    }
+
+    private let maximumQueued: Int
+    private var activeToken: UUID?
+    private var waiters: [Waiter] = []
+
+    init(
+        maximumQueued: Int = MCPHeavyRequestAdmission.defaultMaximumQueued
+    ) {
+        self.maximumQueued = max(0, maximumQueued)
+    }
+
+    func acquire() async throws -> Permit {
+        try Task.checkCancellation()
+        let token = UUID()
+
+        if activeToken == nil {
+            activeToken = token
+            return Permit(token: token)
+        }
+        guard waiters.count < maximumQueued else {
+            throw AdmissionError.serverBusy
+        }
+
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation {
+                (continuation: CheckedContinuation<Void, Error>) -> Void in
+                if Task.isCancelled {
+                    continuation.resume(throwing: CancellationError())
+                } else {
+                    waiters.append(Waiter(
+                        token: token,
+                        continuation: continuation
+                    ))
+                }
+            }
+        } onCancel: {
+            Task { await self.cancelWaitingOrActive(token: token) }
+        }
+
+        do {
+            try Task.checkCancellation()
+        } catch {
+            // The waiter may have been promoted immediately before cancellation,
+            // after the cancellation-handler scope ended. Release that freshly
+            // acquired slot here so it cannot remain permanently occupied.
+            if activeToken == token {
+                promoteNext()
+            }
+            throw error
+        }
+        return Permit(token: token)
+    }
+
+    func release(_ permit: Permit) {
+        guard activeToken == permit.token else { return }
+        promoteNext()
+    }
+
+    var activeCount: Int { activeToken == nil ? 0 : 1 }
+    var queuedCount: Int { waiters.count }
+
+    private func cancelWaitingOrActive(token: UUID) {
+        if activeToken == token {
+            promoteNext()
+            return
+        }
+        guard let index = waiters.firstIndex(where: { $0.token == token }) else {
+            return
+        }
+        let waiter = waiters.remove(at: index)
+        waiter.continuation.resume(throwing: CancellationError())
+    }
+
+    private func promoteNext() {
+        guard !waiters.isEmpty else {
+            activeToken = nil
+            return
+        }
+        let waiter = waiters.removeFirst()
+        activeToken = waiter.token
+        waiter.continuation.resume()
+    }
+}
+
+/// Drives stdin and routes requests. Tool calls run concurrently with the read
+/// loop so cancellation and shutdown messages remain observable while a long
+/// transcription is in flight.
 struct MCPServer {
-    /// Read stdin line by line and answer on stdout until EOF (client closed the
-    /// pipe → graceful shutdown). Blocking reads are fine: a stdio MCP server is
-    /// single-client and request/response serial.
+    /// Read stdin line by line until EOF or an explicit shutdown request.
     func serve() async throws {
         logErr("Voicely MCP server ready (protocol \(Mcp.protocolVersion)). Reading JSON-RPC on stdin…")
-        while let line = readLine(strippingNewline: true) {
+        let sink = MCPResponseSink()
+        let transcriptionRuntime = await MainActor.run {
+            CLITranscriptionRuntime()
+        }
+        let coordinator = MCPRequestCoordinator { response in
+            await sink.write(response)
+        }
+        let heavyAdmission = MCPHeavyRequestAdmission()
+        var frameReader = JSONRPCFrameReader(input: .standardInput)
+
+        while let frame = try frameReader.nextFrame() {
+            guard case let .frame(frameData) = frame else {
+                await sink.write(.error(
+                    id: .null,
+                    code: -32600,
+                    message: "Request too large"
+                ))
+                continue
+            }
+            guard let line = String(data: frameData, encoding: .utf8) else {
+                await sink.write(.error(id: .null, code: -32700, message: "Parse error"))
+                continue
+            }
             let trimmed = line.trimmingCharacters(in: .whitespaces)
             if trimmed.isEmpty { continue }
             guard let data = trimmed.data(using: .utf8) else { continue }
@@ -58,25 +279,92 @@ struct MCPServer {
             let message: JSONRPCMessage
             do {
                 message = try JSONRPCMessage(data: data)
+            } catch is JSONRPCParseError {
+                await sink.write(.error(id: .null, code: -32600, message: "Invalid Request"))
+                continue
             } catch {
                 // Couldn't even parse the envelope → Parse error, null id.
-                write(JSONRPCResponse.error(id: .null, code: -32700, message: "Parse error"))
+                await sink.write(.error(id: .null, code: -32700, message: "Parse error"))
                 continue
             }
 
-            if let response = await handle(message) {
-                write(response)
+            guard let id = message.id else {
+                await handleNotification(message, coordinator: coordinator)
+                continue
             }
-            // No response → it was a notification (initialized, etc.).
+
+            if message.method == "shutdown" {
+                logErr("Received shutdown; cancelling in-flight requests.")
+                await coordinator.shutdown()
+                await sink.write(.result(id: id, result: .object([:])))
+                return
+            }
+
+            let submission = await coordinator.submit(id: id) {
+                await handle(
+                    message,
+                    runtime: transcriptionRuntime,
+                    heavyAdmission: heavyAdmission
+                )
+            }
+            switch submission {
+            case .accepted:
+                break
+            case .duplicateID:
+                await sink.write(.error(
+                    id: id,
+                    code: -32600,
+                    message: "Duplicate request id"
+                ))
+            case .shuttingDown:
+                await sink.write(.error(id: id, code: -32600, message: "Server is shutting down"))
+            case .serverBusy:
+                await sink.write(.error(id: id, code: -32000, message: "Server busy"))
+            }
         }
+        await coordinator.shutdown()
         logErr("stdin closed; Voicely MCP server shutting down.")
+    }
+
+    private func handleNotification(
+        _ message: JSONRPCMessage,
+        coordinator: MCPRequestCoordinator
+    ) async {
+        switch message.method {
+        case "notifications/initialized", "initialized":
+            logErr("Client initialized.")
+
+        case "notifications/cancelled":
+            guard let requestID = Self.cancelledRequestID(from: message.params) else {
+                logErr("Ignoring malformed cancellation notification.")
+                return
+            }
+            if await coordinator.cancel(id: requestID) {
+                logErr("Cancelled request \(requestID.logDescription).")
+            }
+
+        default:
+            logErr("Ignoring notification: \(message.method ?? "<none>")")
+        }
+    }
+
+    static func cancelledRequestID(from params: JSONValue?) -> JSONRPCID? {
+        guard case let .object(object)? = params,
+              let value = object["requestId"] else {
+            return nil
+        }
+        return JSONRPCID(from: value)
     }
 
     // MARK: - Routing
 
     /// Map one request/notification to an optional response. Returns nil for
     /// notifications (which, per JSON-RPC, get no reply).
-    private func handle(_ message: JSONRPCMessage) async -> JSONRPCResponse? {
+    private func handle(
+        _ message: JSONRPCMessage,
+        runtime: CLITranscriptionRuntime,
+        heavyAdmission: MCPHeavyRequestAdmission
+    ) async -> JSONRPCResponse? {
         // Notifications carry no id and never get a response.
         guard let id = message.id else {
             switch message.method {
@@ -102,11 +390,12 @@ struct MCPServer {
             return .result(id: id, result: Self.toolsListResult())
 
         case "tools/call":
-            return await handleToolsCall(id: id, params: message.params)
-
-        case "shutdown":
-            logErr("Received shutdown.")
-            return .result(id: id, result: .object([:]))
+            return await handleToolsCall(
+                id: id,
+                params: message.params,
+                runtime: runtime,
+                heavyAdmission: heavyAdmission
+            )
 
         case .some(let m):
             return .error(id: id, code: -32601, message: "Method not found: \(m)")
@@ -142,7 +431,12 @@ struct MCPServer {
 
     // MARK: - tools/call dispatch
 
-    private func handleToolsCall(id: JSONRPCID, params: JSONValue?) async -> JSONRPCResponse {
+    private func handleToolsCall(
+        id: JSONRPCID,
+        params: JSONValue?,
+        runtime: CLITranscriptionRuntime,
+        heavyAdmission: MCPHeavyRequestAdmission
+    ) async -> JSONRPCResponse {
         guard case let .object(obj)? = params,
               case let .string(name)? = obj["name"] else {
             return .error(id: id, code: -32602, message: "Invalid params: tools/call requires a tool name")
@@ -155,7 +449,7 @@ struct MCPServer {
         }
 
         do {
-            let text = try await tool.run(arguments)
+            let text = try await tool.run(arguments, runtime, heavyAdmission)
             return .result(id: id, result: Self.toolText(text, isError: false))
         } catch let error as ToolError {
             // Tool execution errors are reported in-band (isError: true), not as
@@ -176,20 +470,6 @@ struct MCPServer {
         ])
     }
 
-    // MARK: - stdout writer
-
-    /// Serialize one message compact (no embedded newlines) + a single trailing
-    /// newline. This is the ONLY thing allowed on stdout.
-    private func write(_ response: JSONRPCResponse) {
-        let value = response.jsonValue
-        guard let data = try? JSONValue.encode(value) else {
-            logErr("Failed to serialize response.")
-            return
-        }
-        var out = data
-        out.append(0x0A)  // '\n'
-        FileHandle.standardOutput.write(out)
-    }
 }
 
 // MARK: - Tools
@@ -206,7 +486,11 @@ struct MCPTool: Sendable {
     let name: String
     let description: String
     let inputSchema: JSONValue
-    let run: @Sendable ([String: JSONValue]) async throws -> String
+    let run: @Sendable (
+        [String: JSONValue],
+        CLITranscriptionRuntime,
+        MCPHeavyRequestAdmission
+    ) async throws -> String
 
     var descriptor: JSONValue {
         .object([
@@ -246,40 +530,53 @@ struct MCPTool: Sendable {
             ]),
             "required": .array([.string("path")]),
         ]),
-        run: { args in
+        run: { args, runtime, heavyAdmission in
             guard case let .string(rawPath)? = args["path"], !rawPath.isEmpty else {
                 throw ToolError(message: "transcribe_file requires a non-empty 'path'.")
             }
             let diarize: Bool = { if case let .bool(b)? = args["diarize"] { return b } else { return false } }()
-            let forcedLanguage: String? = {
-                if case let .string(lang)? = args["language"], lang != "auto" { return lang }
-                return nil
-            }()
+            let forcedLanguage: String?
+            switch args["language"] {
+            case nil, .string("auto")?:
+                forcedLanguage = nil
+            case .string("ru")?:
+                forcedLanguage = "ru"
+            case .string("en")?:
+                forcedLanguage = "en"
+            case .string(let language)?:
+                throw ToolError(message: "Unknown language '\(language)'. Use auto | ru | en.")
+            default:
+                throw ToolError(message: "language must be auto, ru, or en when provided.")
+            }
 
             let fileURL = URL(fileURLWithPath: (rawPath as NSString).expandingTildeInPath)
             guard FileManager.default.fileExists(atPath: fileURL.path) else {
                 throw ToolError(message: "File not found: \(fileURL.path)")
             }
 
-            // TranscribeJob is @MainActor (loads the @MainActor Transcriber), so
-            // run it on a @MainActor task and await its result here.
-            let transcript = try await Task { @MainActor in
-                let job = TranscribeJob(
+            let permit: MCPHeavyRequestAdmission.Permit
+            do {
+                permit = try await heavyAdmission.acquire()
+            } catch MCPHeavyRequestAdmission.AdmissionError.serverBusy {
+                throw ToolError(message: "Server busy: one transcription is active and two are queued. Try again later.")
+            }
+
+            do {
+                // Admission precedes model preparation, audio decoding, and
+                // diarizer use. A direct actor hop stays in this request task.
+                let transcript = try await renderTranscription(
                     fileURL: fileURL,
                     diarize: diarize,
                     forcedLanguage: forcedLanguage,
-                    modelVariant: nil
+                    runtime: runtime
                 )
-                let result = try await job.execute()
-                // For diarized runs with detected speakers, return the labelled
-                // dialogue; otherwise the plain transcript.
-                if diarize, result.hasSpeakers {
-                    return Transcribe.render(result, format: .txt, timestamps: false)
-                }
-                return result.transcript
-            }.value
-
-            return transcript.isEmpty ? "(no speech detected)" : transcript
+                try Task.checkCancellation()
+                await heavyAdmission.release(permit)
+                return transcript.isEmpty ? "(no speech detected)" : transcript
+            } catch {
+                await heavyAdmission.release(permit)
+                throw error
+            }
         }
     )
 
@@ -298,10 +595,14 @@ struct MCPTool: Sendable {
                     "enum": .array([.string("dictations"), .string("calls"), .string("files")]),
                     "description": .string("Restrict to one kind. Omit to list all kinds."),
                 ]),
+                "limit": .object([
+                    "type": .string("integer"),
+                    "description": .string("Optional max rows to return. Default 100."),
+                ]),
             ]),
             "required": .array([]),
         ]),
-        run: { args in
+        run: { args, _, _ in
             let entries: [TranscriptEntry]
             if case let .string(kindToken)? = args["kind"] {
                 guard let kind = TranscriptStore.kindFromToken(kindToken) else {
@@ -312,15 +613,25 @@ struct MCPTool: Sendable {
                 entries = TranscriptStore.allEntries()
             }
 
-            if entries.isEmpty {
-                return "No transcripts found under \(TranscriptStore.baseDir.path)."
+            let limit: Int?
+            switch args["limit"] {
+            case .int(let value)?:
+                guard value >= 0 else {
+                    throw ToolError(message: "limit must be a non-negative integer.")
+                }
+                limit = value
+            case .double(let value)?:
+                guard case let .int(exact)? = JSONRPCID(from: .double(value)),
+                      exact >= 0 else {
+                    throw ToolError(message: "limit must be a non-negative integer.")
+                }
+                limit = exact
+            case nil:
+                limit = nil
+            default:
+                throw ToolError(message: "limit must be an integer when provided.")
             }
-            let iso = ISO8601DateFormatter()
-            let lines = entries.map { e -> String in
-                let preview = previewText(of: e.transcriptURL)
-                return "\(e.kind.singular)\t\(e.id)\t\(iso.string(from: e.modified))\t\(preview)"
-            }
-            return lines.joined(separator: "\n")
+            return TranscriptListFormatter.render(entries, limit: limit)
         }
     )
 
@@ -346,7 +657,7 @@ struct MCPTool: Sendable {
             ]),
             "required": .array([.string("id")]),
         ]),
-        run: { args in
+        run: { args, _, _ in
             guard case let .string(id)? = args["id"], !id.isEmpty else {
                 throw ToolError(message: "get_transcript requires a non-empty 'id'.")
             }
@@ -375,7 +686,7 @@ struct MCPTool: Sendable {
             "properties": .object([:]),
             "required": .array([]),
         ]),
-        run: { _ in
+        run: { _, _, _ in
             guard let entry = TranscriptStore.resolve(idOrAlias: "last-call", kind: .calls) else {
                 throw ToolError(message: "No call transcripts found under \(TranscriptStore.directory(for: .calls).path).")
             }
@@ -385,22 +696,27 @@ struct MCPTool: Sendable {
 
     // MARK: - helpers
 
+    @MainActor
+    private static func renderTranscription(
+        fileURL: URL,
+        diarize: Bool,
+        forcedLanguage: String?,
+        runtime: CLITranscriptionRuntime
+    ) async throws -> String {
+        try Task.checkCancellation()
+        let job = TranscribeJob(
+            fileURL: fileURL,
+            diarize: diarize,
+            forcedLanguage: forcedLanguage,
+            modelVariant: nil
+        )
+        let result = try await job.execute(runtime: runtime)
+        try Task.checkCancellation()
+        return Transcribe.render(result, format: .txt, timestamps: false)
+    }
+
     private static func readTranscript(at url: URL) -> String {
         let text = (try? String(contentsOf: url, encoding: .utf8)) ?? ""
         return text.isEmpty ? "(empty transcript)" : text
-    }
-
-    /// First non-empty line, truncated, for list previews.
-    private static func previewText(of url: URL) -> String {
-        guard let text = try? String(contentsOf: url, encoding: .utf8) else { return "" }
-        let firstLine = text
-            .split(whereSeparator: \.isNewline)
-            .first { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
-            .map(String.init) ?? ""
-        let trimmed = firstLine.trimmingCharacters(in: .whitespaces)
-        if trimmed.count > 80 {
-            return String(trimmed.prefix(80)) + "…"
-        }
-        return trimmed
     }
 }

@@ -2,11 +2,77 @@ import XCTest
 import AVFoundation
 @testable import VoicelyCore
 
+private actor MockFileDiarizer: FileDiarizing {
+    private var requestedURLs: [URL] = []
+
+    func diarize(fileURL: URL) async throws -> [SpeakerTurn] {
+        requestedURLs.append(fileURL)
+        return [SpeakerTurn(speakerIndex: 1, start: 0, end: 60)]
+    }
+
+    func urls() -> [URL] {
+        requestedURLs
+    }
+}
+
+/// Holds the first inference even after its task is cancelled. This models
+/// CoreML/provider calls that only return at an internal boundary.
+private actor CancellationIgnoringFileTranscriber: SampleTranscribing {
+    private var calls = 0
+    private var firstCallStarted = false
+    private var firstCallReleased = false
+    private var releaseContinuation: CheckedContinuation<Void, Never>?
+
+    func transcribeSamples(
+        _ samples: [Float],
+        translate: Bool,
+        language: String?
+    ) async throws -> WhisperTranscription {
+        calls += 1
+        let call = calls
+        if call == 1 {
+            firstCallStarted = true
+            if !firstCallReleased {
+                await withCheckedContinuation { continuation in
+                    releaseContinuation = continuation
+                }
+            }
+        }
+        return WhisperTranscription(
+            text: "call\(call)",
+            segments: [WhisperSegment(start: 0, end: 1, text: "call\(call)")],
+            detectedLanguage: "en"
+        )
+    }
+
+    func hasStartedFirstCall() -> Bool { firstCallStarted }
+    func callCount() -> Int { calls }
+
+    func releaseFirstCall() {
+        firstCallReleased = true
+        let continuation = releaseContinuation
+        releaseContinuation = nil
+        continuation?.resume()
+    }
+}
+
 @MainActor
 final class FileTranscriptionQueueTests: XCTestCase {
 
+    private func waitUntil(
+        timeoutIterations: Int = 100,
+        condition: () async -> Bool
+    ) async -> Bool {
+        for _ in 0..<timeoutIterations {
+            if await condition() { return true }
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        return false
+    }
+
     private func makeQueue(
-        mock: MockSampleTranscriber = MockSampleTranscriber()
+        mock: MockSampleTranscriber = MockSampleTranscriber(),
+        diarizer: (any FileDiarizing)? = nil
     ) -> FileTranscriptionQueue {
         FileTranscriptionQueue(
             transcriber: mock,
@@ -15,7 +81,8 @@ final class FileTranscriptionQueueTests: XCTestCase {
                 .appendingPathComponent("ftq-\(UUID().uuidString)/files"),
             // 16000 samples per second × 0.5 s = 8000 samples per fake chunk
             // so tests can build multi-chunk inputs cheaply.
-            chunkSampleCount: 8000
+            chunkSampleCount: 8000,
+            diarizer: diarizer
         )
     }
 
@@ -68,6 +135,105 @@ final class FileTranscriptionQueueTests: XCTestCase {
         await fulfillment(of: [doneExpectation], timeout: 10)
         XCTAssertGreaterThanOrEqual(mock.calls.count, 3,
             "expected at least one transcribe call per file")
+    }
+
+    func testEachQueuedFileKeepsItsLanguageAndTranslationSnapshot() async throws {
+        let mock = MockSampleTranscriber()
+        mock.delayPerCall = .milliseconds(40)
+        let queue = makeQueue(mock: mock)
+        let first = try writeSilenceWav(seconds: 0.2)
+        let second = try writeSilenceWav(seconds: 0.2)
+        defer {
+            try? FileManager.default.removeItem(at: first)
+            try? FileManager.default.removeItem(at: second)
+        }
+
+        let done = expectation(description: "settings snapshots complete")
+        queue.onStateChange = { state, _ in
+            if case .idle = state { done.fulfill() }
+        }
+        let options = FileTranscriptionOptions(content: .plain, format: .markdown)
+        queue.enqueue(
+            [first],
+            options: options,
+            requestSettings: .init(
+                modelName: "snapshot-model",
+                translateToEnglish: false,
+                preferredLanguage: "ru"
+            )
+        )
+        queue.enqueue(
+            [second],
+            options: options,
+            requestSettings: .init(
+                modelName: "snapshot-model",
+                translateToEnglish: true,
+                preferredLanguage: nil
+            )
+        )
+
+        await fulfillment(of: [done], timeout: 10)
+        XCTAssertEqual(mock.calls.count, 2)
+        XCTAssertFalse(mock.calls[0].translate)
+        XCTAssertEqual(mock.calls[0].language, "ru")
+        XCTAssertTrue(mock.calls[1].translate)
+        XCTAssertNil(mock.calls[1].language)
+        XCTAssertEqual(queue.jobs.map(\.requestSettings), [
+            .init(
+                modelName: "snapshot-model",
+                translateToEnglish: false,
+                preferredLanguage: "ru"
+            ),
+            .init(
+                modelName: "snapshot-model",
+                translateToEnglish: true,
+                preferredLanguage: nil
+            ),
+        ])
+        let centralURLs = try queue.jobs.map { job -> URL in
+            guard case let .completed(_, centralURL) = job.status else {
+                return try XCTUnwrap(Optional<URL>.none, "job did not complete")
+            }
+            return centralURL
+        }
+        let firstTranscript = try String(contentsOf: centralURLs[0], encoding: .utf8)
+        let secondTranscript = try String(contentsOf: centralURLs[1], encoding: .utf8)
+        XCTAssertTrue(firstTranscript.contains("language: ru"))
+        XCTAssertTrue(secondTranscript.contains("language: en"))
+        XCTAssertTrue(firstTranscript.contains("model: snapshot-model"))
+        XCTAssertTrue(secondTranscript.contains("model: snapshot-model"))
+    }
+
+    func testSecondBatchDoesNotReprocessCompleted() async throws {
+        let mock = MockSampleTranscriber()
+        let queue = makeQueue(mock: mock)
+        let f1 = try writeSilenceWav(seconds: 0.6)
+        let f2 = try writeSilenceWav(seconds: 0.6)
+        defer {
+            try? FileManager.default.removeItem(at: f1)
+            try? FileManager.default.removeItem(at: f2)
+        }
+        let opts = FileTranscriptionOptions(content: .plain, format: .plainText)
+
+        // Batch 1: one file, run to idle.
+        let idle1 = expectation(description: "batch 1 idle")
+        queue.onStateChange = { state, _ in if case .idle = state { idle1.fulfill() } }
+        queue.enqueue([f1], options: opts)
+        await fulfillment(of: [idle1], timeout: 10)
+        let callsAfterBatch1 = mock.calls.count
+        XCTAssertGreaterThanOrEqual(callsAfterBatch1, 1)
+
+        // Batch 2: a different file. The completed f1 must be pruned, NOT re-run.
+        let idle2 = expectation(description: "batch 2 idle")
+        queue.onStateChange = { state, _ in if case .idle = state { idle2.fulfill() } }
+        queue.enqueue([f2], options: opts)
+        await fulfillment(of: [idle2], timeout: 10)
+
+        XCTAssertEqual(queue.jobs.count, 1,
+            "the completed batch-1 job must be pruned; only the new file remains")
+        let batch2Calls = mock.calls.count - callsAfterBatch1
+        XCTAssertEqual(batch2Calls, callsAfterBatch1,
+            "batch 2 must transcribe only the new file (same size), not re-run f1")
     }
 
     func testFailedFileDoesNotStopQueue() async throws {
@@ -129,6 +295,57 @@ final class FileTranscriptionQueueTests: XCTestCase {
         if case .completed = finalJobs[0].status {} else {
             XCTFail("silentAudio must not fail the job, got \(finalJobs[0].status)")
         }
+    }
+
+    func testMultiChunkFileKeepsDecodedPCMAtOneConfiguredWindow() async throws {
+        let mock = MockSampleTranscriber()
+        let queue = makeQueue(mock: mock)
+        let url = try writeSilenceWav(seconds: 3.2)
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        let done = expectation(description: "queue idle")
+        queue.onStateChange = { state, _ in
+            if case .idle = state { done.fulfill() }
+        }
+        queue.enqueue([url], options: FileTranscriptionOptions(
+            content: .plain,
+            format: .plainText
+        ))
+
+        await fulfillment(of: [done], timeout: 10)
+
+        XCTAssertEqual(mock.calls.map(\.sampleCount), [
+            8_000, 8_000, 8_000, 8_000, 8_000, 8_000, 3_200,
+        ])
+        XCTAssertEqual(queue.maximumBufferedSamplesObserved, 8_000)
+        XCTAssertLessThanOrEqual(
+            queue.maximumBufferedSamplesObserved,
+            8_000,
+            "decoded PCM must stay bounded to one configured transcription window"
+        )
+    }
+
+    func testDiarizationUsesOriginalFileURLInsteadOfRetainedPCM() async throws {
+        let mock = MockSampleTranscriber()
+        let diarizer = MockFileDiarizer()
+        let queue = makeQueue(mock: mock, diarizer: diarizer)
+        let url = try writeSilenceWav(seconds: 0.6)
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        let done = expectation(description: "queue idle")
+        queue.onStateChange = { state, _ in
+            if case .idle = state { done.fulfill() }
+        }
+        queue.enqueue([url], options: FileTranscriptionOptions(
+            content: .plain,
+            format: .plainText,
+            diarize: true
+        ))
+
+        await fulfillment(of: [done], timeout: 10)
+        let diarizedURLs = await diarizer.urls()
+        XCTAssertEqual(diarizedURLs, [url])
+        XCTAssertLessThanOrEqual(queue.maximumBufferedSamplesObserved, 8_000)
     }
 
     func testCancelAllStopsQueue() async throws {
@@ -198,6 +415,65 @@ final class FileTranscriptionQueueTests: XCTestCase {
         }
     }
 
+    func testCancelledGenerationRetainsOwnershipUntilIgnoringEngineReturns() async throws {
+        let transcriber = CancellationIgnoringFileTranscriber()
+        let queue = FileTranscriptionQueue(
+            transcriber: transcriber,
+            modelName: "test-model",
+            centralRoot: FileManager.default.temporaryDirectory
+                .appendingPathComponent("ftq-generation-\(UUID().uuidString)/files"),
+            chunkSampleCount: 8_000
+        )
+        let cancelledURL = try writeSilenceWav(seconds: 0.4)
+        let replacementURL = try writeSilenceWav(seconds: 0.4)
+        defer {
+            try? FileManager.default.removeItem(at: cancelledURL)
+            try? FileManager.default.removeItem(at: replacementURL)
+        }
+
+        var idleObserved = false
+        let finalIdle = expectation(description: "replacement batch idle")
+        queue.onStateChange = { state, _ in
+            if case .idle = state {
+                idleObserved = true
+                finalIdle.fulfill()
+            }
+        }
+
+        let options = FileTranscriptionOptions(content: .plain, format: .plainText)
+        queue.enqueue([cancelledURL], options: options)
+        let started = await waitUntil { await transcriber.hasStartedFirstCall() }
+        guard started else {
+            queue.cancelAll()
+            await transcriber.releaseFirstCall()
+            XCTFail("timed out waiting for first inference")
+            return
+        }
+
+        queue.cancelAll()
+        queue.enqueue([replacementURL], options: options)
+        try await Task.sleep(for: .milliseconds(100))
+
+        XCTAssertFalse(idleObserved, "cancel must not publish idle before the backend exits")
+        let callsBeforeRelease = await transcriber.callCount()
+        XCTAssertEqual(
+            callsBeforeRelease, 1,
+            "replacement work must not overlap the cancelled generation"
+        )
+
+        await transcriber.releaseFirstCall()
+        await fulfillment(of: [finalIdle], timeout: 5)
+
+        let finalCallCount = await transcriber.callCount()
+        XCTAssertEqual(finalCallCount, 2)
+        XCTAssertEqual(queue.jobs.count, 1)
+        guard let replacement = queue.jobs.first else { return }
+        XCTAssertEqual(replacement.sourceURL, replacementURL)
+        if case .completed = replacement.status {} else {
+            XCTFail("replacement job should complete, got \(replacement.status)")
+        }
+    }
+
     func testAwaitPausedBlocksUntilEngineIdle() async throws {
         let mock = MockSampleTranscriber()
         mock.delayPerCall = .milliseconds(400)
@@ -250,5 +526,46 @@ final class FileTranscriptionQueueTests: XCTestCase {
         try await Task.sleep(for: .seconds(2))
         XCTAssertGreaterThan(mock.calls.count, callsAfterPause,
             "resume should let the remaining chunks through")
+    }
+
+    func testQueueWritesParagraphShapedTranscriptFromSegments() async throws {
+        let mock = MockSampleTranscriber()
+        mock.resultProvider = { _ in
+            WhisperTranscription(
+                text: "First sentence. Second sentence. Third sentence.",
+                segments: [
+                    WhisperSegment(start: 0.0, end: 1.0, text: "First sentence."),
+                    WhisperSegment(start: 1.05, end: 2.0, text: "Second sentence."),
+                    WhisperSegment(start: 4.4, end: 5.2, text: "Third sentence."),
+                ],
+                detectedLanguage: "en"
+            )
+        }
+        let queue = makeQueue(mock: mock)
+        let url = try writeSilenceWav(seconds: 0.4) // one fake chunk
+        defer {
+            try? FileManager.default.removeItem(at: url)
+            try? FileManager.default.removeItem(at: url.deletingPathExtension().appendingPathExtension("txt"))
+        }
+
+        let done = expectation(description: "queue idle")
+        queue.onStateChange = { state, _ in
+            if case .idle = state { done.fulfill() }
+        }
+        queue.enqueue([url], options: FileTranscriptionOptions(
+            content: .plain, format: .plainText))
+
+        await fulfillment(of: [done], timeout: 10)
+
+        let transcriptURL = url.deletingPathExtension().appendingPathExtension("txt")
+        let text = try String(contentsOf: transcriptURL, encoding: .utf8)
+        XCTAssertTrue(
+            text.contains("First sentence. Second sentence.\n\nThird sentence."),
+            "expected paragraph-shaped transcript, got: \(text)"
+        )
+        XCTAssertFalse(
+            text.contains("First sentence. Second sentence. Third sentence."),
+            "queue should persist the writer's paragraph composition, not the flat transport join"
+        )
     }
 }

@@ -27,6 +27,24 @@ final class CallTranscriptMergerTests: XCTestCase {
         XCTAssertEqual(out.map { $0.text }, ["A", "B", "C"])
     }
 
+    func testMerge_equalStartsUseDeterministicChannelAndSourceOrder() {
+        let mic = [
+            DialogueSegment(speaker: .you, start: 1, end: 2, text: "you-1", language: "en"),
+            DialogueSegment(speaker: .you, start: 1, end: 3, text: "you-2", language: "en"),
+        ]
+        let system = [
+            DialogueSegment(speaker: .other, start: 1, end: 2, text: "other-1", language: "en"),
+            DialogueSegment(speaker: .other, start: 1, end: 3, text: "other-2", language: "en"),
+        ]
+
+        for _ in 0..<20 {
+            XCTAssertEqual(
+                CallTranscriptMerger.merge(mic: mic, system: system).map(\.text),
+                ["you-1", "you-2", "other-1", "other-2"]
+            )
+        }
+    }
+
     func testHumanFormat_producesExpectedLines() {
         let segments = [
             DialogueSegment(speaker: .other, start: 5.2, end: 7.3, text: "Привет", language: "ru"),

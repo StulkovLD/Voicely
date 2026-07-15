@@ -2,7 +2,8 @@ __pycache__/
 *.pyc
 *.pyo
 *.egg-info/
-dist/
+dist/*
+!dist/Voicely.icns
 build/
 .eggs/
 *.egg
@@ -24,3 +25,4 @@ project.env
 .orchestrator/
 .worktrees/
 archive/_local/
+archive/

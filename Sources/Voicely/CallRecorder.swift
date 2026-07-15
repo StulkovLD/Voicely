@@ -1,7 +1,10 @@
 import AVFoundation
 import CoreAudioTypes
+import CoreMedia
+import Darwin
 import Foundation
 import ScreenCaptureKit
+import VoicelyCore
 
 /// Records both system audio (call participants) and microphone (you) as separate channels
 final class CallRecorder: @unchecked Sendable {
@@ -9,71 +12,67 @@ final class CallRecorder: @unchecked Sendable {
     var onMaxDuration: (@Sendable () -> Void)?
     var onMaxDurationWarning: (@Sendable (Int) -> Void)?
     var onStreamError: (@Sendable (String) -> Void)?
-    /// Fired once when the on-disk system-channel spill is disabled because the
-    /// volume ran low. RAM capture continues; only the diarization spill stops.
-    /// Carries the free-bytes figure that tripped the guard.
+    /// Fired once when disk capture is degraded because the volume ran low.
     var onDiskSpillStopped: (@Sendable (UInt64) -> Void)?
+    /// Fired once per channel if bounded backpressure or a writer failure drops
+    /// frames. Recording continues and the final capture metadata stays partial.
+    var onCaptureDegraded: (@Sendable (String) -> Void)?
 
     private var stream: SCStream?
     private var micEngine: AVAudioEngine?
     private var delegate: CallStreamDelegate?
+    private var configChangeObserver: NSObjectProtocol?
+    private let inputRouteGuard = CallInputRouteGuard()
+    private let streamErrorGate = CallRecorderStreamErrorGate()
 
-    // MARK: - System-channel disk spill (N2b prerequisite)
+    private let lifecycle = CallRecorderLifecycleState()
 
-    /// Stable identifier for this call, used as the spill folder name. Set in
-    /// `start()`; nil before the first start. Read on main after stop().
-    private(set) var callId: String?
+    /// True only after both ScreenCaptureKit and the microphone engine have
+    /// started successfully. A partially-initialized start never reports as
+    /// running, which keeps retries from accepting a system-only recording.
+    var isFullyRunning: Bool {
+        lifecycle.isRunning
+    }
 
-    /// Full path to the streamed system.wav once the call has stopped (or nil
-    /// if the spill never started / was disabled). The file holds the COMPLETE
-    /// `other` channel at 48 kHz mono, written incrementally during the call so
-    /// diarization (N2b) can do an offline one-pass over the full channel from
-    /// disk without re-holding it all in RAM.
-    private(set) var systemWavURL: URL?
+    /// Atomic handoff truth used by AppDelegate immediately after `start()`
+    /// returns. A plain `isFullyRunning` check can miss an interruption that
+    /// lands between recorder publication and the app's `.callRecording`
+    /// transition.
+    var startHandoffStatus: CallRecorderLifecycleState.StartHandoffStatus {
+        lifecycle.startHandoffStatus()
+    }
 
-    /// Lazily-opened streaming WAV writer for the system channel. Touched only
-    /// under `spillLock` plus the dedicated flush queue (never the audio thread
-    /// directly — see `spillPending`).
-    private let spillLock = NSLock()
-    private var spillFile: AVAudioFile?
-    /// Samples captured on the SCStream thread but not yet written to disk.
-    /// The audio handler only appends here (cheap); the flush queue drains it.
-    private var spillPending: [Float] = []
-    /// Once true, the disk spill is permanently off for this call (disk-full or
-    /// a write error). RAM capture is unaffected.
-    private var spillDisabled = false
-    private var diskGuardFired = false
-    /// Serialises file I/O off the audio callback so the SCStream thread never
-    /// blocks on disk. Buffered samples are drained here.
-    private let spillQueue = DispatchQueue(label: "voicely.callrecorder.spill", qos: .utility)
-    /// Minimum free bytes required to keep spilling. ~512 MB headroom; one hour
-    /// of 48 kHz mono float WAV is ~690 MB, so this stops well before a stall.
+    // MARK: - Disk-authoritative channel capture
+
+    /// Typed filesystem capability for this capture. It exposes only the two
+    /// fixed WAV paths; directory deletion remains inside VoicelyCore.
+    private var pendingCaptureStore: PendingCallRecoveryStore?
+    private var pendingCaptureHandle: PendingCallCaptureHandle?
+
+    private let captureLock = NSLock()
+    private let captureEventQueue = DispatchQueue(
+        label: "voicely.call-capture.events",
+        qos: .utility
+    )
+    private var micCaptureWriter: CallCaptureWAVWriter?
+    private var systemCaptureWriter: CallCaptureWAVWriter?
+    private var degradedChannels: Set<String> = []
+    private var captureTimelineOriginSeconds: Double?
+    /// Minimum free bytes required to start/continue capture.
     private static let spillMinFreeBytes: UInt64 = 512 * 1024 * 1024
 
-    // Soft cap on recording length, in hours. Defaults to 8 hours (was 2);
-    // override via VOICELY_MAX_CALL_HOURS env var. The cap exists only to
-    // bound RAM usage (float32 mono 48 kHz ≈ 690 MB / hour) - it is not a
-    // product constraint. When the cap is reached we stop accepting NEW
-    // samples but keep what we already have; the user can stop manually.
+    // Safety cap on classic-WAV recording length. Default 8 hours stays below
+    // the 4 GiB RIFF size ceiling for mono PCM16 at 48 kHz.
     private static var maxHours: Int {
         if let env = ProcessInfo.processInfo.environment["VOICELY_MAX_CALL_HOURS"],
-           let h = Int(env), h > 0, h <= 48 {
+           let h = Int(env), h > 0, h <= 12 {
             return h
         }
         return 8
     }
-    private let maxSamples = CallRecorder.maxHours * 3600 * 48000
-
-    private let systemLock = NSLock()
-    private var systemSamples: [Float] = []
-
-    private let micLock = NSLock()
-    private var micSamples: [Float] = []
-
-    // Offset-based chunk reading: track how far we've read without removing data.
-    // Samples stay in memory for the final WAV save via collectSamples().
-    private var systemReadOffset: Int = 0
-    private var micReadOffset: Int = 0
+    private static let effectiveSilenceMinimumDurationSeconds: Double = 2
+    private static let effectiveSilenceMeanVolumeFloorDBFS: Double = -75
+    private static let effectiveSilencePeakVolumeFloorDBFS: Double = -55
 
     private let sampleRateLock = NSLock()
     private var micSampleRate: Double = 48000
@@ -86,195 +85,448 @@ final class CallRecorder: @unchecked Sendable {
     private var maxDurationNotified = false
     private var warningFired = false
     private var startTime: Date?
-    private let warningSamples = (CallRecorder.maxHours * 3600 - 5 * 60) * 48000  // 5 min before cap
 
-    struct CallAudio {
-        let mic: AVAudioPCMBuffer?
-        let system: AVAudioPCMBuffer?
-        let micSampleRate: Double
-        let systemSampleRate: Double
-        let startTime: Date
+    struct ChannelCaptureTruth: Sendable, Equatable {
+        let sampleCount: Int
+        let sampleRate: Double
+        let durationSeconds: Double
+        let rms: Double
+        let peakAmplitude: Double
+        let meanVolumeDBFS: Double
+        let peakVolumeDBFS: Double
+        let isEffectivelySilent: Bool
+        let droppedSampleCount: Int
+        let zeroFilledSampleCount: Int
+        let timelineOriginOffsetSeconds: Double
+        let maxClockDriftSeconds: Double
+        let discontinuityCount: Int
+        let failure: String?
+        let isDegraded: Bool
+
+        init(
+            sampleCount: Int,
+            sampleRate: Double,
+            durationSeconds: Double,
+            rms: Double,
+            peakAmplitude: Double,
+            meanVolumeDBFS: Double,
+            peakVolumeDBFS: Double,
+            isEffectivelySilent: Bool,
+            droppedSampleCount: Int = 0,
+            zeroFilledSampleCount: Int = 0,
+            timelineOriginOffsetSeconds: Double = 0,
+            maxClockDriftSeconds: Double = 0,
+            discontinuityCount: Int = 0,
+            failure: String? = nil,
+            isDegraded: Bool = false
+        ) {
+            self.sampleCount = sampleCount
+            self.sampleRate = sampleRate
+            self.durationSeconds = durationSeconds
+            self.rms = rms
+            self.peakAmplitude = peakAmplitude
+            self.meanVolumeDBFS = meanVolumeDBFS
+            self.peakVolumeDBFS = peakVolumeDBFS
+            self.isEffectivelySilent = isEffectivelySilent
+            self.droppedSampleCount = droppedSampleCount
+            self.zeroFilledSampleCount = zeroFilledSampleCount
+            self.timelineOriginOffsetSeconds = timelineOriginOffsetSeconds
+            self.maxClockDriftSeconds = maxClockDriftSeconds
+            self.discontinuityCount = discontinuityCount
+            self.failure = failure
+            self.isDegraded = isDegraded
+        }
     }
 
-    struct ChannelChunks {
-        let mic: AVAudioPCMBuffer?
-        let system: AVAudioPCMBuffer?
+    struct CaptureTruth: Sendable, Equatable {
+        let mic: ChannelCaptureTruth
+        let system: ChannelCaptureTruth
+        /// First runtime stream/configuration interruption for this capture.
+        /// A nil value means the user stopped a healthy capture normally.
+        let interruptionReason: String?
+
+        init(
+            mic: ChannelCaptureTruth,
+            system: ChannelCaptureTruth,
+            interruptionReason: String? = nil
+        ) {
+            self.mic = mic
+            self.system = system
+            self.interruptionReason = interruptionReason
+        }
+    }
+
+    struct CallAudio: Sendable {
+        let sourceCapture: PendingCallClaim
+        let captureTruth: CaptureTruth
+
+        var micFileURL: URL? {
+            captureTruth.mic.sampleCount > 0 ? sourceCapture.micFileURL : nil
+        }
+        var systemFileURL: URL? {
+            captureTruth.system.sampleCount > 0 ? sourceCapture.systemFileURL : nil
+        }
+        var startTime: Date { sourceCapture.startTime }
+        var micSampleRate: Double { captureTruth.mic.sampleRate }
+        var systemSampleRate: Double { captureTruth.system.sampleRate }
     }
 
     /// Start recording: system audio via ScreenCaptureKit + mic via AVAudioEngine
     func start() async throws {
-        guard stream == nil else { throw CallRecorderError.alreadyRunning }
-        NSLog("[Voicely] CallRecorder.start() called")
-        startTime = Date()
-        systemSamples = []
-        micSamples = []
-        systemReadOffset = 0
-        micReadOffset = 0
-        setupSystemSpill()
-        // Swift 6: NSLock.lock()/unlock() are unavailable across async
-        // suspension points. Scoped withLock is async-safe (no suspension
-        // inside the critical section).
-        limitLock.withLock {
-            maxDurationNotified = false
-            warningFired = false
-        }
+        guard beginStart() else { throw CallRecorderError.alreadyRunning }
 
-        // 1. Get shareable content (we capture entire display audio)
-        let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false)
-        guard let display = content.displays.first else {
-            throw CallRecorderError.noDisplay
-        }
+        var keepInputRoute = false
+        var candidateStream: SCStream?
+        var candidateEngine: AVAudioEngine?
+        var candidateDelegate: CallStreamDelegate?
+        var candidateObserver: NSObjectProtocol?
+        var micTapInstalled = false
 
-        // 2. Configure stream for audio only
-        let config = SCStreamConfiguration()
-        config.capturesAudio = true
-        config.excludesCurrentProcessAudio = true  // Don't capture our own app sounds
-        config.sampleRate = 48000
-        config.channelCount = 1
-
-        // Don't capture video - audio only
-        config.width = 2
-        config.height = 2
-        config.minimumFrameInterval = CMTime(value: 1, timescale: 1) // 1 FPS minimum
-
-        // 3. Create stream with display filter
-        let filter = SCContentFilter(display: display, excludingApplications: [], exceptingWindows: [])
-
-        // 4. Set up delegate to receive audio samples (and stream errors)
-        let delegate = CallStreamDelegate(onSamples: { [weak self] samples, sampleRate in
-            guard let self else { return }
-            self.systemLock.lock()
-            let count = self.systemSamples.count
-            let atLimit = count >= self.maxSamples
-            if !atLimit { self.systemSamples.append(contentsOf: samples) }
-            self.systemLock.unlock()
-
-            // Spill the system channel to disk for the full-channel diarization
-            // pass (N2b). Buffered append here (cheap, lock-guarded); the actual
-            // file write happens on spillQueue so this audio thread never blocks.
-            if !atLimit { self.enqueueSpill(samples) }
-
-            self.limitLock.lock()
-            let shouldNotify = atLimit && !self.maxDurationNotified
-            if shouldNotify { self.maxDurationNotified = true }
-            let shouldWarn = !self.warningFired && count >= self.warningSamples
-            if shouldWarn { self.warningFired = true }
-            self.limitLock.unlock()
-            let remaining = shouldWarn ? max(0, self.maxSamples - count) / 48000 : 0
-            if shouldWarn { self.onMaxDurationWarning?(remaining) }
-            if shouldNotify { self.onMaxDuration?(); return }
-            self.sampleRateLock.lock()
-            self.systemSampleRate = sampleRate
-            self.sampleRateLock.unlock()
-
-            // Calculate RMS for visualization
-            var rms: Float = 0
-            for s in samples { rms += s * s }
-            rms = sqrt(rms / max(1, Float(samples.count)))
-            self.onAudioLevel?(min(1.0, rms * 8.0))
-        }, onError: { [weak self] message in
-            self?.onStreamError?(message)
-        })
-        delegate.onStreamDied = { [weak self] in
-            // Runs on the SCStream thread. Hop to main so teardown of micEngine/
-            // stream/delegate doesn't race stop()/forceStop(), which mutate the
-            // same fields on main.
-            DispatchQueue.main.async { [weak self] in
-                guard let self else { return }
-                if let engine = self.micEngine {
-                    engine.inputNode.removeTap(onBus: 0)
-                    engine.stop()
-                    self.micEngine = nil
-                }
-                self.stream = nil
-                self.delegate = nil
+        inputRouteGuard.prepareForCallRecording()
+        defer {
+            if !keepInputRoute {
+                inputRouteGuard.restoreIfNeeded()
             }
         }
-        self.delegate = delegate
+        do {
+            try Task.checkCancellation()
+            NSLog("[Voicely] CallRecorder.start() called")
+            sampleRateLock.withLock {
+                self.micSampleRate = 48_000
+                self.systemSampleRate = 48_000
+            }
+            limitLock.withLock {
+                maxDurationNotified = false
+                warningFired = false
+            }
 
-        let stream = SCStream(filter: filter, configuration: config, delegate: delegate)
-        try stream.addStreamOutput(delegate, type: .audio, sampleHandlerQueue: .global(qos: .userInitiated))
-        try await stream.startCapture()
-        self.stream = stream
-        NSLog("[Voicely] SCStream started successfully")
+            // 1. Get shareable content (we capture entire display audio)
+            let content = try await SCShareableContent.excludingDesktopWindows(
+                false,
+                onScreenWindowsOnly: false
+            )
+            try Task.checkCancellation()
+            guard let display = content.displays.first else {
+                throw CallRecorderError.noDisplay
+            }
 
-        // 5. Start microphone recording in parallel
-        let engine = AVAudioEngine()
-        let inputNode = engine.inputNode
-        let format = inputNode.outputFormat(forBus: 0)
-        // #92: Validate mic format before installing tap
-        guard format.sampleRate > 0, format.channelCount > 0 else {
-            NSLog("[Voicely] Invalid mic format: %.0f Hz, %d ch", format.sampleRate, format.channelCount)
-            throw CallRecorderError.noAudio
-        }
-        NSLog("[Voicely] Mic format: %.0f Hz, %d ch", format.sampleRate, format.channelCount)
-        setMicSampleRate(format.sampleRate)
-        let micChannelCount = Int(format.channelCount)
+            // 2. Configure stream for audio only
+            let config = SCStreamConfiguration()
+            config.capturesAudio = true
+            config.excludesCurrentProcessAudio = true
+            config.sampleRate = 48_000
+            config.channelCount = 1
+            config.width = 2
+            config.height = 2
+            config.minimumFrameInterval = CMTime(value: 1, timescale: 1)
 
-        inputNode.installTap(onBus: 0, bufferSize: 4096, format: format) { [weak self] buffer, _ in
-            guard let self else { return }
-            let frameLength = Int(buffer.frameLength)
-            guard let floatChannelData = buffer.floatChannelData, frameLength > 0 else { return }
-            // Mix all channels to mono (matches Recorder behavior)
-            let samples: [Float]
-            if micChannelCount == 1 {
-                samples = Array(UnsafeBufferPointer(start: floatChannelData[0], count: frameLength))
-            } else {
-                var mixed = [Float](repeating: 0, count: frameLength)
-                let gain = 1.0 / Float(micChannelCount)
-                for ch in 0..<micChannelCount {
-                    let chData = floatChannelData[ch]
-                    for i in 0..<frameLength {
-                        mixed[i] += chData[i] * gain
+            let filter = SCContentFilter(
+                display: display,
+                excludingApplications: [],
+                exceptingWindows: []
+            )
+            // Establish the shared wall/timeline origin only after discovery and
+            // permission work. Startup latency before this point is not call
+            // audio; the system channel starts next, and the later mic offset is
+            // represented by leading PCM silence.
+            startTime = Date()
+            captureTimelineOriginSeconds = Self.monotonicHostTimeSeconds()
+            try setupCaptureSession()
+            let recordingMaxHours = Self.maxHours
+
+            // 3. Keep all resources local until both capture paths are healthy.
+            let delegate = CallStreamDelegate(onSamples: {
+                [weak self] samples, sampleRate, presentationTimeSeconds in
+                guard let self else { return }
+                let sampleLimit = Self.sampleLimit(
+                    maxHours: recordingMaxHours,
+                    sampleRate: sampleRate
+                )
+                let warningThreshold = Self.warningSampleThreshold(
+                    maxHours: recordingMaxHours,
+                    sampleRate: sampleRate
+                )
+
+                self.sampleRateLock.withLock { self.systemSampleRate = sampleRate }
+                let enqueue = self.enqueueSystemCapture(
+                    samples,
+                    maximumTotalSamples: sampleLimit,
+                    presentationTimeSeconds: presentationTimeSeconds
+                )
+                let count = enqueue.timelineSampleCount
+                let atLimit = count >= sampleLimit
+
+                let (shouldNotify, shouldWarn) = self.limitLock.withLock {
+                    let shouldNotify = atLimit && !self.maxDurationNotified
+                    if shouldNotify { self.maxDurationNotified = true }
+                    let shouldWarn = !self.warningFired && count >= warningThreshold
+                    if shouldWarn { self.warningFired = true }
+                    return (shouldNotify, shouldWarn)
+                }
+                if shouldWarn {
+                    let remaining = Self.remainingSeconds(
+                        maxHours: recordingMaxHours,
+                        sampleCount: count,
+                        sampleRate: sampleRate
+                    )
+                    self.captureEventQueue.async { [weak self] in
+                        self?.onMaxDurationWarning?(remaining)
                     }
                 }
-                samples = mixed
+                if shouldNotify {
+                    self.captureEventQueue.async { [weak self] in
+                        self?.onMaxDuration?()
+                    }
+                    return
+                }
+            }, onError: { [weak self] message in
+                self?.reportStreamInterruption(message)
+            })
+            delegate.onStreamDied = { [weak self] in
+                DispatchQueue.main.async { [weak self] in
+                    self?.handleStreamDied()
+                }
             }
-            self.micLock.lock()
-            let count = self.micSamples.count
-            let atLimit = count >= self.maxSamples
-            if !atLimit { self.micSamples.append(contentsOf: samples) }
-            self.micLock.unlock()
+            candidateDelegate = delegate
 
-            self.limitLock.lock()
-            let shouldNotify = atLimit && !self.maxDurationNotified
-            if shouldNotify { self.maxDurationNotified = true }
-            let shouldWarn = !self.warningFired && count >= self.warningSamples
-            if shouldWarn { self.warningFired = true }
-            self.limitLock.unlock()
-            let remaining = shouldWarn ? max(0, self.maxSamples - count) / 48000 : 0
-            if shouldWarn { self.onMaxDurationWarning?(remaining) }
-            if shouldNotify { self.onMaxDuration?() }
-        }
+            let stream = SCStream(filter: filter, configuration: config, delegate: delegate)
+            candidateStream = stream
+            try stream.addStreamOutput(
+                delegate,
+                type: .audio,
+                sampleHandlerQueue: .global(qos: .userInitiated)
+            )
+            try await stream.startCapture()
+            try Task.checkCancellation()
+            NSLog("[Voicely] SCStream started successfully")
 
-        engine.prepare()
-        do {
+            // 4. Start microphone recording before publishing running state.
+            let engine = AVAudioEngine()
+            candidateEngine = engine
+            let inputNode = engine.inputNode
+            let format = inputNode.outputFormat(forBus: 0)
+            guard CallCaptureWAVWriter.isSupportedSampleRate(format.sampleRate),
+                  format.channelCount > 0 else {
+                NSLog(
+                    "[Voicely] Invalid mic format: %.0f Hz, %d ch",
+                    format.sampleRate,
+                    format.channelCount
+                )
+                throw CallRecorderError.noAudio
+            }
+            NSLog(
+                "[Voicely] Mic format: %.0f Hz, %d ch",
+                format.sampleRate,
+                format.channelCount
+            )
+            setMicSampleRate(format.sampleRate)
+            let micChannelCount = Int(format.channelCount)
+            let micSampleRate = format.sampleRate
+            try setupMicCapture(sampleRate: micSampleRate)
+            let micSampleLimit = Self.sampleLimit(
+                maxHours: recordingMaxHours,
+                sampleRate: micSampleRate
+            )
+            let micWarningThreshold = Self.warningSampleThreshold(
+                maxHours: recordingMaxHours,
+                sampleRate: micSampleRate
+            )
+            let micMixer = CallMicMixBuffer(
+                capacity: CallCaptureWAVWriter.maximumInputChunkSamples
+            )
+
+            inputNode.installTap(onBus: 0, bufferSize: 4096, format: format) {
+                [weak self] buffer, audioTime in
+                guard let self else { return }
+                let frameLength = Int(buffer.frameLength)
+                guard let floatChannelData = buffer.floatChannelData, frameLength > 0 else { return }
+                let basePresentationTime = audioTime.isHostTimeValid
+                    ? AVAudioTime.seconds(forHostTime: audioTime.hostTime)
+                    : nil
+                var offset = 0
+                while offset < frameLength {
+                    let count = min(
+                        CallCaptureWAVWriter.maximumInputChunkSamples,
+                        frameLength - offset
+                    )
+                    let presentationTime = basePresentationTime.map {
+                        $0 + Double(offset) / micSampleRate
+                    }
+                    if micChannelCount == 1 {
+                        self.processMicCaptureCallback(
+                            UnsafeBufferPointer(
+                                start: floatChannelData[0] + offset,
+                                count: count
+                            ),
+                            sampleRate: micSampleRate,
+                            sampleLimit: micSampleLimit,
+                            warningThreshold: micWarningThreshold,
+                            maxHours: recordingMaxHours,
+                            presentationTimeSeconds: presentationTime
+                        )
+                    } else {
+                        micMixer.withMixedSamples(
+                            channelData: floatChannelData,
+                            channelCount: micChannelCount,
+                            offset: offset,
+                            count: count
+                        ) { mixed in
+                            self.processMicCaptureCallback(
+                                mixed,
+                                sampleRate: micSampleRate,
+                                sampleLimit: micSampleLimit,
+                                warningThreshold: micWarningThreshold,
+                                maxHours: recordingMaxHours,
+                                presentationTimeSeconds: presentationTime
+                            )
+                        }
+                    }
+                    offset += count
+                }
+            }
+            micTapInstalled = true
+
+            engine.prepare()
             try engine.start()
-        } catch {
-            self.micEngine = nil
-            if let s = self.stream {
-                self.stream = nil
-                self.delegate = nil
-                try? await s.stopCapture()
+
+            // Device switches and Bluetooth/USB route changes can leave an
+            // AVAudioEngine alive but no longer delivering mic samples. Treat
+            // the change as a capture interruption so the caller saves partial.
+            candidateObserver = NotificationCenter.default.addObserver(
+                forName: .AVAudioEngineConfigurationChange,
+                object: engine,
+                queue: nil
+            ) { [weak self] _ in
+                self?.reportStreamInterruption("Microphone configuration changed during call recording")
             }
-            // Close the just-opened spill so a failed start doesn't leak an open
-            // file handle while the caller's retry backoff runs (#5).
-            finalizeSystemSpill()
+
+            // Publish atomically from the caller's perspective only after both
+            // engines started. Any interruption observed while starting makes
+            // this guard fail and flows through the same full rollback.
+            self.stream = stream
+            self.micEngine = engine
+            self.delegate = delegate
+            self.configChangeObserver = candidateObserver
+            guard markRunningIfHealthy() else {
+                throw CallRecorderError.noAudio
+            }
+
+            keepInputRoute = true
+
+            NSLog("[Voicely] Call recording started (system audio + mic)")
+        } catch {
+            candidateDelegate?.onStreamDied = nil
+            if let observer = candidateObserver {
+                NotificationCenter.default.removeObserver(observer)
+            }
+            if micTapInstalled, let engine = candidateEngine {
+                engine.inputNode.removeTap(onBus: 0)
+            }
+            candidateEngine?.stop()
+            if let stream = candidateStream {
+                try? await stream.stopCapture()
+            }
+
+            self.configChangeObserver = nil
+            self.micEngine = nil
+            self.stream = nil
+            self.delegate = nil
+            discardFailedStartArtifacts()
+            finishLifecycleStop()
             throw error
         }
-        self.micEngine = engine
-
-        NSLog("[Voicely] Call recording started (system audio + mic)")
     }
 
-    /// Synchronous cleanup for app termination - releases resources without collecting samples
+    private func beginStart() -> Bool {
+        let began = lifecycle.beginStart()
+        if began { streamErrorGate.reset() }
+        return began
+    }
+
+    private func markRunningIfHealthy() -> Bool {
+        let result = lifecycle.publishRunningIfHealthy()
+        if let pending = result.pendingInterruption {
+            NSLog("[Voicely] Call start interrupted before publication: %@", pending)
+        }
+        return result.healthy
+    }
+
+    private func beginLifecycleStop() -> String? {
+        lifecycle.beginStop()
+    }
+
+    private func finishLifecycleStop() {
+        lifecycle.finishStop()
+    }
+
+    private func reportStreamInterruption(_ message: String) {
+        let shouldReport = lifecycle.recordInterruption(message)
+        guard shouldReport, streamErrorGate.claim() else { return }
+        onStreamError?(message)
+    }
+
+    private func handleStreamDied() {
+        let shouldCleanUp = lifecycle.beginStreamDeathCleanup()
+        guard shouldCleanUp else { return }
+
+        delegate?.onStreamDied = nil
+        removeConfigurationObserver()
+        if let engine = micEngine {
+            engine.inputNode.removeTap(onBus: 0)
+            engine.stop()
+            micEngine = nil
+        }
+        inputRouteGuard.restoreIfNeeded()
+        stream = nil
+        delegate = nil
+        // Keep the lifecycle in `.stopping` and retain its interruption reason.
+        // AppDelegate's queued stop transition still has to drain the writers,
+        // claim the durable capture, and publish partial capture metadata.
+    }
+
+    private func removeConfigurationObserver() {
+        if let observer = configChangeObserver {
+            NotificationCenter.default.removeObserver(observer)
+            configChangeObserver = nil
+        }
+    }
+
+    private func discardFailedStartArtifacts() {
+        let snapshots = finalizeCaptureWriters()
+        // A cancellation can race with a partially started ScreenCaptureKit
+        // stream. Publish the typed capture for recovery; no raw directory URL
+        // or recursive-delete capability exists in this layer.
+        let capturedPrefixExists = (snapshots.mic?.sampleCount ?? 0) > 0
+            || (snapshots.system?.sampleCount ?? 0) > 0
+        if capturedPrefixExists {
+            markRecoveryCaptured(mic: snapshots.mic, system: snapshots.system)
+        } else if let store = captureLock.withLock({ pendingCaptureStore }),
+                  let handle = captureLock.withLock({ pendingCaptureHandle }) {
+            _ = try? store.discardEmpty(handle)
+        }
+        clearCaptureSessionReferences()
+    }
+
+    private func clearCaptureSessionReferences() {
+        captureLock.withLock {
+            pendingCaptureHandle = nil
+            pendingCaptureStore = nil
+        }
+        startTime = nil
+    }
+
+    /// Synchronous app-termination fallback. Producers stop, every accepted ring
+    /// slot drains, and the recovery marker remains on disk for the next launch.
     func forceStop() {
+        _ = beginLifecycleStop()
         // Prevent onStreamDied from racing with cleanup
         delegate?.onStreamDied = nil
+        removeConfigurationObserver()
 
         micEngine?.inputNode.removeTap(onBus: 0)
         micEngine?.stop()
         micEngine = nil
+        inputRouteGuard.restoreIfNeeded()
 
         if let stream = self.stream {
             self.stream = nil
@@ -290,15 +542,20 @@ final class CallRecorder: @unchecked Sendable {
             self.delegate = nil
         }
 
-        // Close the spill so the partial system.wav on disk is a valid file
-        // even on abrupt termination (best effort, no save of RAM samples).
-        finalizeSystemSpill()
+        // Drain both bounded queues and leave the recovery marker in place. The
+        // next launch will save this interrupted capture.
+        let snapshots = finalizeCaptureWriters()
+        markRecoveryCaptured(mic: snapshots.mic, system: snapshots.system)
+        finishLifecycleStop()
     }
 
-    /// Stop recording and return both audio channels (no mixing).
+    /// Stop recording and return disk-backed channel truth. No whole-channel
+    /// sample array or PCM buffer crosses this boundary.
     func stop() async -> CallAudio? {
+        let interruptionReason = beginLifecycleStop()
         // Prevent onStreamDied from racing with stop()
         delegate?.onStreamDied = nil
+        removeConfigurationObserver()
         // #91: Suppress stale audio level callbacks from in-flight delegate calls
         onAudioLevel = nil
 
@@ -306,283 +563,310 @@ final class CallRecorder: @unchecked Sendable {
             try? await stream.stopCapture()
             self.stream = nil
         }
+        self.delegate = nil
         if let engine = micEngine {
             engine.inputNode.removeTap(onBus: 0)
             engine.stop()
             micEngine = nil
         }
+        inputRouteGuard.restoreIfNeeded()
 
-        // Drain and close the system-channel spill before collecting samples so
-        // diarization (N2b) sees the COMPLETE channel on disk. `systemWavURL` is
-        // left populated (or nil if spill was disabled / never opened).
-        finalizeSystemSpill()
+        // Producers are stopped. Drain each fixed ring before closing its WAV
+        // header so every accepted frame is durable and readable.
+        let snapshots = finalizeCaptureWriters()
+        let (micRate, sysRate) = getSampleRates()
+        let micTruth = Self.analyzeChannelCapture(
+            snapshot: snapshots.mic,
+            fallbackSampleRate: micRate
+        )
+        let systemTruth = Self.analyzeChannelCapture(
+            snapshot: snapshots.system,
+            fallbackSampleRate: sysRate
+        )
+        NSLog("[Voicely] Disk capture finalized - System: %d, Mic: %d, dropped: %d/%d",
+              systemTruth.sampleCount,
+              micTruth.sampleCount,
+              systemTruth.droppedSampleCount,
+              micTruth.droppedSampleCount)
 
-        let (sysSamples, micSamps) = collectSamples()
-        NSLog("[Voicely] Collected samples - System: %d, Mic: %d", sysSamples.count, micSamps.count)
+        markRecoveryCaptured(mic: snapshots.mic, system: snapshots.system)
 
-        guard !sysSamples.isEmpty || !micSamps.isEmpty else {
-            NSLog("[Voicely] Capture failure: both system and mic sample arrays empty. Check Screen Recording permission")
+        guard micTruth.sampleCount > 0 || systemTruth.sampleCount > 0 else {
+            NSLog("[Voicely] Capture failure: both disk-backed channels are empty. Check Screen Recording permission")
+            if let store = captureLock.withLock({ pendingCaptureStore }),
+               let handle = captureLock.withLock({ pendingCaptureHandle }) {
+                _ = try? store.discardEmpty(handle)
+            }
+            clearCaptureSessionReferences()
+            finishLifecycleStop()
             return nil
         }
 
-        let (micRate, sysRate) = getSampleRates()
-        let time = startTime ?? Date()
+        let captureTruth = CaptureTruth(
+            mic: micTruth,
+            system: systemTruth,
+            interruptionReason: interruptionReason
+        )
+        guard let store = captureLock.withLock({ pendingCaptureStore }),
+              let handle = captureLock.withLock({ pendingCaptureHandle }) else {
+            NSLog("[Voicely] Capture failure: typed staging handle disappeared")
+            finishLifecycleStop()
+            return nil
+        }
+        let claim: PendingCallClaim
+        do {
+            claim = try store.claim(handle)
+        } catch {
+            NSLog("[Voicely] Capture finalized but could not be claimed: %@",
+                  error.localizedDescription)
+            clearCaptureSessionReferences()
+            finishLifecycleStop()
+            return nil
+        }
 
-        let sysBuf = sysSamples.isEmpty ? nil : makePCMBuffer(from: sysSamples, sampleRate: sysRate)
-        let micBuf = micSamps.isEmpty ? nil : makePCMBuffer(from: micSamps, sampleRate: micRate)
-
-        NSLog("[Voicely] Call recording stopped. Mic: %d samples, System: %d samples", micSamps.count, sysSamples.count)
+        NSLog("[Voicely] Call recording stopped. Mic: %d samples, System: %d samples",
+              micTruth.sampleCount, systemTruth.sampleCount)
+        clearCaptureSessionReferences()
+        finishLifecycleStop()
         return CallAudio(
-            mic: micBuf,
-            system: sysBuf,
-            micSampleRate: micRate,
-            systemSampleRate: sysRate,
-            startTime: time
+            sourceCapture: claim,
+            captureTruth: captureTruth
         )
     }
 
-    /// Read `seconds` of new samples from each channel, advance offsets
-    /// independently. Each channel takes its OWN sample count from its OWN rate
-    /// (system: systemSampleRate * seconds, mic: micSampleRate * seconds) so the
-    /// you/other timelines stay aligned even when the mic runs at a native rate
-    /// other than 48 kHz (built-in 44.1k, AirPods 16-24k). Non-destructive:
-    /// samples stay resident until `collectSamples()` at stop. Either channel may
-    /// be nil if it has no fresh data ≥ minSamples.
-    ///
-    /// `minSamples` is a threshold in samples (not seconds).
-    ///
-    /// No mixing — downstream AEC and transcription consume channels separately.
-    func extractChannelChunks(seconds: Double, minSamples: Int = 8000) -> ChannelChunks {
-        let (micRate, sysRate) = getSampleRates()
-        let sysCount = samplesFor(seconds: seconds, rate: sysRate)
-        let micCount = samplesFor(seconds: seconds, rate: micRate)
+    // MARK: - Capture staging helpers
 
-        systemLock.lock()
-        let sysAvailable = systemSamples.count - systemReadOffset
-        let sysTake = min(sysCount, max(0, sysAvailable))
-        let sysChunk: [Float]
-        if sysTake >= minSamples {
-            let end = systemReadOffset + sysTake
-            sysChunk = Array(systemSamples[systemReadOffset..<end])
-            systemReadOffset = end
-        } else {
-            sysChunk = []
+    private func setupCaptureSession() throws {
+        let time = startTime ?? Date()
+        let root = PendingCallRecoveryStore.defaultRootURL
+        if let free = Self.freeBytes(at: root), free < Self.spillMinFreeBytes {
+            onDiskSpillStopped?(free)
+            throw CallRecorderError.captureStorageUnavailable(
+                "Only \(free / (1024 * 1024)) MB is free"
+            )
         }
-        systemLock.unlock()
 
-        micLock.lock()
-        let micAvailable = micSamples.count - micReadOffset
-        let micTake = min(micCount, max(0, micAvailable))
-        let micChunk: [Float]
-        if micTake >= minSamples {
-            let end = micReadOffset + micTake
-            micChunk = Array(micSamples[micReadOffset..<end])
-            micReadOffset = end
-        } else {
-            micChunk = []
-        }
-        micLock.unlock()
-
-        let sysBuf = sysChunk.isEmpty ? nil : makePCMBuffer(from: sysChunk, sampleRate: sysRate)
-        let micBuf = micChunk.isEmpty ? nil : makePCMBuffer(from: micChunk, sampleRate: micRate)
-        return ChannelChunks(mic: micBuf, system: sysBuf)
-    }
-
-    /// Convert a duration in seconds to a sample count at `rate`, clamped to
-    /// `Int.max` (avoids a trap when `seconds` is `.greatestFiniteMagnitude`,
-    /// used by the tail flush to drain the whole channel).
-    private func samplesFor(seconds: Double, rate: Double) -> Int {
-        let raw = seconds * rate
-        guard raw.isFinite, raw >= 0 else { return 0 }
-        if raw >= Double(Int.max) { return Int.max }
-        return Int(raw)
-    }
-
-    /// Tail flush: everything still unread in both channels since the last
-    /// `extractChannelChunks` call.
-    func extractRemainingChannels() -> ChannelChunks {
-        extractChannelChunks(seconds: .greatestFiniteMagnitude, minSamples: 1)
-    }
-
-    /// Unread backlog in SECONDS for the lagging channel: the larger of the two
-    /// channels' (unread samples / that channel's rate). Used by the chunk loop
-    /// to decide whether transcription has fallen behind real-time capture and
-    /// it must greedily drain more than one 30 s window to let the offset catch
-    /// up. Lock-guarded reads; cheap (no copy).
-    func pendingBacklogSeconds() -> Double {
-        let (micRate, sysRate) = getSampleRates()
-
-        systemLock.lock()
-        let sysUnread = max(0, systemSamples.count - systemReadOffset)
-        systemLock.unlock()
-
-        micLock.lock()
-        let micUnread = max(0, micSamples.count - micReadOffset)
-        micLock.unlock()
-
-        let sysSec = sysRate > 0 ? Double(sysUnread) / sysRate : 0
-        let micSec = micRate > 0 ? Double(micUnread) / micRate : 0
-        return max(sysSec, micSec)
-    }
-
-    #if DEBUG
-    /// Test-only hook: inject raw samples without running SCStream/AVAudioEngine.
-    func testInject(system: [Float], systemRate: Double, mic: [Float], micRate: Double) {
-        systemLock.lock()
-        systemSamples = system
-        systemReadOffset = 0
-        systemLock.unlock()
-        micLock.lock()
-        micSamples = mic
-        micReadOffset = 0
-        micLock.unlock()
-        sampleRateLock.lock()
-        self.systemSampleRate = systemRate
-        self.micSampleRate = micRate
-        sampleRateLock.unlock()
-    }
-    #endif
-
-    // MARK: - System spill helpers
-
-    /// Open a fresh streaming WAV file for this call's system channel. Failure
-    /// to create the file disables the spill but never blocks recording.
-    private func setupSystemSpill() {
-        spillLock.lock()
-        spillFile = nil
-        spillPending = []
-        spillDisabled = false
-        diskGuardFired = false
-        spillLock.unlock()
-
-        let id = CallSpillNaming.folderName(from: startTime ?? Date())
-        callId = id
-        systemWavURL = nil
-
-        let baseDir = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Documents/Voicely/calls")
-            .appendingPathComponent(id)
-        let url = baseDir.appendingPathComponent("system.wav")
+        let store = try PendingCallRecoveryStore()
+        let handle = try store.createCapture(
+            startTime: time,
+            expectedChannels: Set(PendingCallChannel.allCases)
+        )
+        let systemURL = handle.systemFileURL
         do {
-            try FileManager.default.createDirectory(at: baseDir, withIntermediateDirectories: true)
-            guard let format = AVAudioFormat(commonFormat: .pcmFormatFloat32,
-                                             sampleRate: 48000, channels: 1, interleaved: false) else {
-                disableSpill()
-                return
+            let systemFD = try store.createChannelFileDescriptor(
+                handle,
+                channel: .system
+            )
+            let writer = try CallCaptureWAVWriter(
+                url: systemURL,
+                sampleRate: 48_000,
+                ownedFileDescriptor: systemFD,
+                minimumFreeBytes: Self.spillMinFreeBytes,
+                timelineOriginSeconds: captureTimelineOriginSeconds,
+                onDegraded: { [weak self] reason in
+                    self?.handleCaptureDegraded(channel: "system", reason: reason)
+                }
+            )
+            captureLock.withLock {
+                pendingCaptureStore = store
+                pendingCaptureHandle = handle
+                systemCaptureWriter = writer
+                micCaptureWriter = nil
+                degradedChannels = []
             }
-            // Persist as 16-bit PCM to roughly halve disk footprint vs float32;
-            // AVAudioFile converts on write. Diarization reads back fine.
-            let settings: [String: Any] = [
-                AVFormatIDKey: kAudioFormatLinearPCM,
-                AVSampleRateKey: 48000.0,
-                AVNumberOfChannelsKey: 1,
-                AVLinearPCMBitDepthKey: 16,
-                AVLinearPCMIsFloatKey: false,
-                AVLinearPCMIsBigEndianKey: false,
-                AVLinearPCMIsNonInterleaved: false,
-            ]
-            let file = try AVAudioFile(forWriting: url, settings: settings,
-                                       commonFormat: format.commonFormat, interleaved: false)
-            spillLock.lock()
-            spillFile = file
-            spillLock.unlock()
-            systemWavURL = url
-            try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
-            NSLog("[Voicely] system spill opened at %@", url.path)
         } catch {
-            NSLog("[Voicely] system spill open failed: %@ — continuing RAM-only", error.localizedDescription)
-            disableSpill()
+            // Typed cleanup validates that no audio payload exists before it can
+            // retire the transaction. A non-empty capture is retained.
+            _ = try? store.discardEmpty(handle)
+            throw error
         }
     }
 
-    /// Audio-thread side: stash samples and kick a background flush. O(append).
-    private func enqueueSpill(_ samples: [Float]) {
-        spillLock.lock()
-        if spillDisabled {
-            spillLock.unlock()
-            return
+    private func setupMicCapture(sampleRate: Double) throws {
+        let context: (PendingCallRecoveryStore, PendingCallCaptureHandle)? =
+            captureLock.withLock {
+                guard let store = pendingCaptureStore,
+                      let handle = pendingCaptureHandle else { return nil }
+                return (store, handle)
+            }
+        guard let (store, handle) = context else {
+            throw CallRecorderError.captureStorageUnavailable("typed staging handle is missing")
         }
-        spillPending.append(contentsOf: samples)
-        spillLock.unlock()
-        spillQueue.async { [weak self] in self?.flushSpill() }
+        let url = handle.micFileURL
+        let micFD = try store.createChannelFileDescriptor(
+            handle,
+            channel: .mic
+        )
+        let writer = try CallCaptureWAVWriter(
+            url: url,
+            sampleRate: sampleRate,
+            ownedFileDescriptor: micFD,
+            minimumFreeBytes: Self.spillMinFreeBytes,
+            timelineOriginSeconds: captureTimelineOriginSeconds,
+            onDegraded: { [weak self] reason in
+                self?.handleCaptureDegraded(channel: "mic", reason: reason)
+            }
+        )
+        captureLock.withLock {
+            micCaptureWriter = writer
+        }
     }
 
-    /// Background side: write whatever is pending to the WAV file. Runs the
-    /// disk-full guard before writing. Never touches the audio thread.
-    private func flushSpill() {
-        spillLock.lock()
-        if spillDisabled || spillFile == nil || spillPending.isEmpty {
-            spillLock.unlock()
-            return
+    private func enqueueSystemCapture(
+        _ samples: UnsafeBufferPointer<Float>,
+        maximumTotalSamples: Int,
+        presentationTimeSeconds: Double?
+    ) -> CallCaptureWAVWriter.EnqueueResult {
+        let writer = captureLock.withLock { systemCaptureWriter }
+        guard let writer else {
+            handleCaptureDegraded(channel: "system", reason: "capture writer is unavailable")
+            return CallCaptureWAVWriter.EnqueueResult(
+                acceptedSampleCount: 0,
+                droppedSampleCount: samples.count,
+                timelineSampleCount: samples.count,
+                becameDegraded: true
+            )
         }
-        var batch: [Float] = []
-        swap(&batch, &spillPending)
-        let file = spillFile
-        spillLock.unlock()
+        return writer.enqueue(
+            samples,
+            maximumTotalSamples: maximumTotalSamples,
+            presentationTimeSeconds: presentationTimeSeconds
+        )
+    }
 
-        guard let file else { return }
-
-        // Disk-full guard (#2): stop spilling if the volume is low, keep RAM
-        // data and already-written bytes. Fire the user-facing callback once.
-        if let free = Self.freeBytes(at: file.url), free < Self.spillMinFreeBytes {
-            NSLog("[Voicely] system spill low disk (%llu bytes free) — stopping spill", free)
-            disableSpill()
-            fireDiskGuard(free)
-            return
+    private func enqueueMicCapture(
+        _ samples: UnsafeBufferPointer<Float>,
+        maximumTotalSamples: Int,
+        presentationTimeSeconds: Double?
+    ) -> CallCaptureWAVWriter.EnqueueResult {
+        let writer = captureLock.withLock { micCaptureWriter }
+        guard let writer else {
+            handleCaptureDegraded(channel: "mic", reason: "capture writer is unavailable")
+            return CallCaptureWAVWriter.EnqueueResult(
+                acceptedSampleCount: 0,
+                droppedSampleCount: samples.count,
+                timelineSampleCount: samples.count,
+                becameDegraded: true
+            )
         }
+        return writer.enqueue(
+            samples,
+            maximumTotalSamples: maximumTotalSamples,
+            presentationTimeSeconds: presentationTimeSeconds
+        )
+    }
 
-        guard let format = AVAudioFormat(commonFormat: .pcmFormatFloat32,
-                                         sampleRate: 48000, channels: 1, interleaved: false),
-              let buffer = AVAudioPCMBuffer(pcmFormat: format,
-                                            frameCapacity: AVAudioFrameCount(batch.count)) else {
-            return
+    private func processMicCaptureCallback(
+        _ samples: UnsafeBufferPointer<Float>,
+        sampleRate: Double,
+        sampleLimit: Int,
+        warningThreshold: Int,
+        maxHours: Int,
+        presentationTimeSeconds: Double?
+    ) {
+        let enqueue = enqueueMicCapture(
+            samples,
+            maximumTotalSamples: sampleLimit,
+            presentationTimeSeconds: presentationTimeSeconds
+        )
+        let count = enqueue.timelineSampleCount
+        let atLimit = count >= sampleLimit
+        let (shouldNotify, shouldWarn) = limitLock.withLock {
+            let shouldNotify = atLimit && !maxDurationNotified
+            if shouldNotify { maxDurationNotified = true }
+            let shouldWarn = !warningFired && count >= warningThreshold
+            if shouldWarn { warningFired = true }
+            return (shouldNotify, shouldWarn)
         }
-        buffer.frameLength = AVAudioFrameCount(batch.count)
-        if let dst = buffer.floatChannelData?[0] {
-            batch.withUnsafeBufferPointer { src in
-                if let base = src.baseAddress { dst.initialize(from: base, count: batch.count) }
+        if shouldWarn {
+            let remaining = Self.remainingSeconds(
+                maxHours: maxHours,
+                sampleCount: count,
+                sampleRate: sampleRate
+            )
+            captureEventQueue.async { [weak self] in
+                self?.onMaxDurationWarning?(remaining)
             }
         }
+        if shouldNotify {
+            captureEventQueue.async { [weak self] in
+                self?.onMaxDuration?()
+            }
+        }
+    }
+
+    private func handleCaptureDegraded(channel: String, reason: String) {
+        captureEventQueue.async { [weak self] in
+            self?.handleCaptureDegradedOffCallback(channel: channel, reason: reason)
+        }
+    }
+
+    private func handleCaptureDegradedOffCallback(channel: String, reason: String) {
+        let first = captureLock.withLock { degradedChannels.insert(channel).inserted }
+        guard first else { return }
+        NSLog("[Voicely] %@ call capture degraded: %@", channel, reason)
+        onCaptureDegraded?(channel)
+        if let captureURL = captureLock.withLock({ pendingCaptureHandle?.systemFileURL }),
+           let free = Self.freeBytes(at: captureURL),
+           free < Self.spillMinFreeBytes {
+            onDiskSpillStopped?(free)
+        }
+    }
+
+    private func finalizeCaptureWriters() -> (
+        mic: CallCaptureWAVWriter.Snapshot?,
+        system: CallCaptureWAVWriter.Snapshot?
+    ) {
+        let writers = captureLock.withLock { () -> (
+            CallCaptureWAVWriter?,
+            CallCaptureWAVWriter?
+        ) in
+            let mic = micCaptureWriter
+            let system = systemCaptureWriter
+            micCaptureWriter = nil
+            systemCaptureWriter = nil
+            return (mic, system)
+        }
+        let mic = writers.0?.finish()
+        let system = writers.1?.finish()
+        return (mic, system)
+    }
+
+    private func markRecoveryCaptured(
+        mic: CallCaptureWAVWriter.Snapshot?,
+        system: CallCaptureWAVWriter.Snapshot?
+    ) {
+        // A second stop/termination pass must not overwrite a previously
+        // finalized marker with nil channel metadata after writer ownership was
+        // already handed off.
+        guard mic != nil || system != nil else { return }
+        guard let store = captureLock.withLock({ pendingCaptureStore }),
+              let handle = captureLock.withLock({ pendingCaptureHandle }) else { return }
         do {
-            try file.write(from: buffer)
+            try store.markCaptured(
+                handle,
+                mic: mic.map(Self.pendingChannelMetadata),
+                system: system.map(Self.pendingChannelMetadata)
+            )
         } catch {
-            // A write error (e.g. ENOSPC slipping past the guard) must not crash
-            // the call; disable the spill and keep RAM capture intact.
-            NSLog("[Voicely] system spill write failed: %@ — stopping spill", error.localizedDescription)
-            let free = Self.freeBytes(at: file.url) ?? 0
-            disableSpill()
-            fireDiskGuard(free)
+            NSLog("[Voicely] Failed to finalize call recovery marker: %@", error.localizedDescription)
         }
     }
 
-    /// Drain remaining pending samples and close the file. Synchronous wrt the
-    /// spill queue so `systemWavURL` points to a complete, closed WAV on return.
-    private func finalizeSystemSpill() {
-        spillQueue.sync { [weak self] in self?.flushSpill() }
-        spillLock.lock()
-        let hadFile = spillFile != nil
-        spillFile = nil
-        spillPending = []
-        spillLock.unlock()
-        if hadFile, let url = systemWavURL {
-            NSLog("[Voicely] system spill finalized at %@", url.path)
-        }
-    }
-
-    private func disableSpill() {
-        spillLock.lock()
-        spillDisabled = true
-        spillFile = nil
-        spillPending = []
-        spillLock.unlock()
-    }
-
-    private func fireDiskGuard(_ freeBytes: UInt64) {
-        spillLock.lock()
-        let already = diskGuardFired
-        diskGuardFired = true
-        spillLock.unlock()
-        if !already { onDiskSpillStopped?(freeBytes) }
+    private static func pendingChannelMetadata(
+        _ snapshot: CallCaptureWAVWriter.Snapshot
+    ) -> PendingCallChannelMetadata {
+        PendingCallChannelMetadata(
+            sampleRate: snapshot.sampleRate,
+            sampleCount: snapshot.sampleCount,
+            droppedSampleCount: snapshot.droppedSampleCount,
+            zeroFilledSampleCount: snapshot.zeroFilledSampleCount,
+            timelineOriginOffsetSeconds: snapshot.timelineOriginOffsetSeconds,
+            maxClockDriftSeconds: snapshot.maxClockDriftSeconds,
+            discontinuityCount: snapshot.discontinuityCount,
+            isDegraded: snapshot.isDegraded,
+            failure: snapshot.failure ?? snapshot.timelineIssue
+        )
     }
 
     /// APFS-aware free space at the spill file's volume; nil if unreadable.
@@ -599,18 +883,9 @@ final class CallRecorder: @unchecked Sendable {
         return nil
     }
 
-    private func collectSamples() -> ([Float], [Float]) {
-        var sys: [Float] = []
-        systemLock.lock()
-        swap(&sys, &systemSamples)
-        systemLock.unlock()
-
-        var mic: [Float] = []
-        micLock.lock()
-        swap(&mic, &micSamples)
-        micLock.unlock()
-
-        return (sys, mic)
+    private static func monotonicHostTimeSeconds() -> Double? {
+        let seconds = CMTimeGetSeconds(CMClockGetTime(CMClockGetHostTimeClock()))
+        return seconds.isFinite ? seconds : nil
     }
 
     // Sync helpers to avoid NSLock in async context (Swift 6)
@@ -628,28 +903,1059 @@ final class CallRecorder: @unchecked Sendable {
         return (mic, sys)
     }
 
-    private func makePCMBuffer(from samples: [Float], sampleRate: Double) -> AVAudioPCMBuffer? {
-        guard !samples.isEmpty, sampleRate > 0 else { return nil }
-        guard let format = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: sampleRate, channels: 1, interleaved: false) else { return nil }
-        guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(samples.count)) else { return nil }
-        buffer.frameLength = AVAudioFrameCount(samples.count)
-        if let data = buffer.floatChannelData?[0] {
-            for i in 0..<samples.count {
-                data[i] = samples[i]
+    nonisolated static func sampleLimit(maxHours: Int, sampleRate: Double) -> Int {
+        guard maxHours > 0,
+              CallCaptureWAVWriter.isSupportedSampleRate(sampleRate) else { return 0 }
+        let value = Double(maxHours) * 3_600 * sampleRate
+        guard value < Double(Int.max) else {
+            return CallCaptureWAVWriter.maximumPCM16SampleCount
+        }
+        return min(
+            Int(value.rounded(.down)),
+            CallCaptureWAVWriter.maximumPCM16SampleCount
+        )
+    }
+
+    nonisolated static func warningSampleThreshold(
+        maxHours: Int,
+        sampleRate: Double,
+        warningLeadSeconds: Int = 5 * 60
+    ) -> Int {
+        guard maxHours > 0,
+              CallCaptureWAVWriter.isSupportedSampleRate(sampleRate) else { return 0 }
+        let limit = sampleLimit(maxHours: maxHours, sampleRate: sampleRate)
+        let lead = Int((Double(max(0, warningLeadSeconds)) * sampleRate).rounded(.down))
+        return max(0, limit - lead)
+    }
+
+    nonisolated static func remainingSeconds(
+        maxHours: Int,
+        sampleCount: Int,
+        sampleRate: Double
+    ) -> Int {
+        guard sampleRate.isFinite, sampleRate > 0 else { return 0 }
+        let remainingSamples = max(0, sampleLimit(maxHours: maxHours, sampleRate: sampleRate) - sampleCount)
+        return Int((Double(remainingSamples) / sampleRate).rounded(.down))
+    }
+
+    nonisolated static func analyzeChannelCapture(
+        samples: [Float],
+        sampleRate: Double
+    ) -> ChannelCaptureTruth {
+        let durationSeconds = sampleRate > 0 ? Double(samples.count) / sampleRate : 0
+        guard !samples.isEmpty else {
+            return ChannelCaptureTruth(
+                sampleCount: 0,
+                sampleRate: sampleRate,
+                durationSeconds: durationSeconds,
+                rms: 0,
+                peakAmplitude: 0,
+                meanVolumeDBFS: dbfs(forAmplitude: 0),
+                peakVolumeDBFS: dbfs(forAmplitude: 0),
+                isEffectivelySilent: true
+            )
+        }
+
+        var sumSquares = 0.0
+        var peak = 0.0
+        for sample in samples {
+            let value = Double(sample)
+            let magnitude = abs(value)
+            sumSquares += value * value
+            if magnitude > peak {
+                peak = magnitude
             }
         }
-        return buffer
+        let rms = sqrt(sumSquares / Double(samples.count))
+        let meanVolumeDBFS = dbfs(forAmplitude: rms)
+        let peakVolumeDBFS = dbfs(forAmplitude: peak)
+        let isEffectivelySilent = peak == 0 || (
+            durationSeconds >= effectiveSilenceMinimumDurationSeconds &&
+            meanVolumeDBFS <= effectiveSilenceMeanVolumeFloorDBFS &&
+            peakVolumeDBFS <= effectiveSilencePeakVolumeFloorDBFS
+        )
+        return ChannelCaptureTruth(
+            sampleCount: samples.count,
+            sampleRate: sampleRate,
+            durationSeconds: durationSeconds,
+            rms: rms,
+            peakAmplitude: peak,
+            meanVolumeDBFS: meanVolumeDBFS,
+            peakVolumeDBFS: peakVolumeDBFS,
+            isEffectivelySilent: isEffectivelySilent
+        )
+    }
+
+    private nonisolated static func analyzeChannelCapture(
+        snapshot: CallCaptureWAVWriter.Snapshot?,
+        fallbackSampleRate: Double
+    ) -> ChannelCaptureTruth {
+        guard let snapshot else {
+            return ChannelCaptureTruth(
+                sampleCount: 0,
+                sampleRate: fallbackSampleRate,
+                durationSeconds: 0,
+                rms: 0,
+                peakAmplitude: 0,
+                meanVolumeDBFS: dbfs(forAmplitude: 0),
+                peakVolumeDBFS: dbfs(forAmplitude: 0),
+                isEffectivelySilent: true,
+                isDegraded: false
+            )
+        }
+        let duration = snapshot.sampleRate > 0
+            ? Double(snapshot.sampleCount) / snapshot.sampleRate
+            : 0
+        let rms = snapshot.sampleCount > 0
+            ? sqrt(snapshot.sumSquares / Double(snapshot.sampleCount))
+            : 0
+        let meanDBFS = dbfs(forAmplitude: rms)
+        let peakDBFS = dbfs(forAmplitude: snapshot.peakAmplitude)
+        let silent = snapshot.peakAmplitude == 0 || (
+            duration >= effectiveSilenceMinimumDurationSeconds &&
+            meanDBFS <= effectiveSilenceMeanVolumeFloorDBFS &&
+            peakDBFS <= effectiveSilencePeakVolumeFloorDBFS
+        )
+        return ChannelCaptureTruth(
+            sampleCount: snapshot.sampleCount,
+            sampleRate: snapshot.sampleRate,
+            durationSeconds: duration,
+            rms: rms,
+            peakAmplitude: snapshot.peakAmplitude,
+            meanVolumeDBFS: meanDBFS,
+            peakVolumeDBFS: peakDBFS,
+            isEffectivelySilent: silent,
+            droppedSampleCount: snapshot.droppedSampleCount,
+            zeroFilledSampleCount: snapshot.zeroFilledSampleCount,
+            timelineOriginOffsetSeconds: snapshot.timelineOriginOffsetSeconds,
+            maxClockDriftSeconds: snapshot.maxClockDriftSeconds,
+            discontinuityCount: snapshot.discontinuityCount,
+            failure: snapshot.failure ?? snapshot.timelineIssue,
+            isDegraded: snapshot.isDegraded
+        )
+    }
+
+    private nonisolated static func dbfs(forAmplitude amplitude: Double) -> Double {
+        guard amplitude > 0 else { return -160 }
+        return max(-160, 20 * log10(amplitude))
+    }
+
+}
+
+/// Lock-protected lifecycle truth shared by the producer callbacks and the
+/// asynchronous stop/finalize path. The first interruption that happens after
+/// publication remains latched until `beginStop()` snapshots it.
+final class CallRecorderLifecycleState: @unchecked Sendable {
+    struct Publication: Sendable, Equatable {
+        let healthy: Bool
+        let pendingInterruption: String?
+    }
+
+    enum StartHandoffStatus: Sendable, Equatable {
+        case healthy
+        case interrupted(String)
+        case notRunning
+    }
+
+    private enum Phase: Equatable {
+        case idle
+        case starting
+        case running
+        case stopping
+    }
+
+    private let lock = NSLock()
+    private var phase: Phase = .idle
+    private var pendingStartInterruption: String?
+    private var captureInterruptionReason: String?
+
+    var isRunning: Bool {
+        lock.withLock { phase == .running }
+    }
+
+    func beginStart() -> Bool {
+        lock.withLock {
+            guard phase == .idle else { return false }
+            phase = .starting
+            pendingStartInterruption = nil
+            captureInterruptionReason = nil
+            return true
+        }
+    }
+
+    func publishRunningIfHealthy() -> Publication {
+        lock.withLock {
+            guard phase == .starting, pendingStartInterruption == nil else {
+                return Publication(
+                    healthy: false,
+                    pendingInterruption: pendingStartInterruption
+                )
+            }
+            phase = .running
+            return Publication(healthy: true, pendingInterruption: nil)
+        }
+    }
+
+    /// Snapshots recorder health at the app-state handoff boundary. Runtime
+    /// interruption truth stays visible after producer cleanup moves the phase
+    /// to `.stopping`, so the app can still finalize the durable prefix.
+    func startHandoffStatus() -> StartHandoffStatus {
+        lock.withLock {
+            if let captureInterruptionReason {
+                return .interrupted(captureInterruptionReason)
+            }
+            guard phase == .running else { return .notRunning }
+            return .healthy
+        }
+    }
+
+    /// Returns the runtime interruption latched before stop won the lifecycle
+    /// race. Callbacks that arrive after this transition are shutdown noise.
+    func beginStop() -> String? {
+        lock.withLock {
+            phase = .stopping
+            pendingStartInterruption = nil
+            return captureInterruptionReason
+        }
+    }
+
+    /// SCStream has already stopped its producer. Keep `.stopping` and retain
+    /// the reason until the app's normal async stop drains the capture writers.
+    func beginStreamDeathCleanup() -> Bool {
+        lock.withLock {
+            guard phase == .running else { return false }
+            phase = .stopping
+            return true
+        }
+    }
+
+    func finishStop() {
+        lock.withLock {
+            phase = .idle
+            pendingStartInterruption = nil
+            captureInterruptionReason = nil
+        }
+    }
+
+    /// Records startup failures separately so they still force transactional
+    /// rollback. Runtime failures are reported once and become capture truth.
+    func recordInterruption(_ message: String) -> Bool {
+        lock.withLock {
+            switch phase {
+            case .starting:
+                if pendingStartInterruption == nil {
+                    pendingStartInterruption = message
+                }
+                return false
+            case .running:
+                guard captureInterruptionReason == nil else { return false }
+                captureInterruptionReason = message
+                return true
+            case .idle, .stopping:
+                return false
+            }
+        }
+    }
+}
+
+/// One-shot gate shared by ScreenCaptureKit and microphone interruption paths.
+/// Both can report the same route failure, but the app must transition to stop
+/// exactly once for a recording session.
+final class CallRecorderStreamErrorGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var claimed = false
+
+    func claim() -> Bool {
+        lock.withLock {
+            guard !claimed else { return false }
+            claimed = true
+            return true
+        }
+    }
+
+    func reset() {
+        lock.withLock { claimed = false }
+    }
+}
+
+// MARK: - Disk-authoritative call capture
+
+/// A bounded asynchronous mono PCM16 WAV writer.
+///
+/// Audio callbacks enqueue chunks into a fixed-size ring and never perform file
+/// I/O. The worker owns the file handle and updates the WAV length fields after
+/// every successful batch, leaving a readable prefix after a process crash.
+final class CallCaptureWAVWriter: @unchecked Sendable {
+    static let maximumInputChunkSamples = 4_096
+    static let defaultPendingBufferCount = 32
+    static let maximumPCM16SampleCount = Int((UInt64(UInt32.max) - 36) / 2)
+
+    private static let minimumSupportedSampleRate = 8_000.0
+    private static let maximumSupportedSampleRate = 384_000.0
+    private static let timestampToleranceSeconds = 0.001
+
+    static func isSupportedSampleRate(_ value: Double) -> Bool {
+        value.isFinite
+            && value >= minimumSupportedSampleRate
+            && value <= maximumSupportedSampleRate
+    }
+
+    private final class RingSlot: @unchecked Sendable {
+        var samples: [Float]
+        var count = 0
+        var startSamplePosition = 0
+
+        init(capacity: Int) {
+            samples = [Float](repeating: 0, count: capacity)
+        }
+    }
+
+    struct Snapshot: Sendable, Equatable {
+        let sampleCount: Int
+        let sampleRate: Double
+        let sumSquares: Double
+        let peakAmplitude: Double
+        let droppedSampleCount: Int
+        let zeroFilledSampleCount: Int
+        let timelineOriginOffsetSeconds: Double
+        let maxClockDriftSeconds: Double
+        let discontinuityCount: Int
+        let ringSampleCapacity: Int
+        let peakQueuedBufferCount: Int
+        let peakQueuedSampleCount: Int
+        let failure: String?
+        let timelineIssue: String?
+
+        var isDegraded: Bool {
+            droppedSampleCount > 0 || failure != nil || timelineIssue != nil
+        }
+    }
+
+    struct EnqueueResult: Sendable, Equatable {
+        let acceptedSampleCount: Int
+        let droppedSampleCount: Int
+        let timelineSampleCount: Int
+        let becameDegraded: Bool
+    }
+
+    enum WriterError: Error, LocalizedError {
+        case invalidSampleRate(Double)
+        case createFailed(String)
+        case closed
+        case wavSizeLimit
+
+        var errorDescription: String? {
+            switch self {
+            case let .invalidSampleRate(rate):
+                return "Invalid capture sample rate: \(rate)"
+            case let .createFailed(detail):
+                return "Could not create call capture file. \(detail)"
+            case .closed:
+                return "Call capture writer is closed."
+            case .wavSizeLimit:
+                return "Call capture exceeded the WAV size limit."
+            }
+        }
+    }
+
+    let url: URL
+    let sampleRate: Double
+
+    private let lock = NSLock()
+    private let worker: DispatchQueue
+    private let ring: [RingSlot]
+    private var head = 0
+    private var tail = 0
+    private var queuedBufferCount = 0
+    private var queuedSampleCount = 0
+    private var peakQueuedBufferCount = 0
+    private var peakQueuedSampleCount = 0
+    private var drainScheduled = false
+    private var accepting = true
+    private var handle: FileHandle?
+    private var acceptedSampleCount = 0
+    /// End of the source timeline seen by enqueue, including leading alignment
+    /// and input frames replaced with silence under backpressure.
+    private var timelineInputEndSample = 0
+    private var writtenSampleCount = 0
+    private var droppedSampleCount = 0
+    private var zeroFilledSampleCount = 0
+    private var sumSquares = 0.0
+    private var peakAmplitude = 0.0
+    private var failure: String?
+    private var degradationReported = false
+    private let artificialWriteDelay: TimeInterval
+    private let minimumFreeBytes: UInt64?
+    private var writtenBatchCount = 0
+    private let onDegraded: (@Sendable (String) -> Void)?
+    private let timelineOriginSeconds: Double?
+    private var firstPresentationTimeSeconds: Double?
+    private var firstTimelineSamplePosition = 0
+    private var timelineOriginOffsetSeconds = 0.0
+    private var maxClockDriftSeconds = 0.0
+    private var discontinuityCount = 0
+    private var timelineIssue: String?
+
+    init(
+        url: URL,
+        sampleRate: Double,
+        ownedFileDescriptor: Int32? = nil,
+        pendingBufferCount: Int = defaultPendingBufferCount,
+        artificialWriteDelay: TimeInterval = 0,
+        minimumFreeBytes: UInt64? = nil,
+        timelineOriginSeconds: Double? = nil,
+        onDegraded: (@Sendable (String) -> Void)? = nil
+    ) throws {
+        guard Self.isSupportedSampleRate(sampleRate) else {
+            if let ownedFileDescriptor { Darwin.close(ownedFileDescriptor) }
+            throw WriterError.invalidSampleRate(sampleRate)
+        }
+        self.url = url
+        self.sampleRate = sampleRate
+        self.ring = (0..<max(1, pendingBufferCount)).map { _ in
+            RingSlot(capacity: Self.maximumInputChunkSamples)
+        }
+        self.worker = DispatchQueue(
+            label: "voicely.call-capture.\(url.lastPathComponent)",
+            qos: .utility
+        )
+        self.artificialWriteDelay = max(0, artificialWriteDelay)
+        self.minimumFreeBytes = minimumFreeBytes
+        self.timelineOriginSeconds = timelineOriginSeconds.flatMap {
+            $0.isFinite ? $0 : nil
+        }
+        self.onDegraded = onDegraded
+
+        if let ownedFileDescriptor {
+            var closeDescriptor = true
+            defer {
+                if closeDescriptor { Darwin.close(ownedFileDescriptor) }
+            }
+            try Self.initializeOwnedDescriptor(
+                ownedFileDescriptor,
+                sampleRate: sampleRate
+            )
+            self.handle = FileHandle(
+                fileDescriptor: ownedFileDescriptor,
+                closeOnDealloc: true
+            )
+            closeDescriptor = false
+        } else {
+            do {
+                let fm = FileManager.default
+                try fm.createDirectory(
+                    at: url.deletingLastPathComponent(),
+                    withIntermediateDirectories: true
+                )
+                guard fm.createFile(atPath: url.path, contents: Self.wavHeader(
+                    sampleRate: sampleRate,
+                    dataByteCount: 0
+                )) else {
+                    throw WriterError.createFailed("createFile returned false")
+                }
+                self.handle = try FileHandle(forUpdating: url)
+                try fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+            } catch let error as WriterError {
+                throw error
+            } catch {
+                throw WriterError.createFailed(error.localizedDescription)
+            }
+        }
+    }
+
+    /// Enqueue at most `maximumTotalSamples` on a monotonic source timeline.
+    /// A saturated ring loses payload, but the source position still advances;
+    /// the worker writes zero PCM for that exact interval so later timestamps do
+    /// not move earlier.
+    func enqueue(
+        _ samples: [Float],
+        maximumTotalSamples: Int = .max,
+        presentationTimeSeconds: Double? = nil
+    ) -> EnqueueResult {
+        samples.withUnsafeBufferPointer {
+            enqueue(
+                $0,
+                maximumTotalSamples: maximumTotalSamples,
+                presentationTimeSeconds: presentationTimeSeconds
+            )
+        }
+    }
+
+    func enqueue(
+        _ samples: UnsafeBufferPointer<Float>,
+        maximumTotalSamples: Int,
+        presentationTimeSeconds: Double?
+    ) -> EnqueueResult {
+        guard samples.count > 0 else {
+            return lock.withLock {
+                EnqueueResult(
+                    acceptedSampleCount: acceptedSampleCount,
+                    droppedSampleCount: droppedSampleCount,
+                    timelineSampleCount: timelineInputEndSample,
+                    becameDegraded: false
+                )
+            }
+        }
+
+        var shouldSchedule = false
+        var report: String?
+        let result = lock.withLock { () -> EnqueueResult in
+            let wasDegraded = isDegradedLocked
+            guard accepting, failure == nil else {
+                droppedSampleCount += samples.count
+                let became = !wasDegraded
+                if became { report = failure ?? WriterError.closed.localizedDescription }
+                return EnqueueResult(
+                    acceptedSampleCount: acceptedSampleCount,
+                    droppedSampleCount: droppedSampleCount,
+                    timelineSampleCount: timelineInputEndSample,
+                    becameDegraded: became
+                )
+            }
+
+            let hardLimit = min(
+                max(0, maximumTotalSamples),
+                Self.maximumPCM16SampleCount
+            )
+            let presentationStart = timelineStartPositionLocked(
+                presentationTimeSeconds: presentationTimeSeconds,
+                hardLimit: hardLimit,
+                report: &report
+            )
+            if presentationStart > timelineInputEndSample {
+                timelineInputEndSample = presentationStart
+            }
+
+            var offset = 0
+            while offset < samples.count {
+                let remainingCapacity = max(0, hardLimit - timelineInputEndSample)
+                guard remainingCapacity > 0 else {
+                    droppedSampleCount += samples.count - offset
+                    break
+                }
+
+                let count = min(
+                    Self.maximumInputChunkSamples,
+                    samples.count - offset,
+                    remainingCapacity
+                )
+                let startPosition = timelineInputEndSample
+                if queuedBufferCount < ring.count {
+                    let slot = ring[tail]
+                    for index in 0..<count {
+                        slot.samples[index] = samples[offset + index]
+                    }
+                    slot.count = count
+                    slot.startSamplePosition = startPosition
+                    tail = (tail + 1) % ring.count
+                    queuedBufferCount += 1
+                    queuedSampleCount += count
+                    peakQueuedBufferCount = max(peakQueuedBufferCount, queuedBufferCount)
+                    peakQueuedSampleCount = max(peakQueuedSampleCount, queuedSampleCount)
+                    acceptedSampleCount += count
+                } else {
+                    droppedSampleCount += count
+                }
+                timelineInputEndSample += count
+                offset += count
+            }
+
+            if !drainScheduled, queuedBufferCount > 0 {
+                drainScheduled = true
+                shouldSchedule = true
+            }
+            let isDegraded = isDegradedLocked
+            let became = !wasDegraded && isDegraded
+            if became, report == nil {
+                report = "Call capture queue saturated; audio frames were dropped."
+            }
+            return EnqueueResult(
+                acceptedSampleCount: acceptedSampleCount,
+                droppedSampleCount: droppedSampleCount,
+                timelineSampleCount: timelineInputEndSample,
+                becameDegraded: became
+            )
+        }
+
+        if shouldSchedule {
+            worker.async { [weak self] in self?.drain() }
+        }
+        if let report {
+            // Never run logging, filesystem checks, or UI-facing callbacks on
+            // the audio callback thread.
+            worker.async { [weak self] in self?.reportDegradationOnce(report) }
+        }
+        return result
+    }
+
+    /// Stop accepting frames, drain the worker, finalize the header, and close.
+    func finish() -> Snapshot {
+        lock.withLock { accepting = false }
+        worker.sync {
+            drain()
+            do {
+                try writePendingTimelineTail()
+                try handle?.synchronize()
+                try handle?.close()
+            } catch {
+                markFailure(error.localizedDescription)
+            }
+            handle = nil
+        }
+        return snapshot()
+    }
+
+    func snapshot() -> Snapshot {
+        lock.withLock {
+            Snapshot(
+                sampleCount: writtenSampleCount,
+                sampleRate: sampleRate,
+                sumSquares: sumSquares,
+                peakAmplitude: peakAmplitude,
+                droppedSampleCount: droppedSampleCount,
+                zeroFilledSampleCount: zeroFilledSampleCount,
+                timelineOriginOffsetSeconds: timelineOriginOffsetSeconds,
+                maxClockDriftSeconds: maxClockDriftSeconds,
+                discontinuityCount: discontinuityCount,
+                ringSampleCapacity: ring.count * Self.maximumInputChunkSamples,
+                peakQueuedBufferCount: peakQueuedBufferCount,
+                peakQueuedSampleCount: peakQueuedSampleCount,
+                failure: failure,
+                timelineIssue: timelineIssue
+            )
+        }
+    }
+
+    private func drain() {
+        while let slot = peekNextSlot() {
+            do {
+                if artificialWriteDelay > 0 {
+                    Thread.sleep(forTimeInterval: artificialWriteDelay)
+                }
+                try write(slot)
+                consume(slot)
+            } catch {
+                // The failed head remains in the ring and is counted together
+                // with every later queued slot by discardQueuedAfterFailure().
+                markFailure(error.localizedDescription)
+                discardQueuedAfterFailure()
+                return
+            }
+        }
+    }
+
+    private func peekNextSlot() -> RingSlot? {
+        lock.withLock {
+            guard queuedBufferCount > 0 else {
+                drainScheduled = false
+                return nil
+            }
+            return ring[head]
+        }
+    }
+
+    private func consume(_ slot: RingSlot) {
+        lock.withLock {
+            guard queuedBufferCount > 0, ring[head] === slot else { return }
+            queuedSampleCount -= slot.count
+            slot.count = 0
+            head = (head + 1) % ring.count
+            queuedBufferCount -= 1
+        }
+    }
+
+    private func write(_ slot: RingSlot) throws {
+        guard let handle else { throw WriterError.closed }
+        writtenBatchCount += 1
+        if writtenBatchCount == 1 || writtenBatchCount.isMultiple(of: 64),
+           let minimumFreeBytes,
+           let free = Self.freeBytes(at: url),
+           free < minimumFreeBytes {
+            throw WriterError.createFailed(
+                "Low disk space: \(free / (1024 * 1024)) MB free"
+            )
+        }
+
+        let currentPosition = lock.withLock { writtenSampleCount }
+        if slot.startSamplePosition > currentPosition {
+            try writeSilence(sampleCount: slot.startSamplePosition - currentPosition)
+        }
+
+        let updatedPosition = lock.withLock { writtenSampleCount }
+        let overlap = max(0, updatedPosition - slot.startSamplePosition)
+        guard overlap < slot.count else {
+            lock.withLock {
+                droppedSampleCount += slot.count
+                setTimelineIssueLocked("Overlapping capture timestamps discarded a complete audio block.")
+            }
+            return
+        }
+
+        var pcm = [Int16]()
+        pcm.reserveCapacity(slot.count - overlap)
+        var batchSquares = 0.0
+        var batchPeak = 0.0
+        var invalidSampleCount = 0
+        for index in overlap..<slot.count {
+            let rawValue = slot.samples[index]
+            let value = rawValue.isFinite ? Double(rawValue) : 0
+            if !rawValue.isFinite { invalidSampleCount += 1 }
+            batchSquares += value * value
+            batchPeak = max(batchPeak, abs(value))
+            let clamped = max(-1.0, min(1.0, value))
+            let scaled = clamped < 0 ? clamped * 32_768.0 : clamped * 32_767.0
+            pcm.append(Int16(scaled.rounded()).littleEndian)
+        }
+
+        let previousCount = lock.withLock { writtenSampleCount }
+        let newCount = previousCount + pcm.count
+        let dataBytes64 = UInt64(newCount) * UInt64(MemoryLayout<Int16>.size)
+        guard dataBytes64 <= UInt64(UInt32.max - 36) else {
+            throw WriterError.wavSizeLimit
+        }
+
+        try handle.seekToEnd()
+        try pcm.withUnsafeBytes { raw in
+            try handle.write(contentsOf: raw)
+        }
+        try Self.updateWAVHeader(
+            handle: handle,
+            dataByteCount: UInt32(dataBytes64)
+        )
+
+        lock.withLock {
+            writtenSampleCount = newCount
+            sumSquares += batchSquares
+            peakAmplitude = max(peakAmplitude, batchPeak)
+            if overlap > 0 {
+                droppedSampleCount += overlap
+                setTimelineIssueLocked("Overlapping capture timestamps required audio trimming.")
+            }
+            if invalidSampleCount > 0 {
+                droppedSampleCount += invalidSampleCount
+                zeroFilledSampleCount += invalidSampleCount
+                setTimelineIssueLocked("Non-finite capture samples were replaced with silence.")
+            }
+        }
+        if invalidSampleCount > 0 {
+            reportDegradationOnce("Non-finite capture samples were replaced with silence.")
+        }
+    }
+
+    private func writePendingTimelineTail() throws {
+        let (target, canWrite) = lock.withLock {
+            (timelineInputEndSample, failure == nil)
+        }
+        guard canWrite else { return }
+        let current = lock.withLock { writtenSampleCount }
+        if target > current {
+            try writeSilence(sampleCount: target - current)
+        }
+    }
+
+    private func writeSilence(sampleCount: Int) throws {
+        guard sampleCount > 0, let handle else { return }
+        let previousCount = lock.withLock { writtenSampleCount }
+        let newCount = previousCount + sampleCount
+        let dataBytes64 = UInt64(newCount) * UInt64(MemoryLayout<Int16>.size)
+        guard dataBytes64 <= UInt64(UInt32.max - 36) else {
+            throw WriterError.wavSizeLimit
+        }
+        var remaining = sampleCount
+        let zeroChunk = [UInt8](
+            repeating: 0,
+            count: Self.maximumInputChunkSamples * MemoryLayout<Int16>.size
+        )
+        try handle.seekToEnd()
+        while remaining > 0 {
+            let count = min(remaining, Self.maximumInputChunkSamples)
+            try zeroChunk.withUnsafeBytes { raw in
+                let bytes = UnsafeRawBufferPointer(
+                    start: raw.baseAddress,
+                    count: count * MemoryLayout<Int16>.size
+                )
+                try handle.write(contentsOf: bytes)
+            }
+            remaining -= count
+        }
+        try Self.updateWAVHeader(
+            handle: handle,
+            dataByteCount: UInt32(dataBytes64)
+        )
+        lock.withLock {
+            writtenSampleCount = newCount
+            zeroFilledSampleCount += sampleCount
+        }
+    }
+
+    private var isDegradedLocked: Bool {
+        droppedSampleCount > 0 || failure != nil || timelineIssue != nil
+    }
+
+    /// Establish the shared origin on the first buffer and detect later clock
+    /// discontinuities. Positive timestamp gaps advance the file position; the
+    /// worker then writes silence for the missing interval. Negative overlap is
+    /// marked degraded and kept monotonic rather than moving audio backwards.
+    private func timelineStartPositionLocked(
+        presentationTimeSeconds: Double?,
+        hardLimit: Int,
+        report: inout String?
+    ) -> Int {
+        guard let presentationTimeSeconds,
+              presentationTimeSeconds.isFinite else {
+            if timelineOriginSeconds != nil, firstPresentationTimeSeconds == nil {
+                setTimelineIssueLocked("Capture timestamp unavailable; channel alignment is unverified.")
+                report = timelineIssue
+            }
+            return timelineInputEndSample
+        }
+
+        if firstPresentationTimeSeconds == nil {
+            firstPresentationTimeSeconds = presentationTimeSeconds
+            if let origin = timelineOriginSeconds {
+                let offset = presentationTimeSeconds - origin
+                guard offset.isFinite, offset >= -0.05, offset <= 60 else {
+                    setTimelineIssueLocked("Capture timestamp did not share the session host-time origin.")
+                    report = timelineIssue
+                    return timelineInputEndSample
+                }
+                timelineOriginOffsetSeconds = max(0, offset)
+                let samples = Int((timelineOriginOffsetSeconds * sampleRate).rounded())
+                firstTimelineSamplePosition = min(hardLimit, max(0, samples))
+                return max(timelineInputEndSample, firstTimelineSamplePosition)
+            }
+            firstTimelineSamplePosition = timelineInputEndSample
+            return timelineInputEndSample
+        }
+
+        guard let firstPresentationTimeSeconds else { return timelineInputEndSample }
+        let expectedTime = firstPresentationTimeSeconds
+            + Double(timelineInputEndSample - firstTimelineSamplePosition) / sampleRate
+        let drift = presentationTimeSeconds - expectedTime
+        guard drift.isFinite else {
+            maxClockDriftSeconds = max(
+                maxClockDriftSeconds,
+                Double(hardLimit) / sampleRate
+            )
+            discontinuityCount += 1
+            setTimelineIssueLocked("Capture clock discontinuity exceeded the bounded recording timeline.")
+            report = timelineIssue
+            return presentationTimeSeconds > expectedTime
+                ? hardLimit
+                : timelineInputEndSample
+        }
+        maxClockDriftSeconds = max(maxClockDriftSeconds, abs(drift))
+        guard abs(drift) > Self.timestampToleranceSeconds else {
+            return timelineInputEndSample
+        }
+
+        discontinuityCount += 1
+        setTimelineIssueLocked("Capture clock discontinuity detected; timeline alignment is degraded.")
+        report = timelineIssue
+        if drift > 0 {
+            let timestampOffset = (
+                (presentationTimeSeconds - firstPresentationTimeSeconds) * sampleRate
+            ).rounded()
+            guard timestampOffset.isFinite else { return hardLimit }
+            if timestampOffset >= Double(hardLimit) { return hardLimit }
+            if timestampOffset <= 0 { return timelineInputEndSample }
+            let timestampPosition = firstTimelineSamplePosition + Int(timestampOffset)
+            return min(hardLimit, max(timelineInputEndSample, timestampPosition))
+        }
+        return timelineInputEndSample
+    }
+
+    private func setTimelineIssueLocked(_ message: String) {
+        if timelineIssue == nil { timelineIssue = message }
+    }
+
+    private func markFailure(_ message: String, failedBatchCount: Int = 0) {
+        let shouldReport = lock.withLock { () -> Bool in
+            if failure == nil { failure = message }
+            accepting = false
+            droppedSampleCount += failedBatchCount
+            let should = !degradationReported
+            degradationReported = true
+            return should
+        }
+        if shouldReport { onDegraded?(message) }
+    }
+
+    private func discardQueuedAfterFailure() {
+        lock.withLock {
+            for slot in ring where slot.count > 0 {
+                droppedSampleCount += slot.count
+                slot.count = 0
+            }
+            queuedBufferCount = 0
+            queuedSampleCount = 0
+            head = 0
+            tail = 0
+            drainScheduled = false
+        }
+    }
+
+    private func reportDegradationOnce(_ message: String) {
+        let shouldReport = lock.withLock { () -> Bool in
+            guard !degradationReported else { return false }
+            degradationReported = true
+            return true
+        }
+        if shouldReport { onDegraded?(message) }
+    }
+
+    private static func wavHeader(sampleRate: Double, dataByteCount: UInt32) -> Data {
+        var data = Data()
+        data.append("RIFF".data(using: .ascii)!)
+        data.appendLittleEndian(UInt32(36) + dataByteCount)
+        data.append("WAVE".data(using: .ascii)!)
+        data.append("fmt ".data(using: .ascii)!)
+        data.appendLittleEndian(UInt32(16))
+        data.appendLittleEndian(UInt16(1))
+        data.appendLittleEndian(UInt16(1))
+        let rate = UInt32(sampleRate.rounded())
+        data.appendLittleEndian(rate)
+        data.appendLittleEndian(rate * UInt32(MemoryLayout<Int16>.size))
+        data.appendLittleEndian(UInt16(MemoryLayout<Int16>.size))
+        data.appendLittleEndian(UInt16(16))
+        data.append("data".data(using: .ascii)!)
+        data.appendLittleEndian(dataByteCount)
+        return data
+    }
+
+    private static func updateWAVHeader(
+        handle: FileHandle,
+        dataByteCount: UInt32
+    ) throws {
+        try handle.seek(toOffset: 4)
+        try handle.write(contentsOf: Data(littleEndian: UInt32(36) + dataByteCount))
+        try handle.seek(toOffset: 40)
+        try handle.write(contentsOf: Data(littleEndian: dataByteCount))
+        try handle.seekToEnd()
+    }
+
+    /// Takes ownership of a securely preopened, empty regular file. Callers can
+    /// create it with `openat(..., O_EXCL | O_NOFOLLOW)` and keep the writer on
+    /// that pinned inode for its entire lifetime.
+    private static func initializeOwnedDescriptor(
+        _ fd: Int32,
+        sampleRate: Double
+    ) throws {
+        var info = stat()
+        guard fstat(fd, &info) == 0,
+              info.st_mode & mode_t(S_IFMT) == mode_t(S_IFREG),
+              info.st_uid == geteuid(),
+              info.st_nlink == 1,
+              info.st_size == 0 else {
+            throw WriterError.createFailed(
+                "preopened descriptor must be an empty, owner-matched, single-link regular file"
+            )
+        }
+        guard fchmod(fd, 0o600) == 0 else {
+            throw WriterError.createFailed(
+                "could not secure preopened descriptor: \(String(cString: strerror(errno)))"
+            )
+        }
+        let header = wavHeader(sampleRate: sampleRate, dataByteCount: 0)
+        var offset = 0
+        while offset < header.count {
+            let count = header.withUnsafeBytes { bytes in
+                pwrite(
+                    fd,
+                    bytes.baseAddress!.advanced(by: offset),
+                    header.count - offset,
+                    off_t(offset)
+                )
+            }
+            guard count > 0 else {
+                if count < 0, errno == EINTR { continue }
+                throw WriterError.createFailed(
+                    "could not initialize preopened descriptor: \(String(cString: strerror(errno)))"
+                )
+            }
+            offset += count
+        }
+        guard fsync(fd) == 0 else {
+            throw WriterError.createFailed(
+                "could not sync preopened descriptor: \(String(cString: strerror(errno)))"
+            )
+        }
+    }
+
+    private static func freeBytes(at url: URL) -> UInt64? {
+        let directory = url.deletingLastPathComponent()
+        if let values = try? directory.resourceValues(
+            forKeys: [.volumeAvailableCapacityForImportantUsageKey]
+        ), let capacity = values.volumeAvailableCapacityForImportantUsage {
+            return UInt64(max(0, capacity))
+        }
+        if let attributes = try? FileManager.default.attributesOfFileSystem(
+            forPath: directory.path
+        ), let free = attributes[.systemFreeSize] as? UInt64 {
+            return free
+        }
+        return nil
+    }
+}
+
+private extension Data {
+    mutating func appendLittleEndian<T: FixedWidthInteger>(_ value: T) {
+        var little = value.littleEndian
+        Swift.withUnsafeBytes(of: &little) { append(contentsOf: $0) }
+    }
+
+    init<T: FixedWidthInteger>(littleEndian value: T) {
+        var little = value.littleEndian
+        self = Swift.withUnsafeBytes(of: &little) { Data($0) }
     }
 }
 
 // MARK: - Stream Delegate
 
+/// Reusable scratch storage for microphone downmixing. AVAudioEngine invokes a
+/// tap serially, so one preallocated buffer removes per-callback heap growth.
+private final class CallMicMixBuffer: @unchecked Sendable {
+    private var samples: [Float]
+
+    init(capacity: Int) {
+        samples = [Float](repeating: 0, count: max(1, capacity))
+    }
+
+    func withMixedSamples(
+        channelData: UnsafePointer<UnsafeMutablePointer<Float>>,
+        channelCount: Int,
+        offset: Int,
+        count: Int,
+        body: (UnsafeBufferPointer<Float>) -> Void
+    ) {
+        guard channelCount > 0, count > 0, count <= samples.count else { return }
+        for index in 0..<count { samples[index] = 0 }
+        let gain = 1 / Float(channelCount)
+        for channel in 0..<channelCount {
+            let source = channelData[channel] + offset
+            for index in 0..<count {
+                samples[index] += source[index] * gain
+            }
+        }
+        samples.withUnsafeBufferPointer { buffer in
+            body(UnsafeBufferPointer(rebasing: buffer[..<count]))
+        }
+    }
+}
+
 private final class CallStreamDelegate: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sendable {
-    let onSamples: ([Float], Double) -> Void
+    /// The sample pointer is borrowed only for the synchronous callback. The
+    /// writer copies it directly into a preallocated ring slot before returning.
+    let onSamples: (UnsafeBufferPointer<Float>, Double, Double?) -> Void
     let onError: ((String) -> Void)?
     var onStreamDied: (() -> Void)?
+    private let formatErrorLock = NSLock()
+    private var formatErrorReported = false
 
-    init(onSamples: @escaping ([Float], Double) -> Void, onError: ((String) -> Void)? = nil) {
+    init(
+        onSamples: @escaping (UnsafeBufferPointer<Float>, Double, Double?) -> Void,
+        onError: ((String) -> Void)? = nil
+    ) {
         self.onSamples = onSamples
         self.onError = onError
     }
@@ -663,50 +1969,72 @@ private final class CallStreamDelegate: NSObject, SCStreamOutput, SCStreamDelega
 
     func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of type: SCStreamOutputType) {
         guard type == .audio else { return }
-        guard let formatDesc = sampleBuffer.formatDescription else { return }
-
-        let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(formatDesc)?.pointee
-
-        // Validate audio format: must be Float32, mono, packed
-        if let desc = asbd {
-            guard desc.mChannelsPerFrame == 1,
-                  desc.mBitsPerChannel == 32,
-                  desc.mFormatFlags & kAudioFormatFlagIsFloat != 0 else {
-                return
-            }
+        guard let formatDesc = sampleBuffer.formatDescription,
+              let desc = CMAudioFormatDescriptionGetStreamBasicDescription(formatDesc)?.pointee,
+              desc.mFormatID == kAudioFormatLinearPCM,
+              desc.mChannelsPerFrame == 1,
+              desc.mBitsPerChannel == 32,
+              desc.mBytesPerFrame == MemoryLayout<Float>.size,
+              desc.mFramesPerPacket == 1,
+              desc.mFormatFlags & kAudioFormatFlagIsFloat != 0,
+              desc.mFormatFlags & kAudioFormatFlagIsPacked != 0,
+              CallCaptureWAVWriter.isSupportedSampleRate(desc.mSampleRate),
+              abs(desc.mSampleRate - 48_000) < 0.5 else {
+            reportFormatErrorOnce("Screen capture returned an unsupported audio format.")
+            return
         }
-
-        // Guard against 0 or invalid sample rate
-        let sampleRate = (asbd?.mSampleRate ?? 0) > 0 ? asbd!.mSampleRate : 48000
+        let sampleRate = desc.mSampleRate
 
         guard let blockBuffer = sampleBuffer.dataBuffer else { return }
         var length = 0
         var dataPointer: UnsafeMutablePointer<Int8>?
-        CMBlockBufferGetDataPointer(blockBuffer, atOffset: 0, lengthAtOffsetOut: nil, totalLengthOut: &length, dataPointerOut: &dataPointer)
+        let status = CMBlockBufferGetDataPointer(
+            blockBuffer,
+            atOffset: 0,
+            lengthAtOffsetOut: nil,
+            totalLengthOut: &length,
+            dataPointerOut: &dataPointer
+        )
 
-        guard let data = dataPointer, length > 0 else { return }
-
-        let floatCount = length / MemoryLayout<Float>.size
-        let floats = data.withMemoryRebound(to: Float.self, capacity: floatCount) { ptr in
-            Array(UnsafeBufferPointer(start: ptr, count: floatCount))
+        guard status == 0,
+              let data = dataPointer,
+              length > 0,
+              length.isMultiple(of: MemoryLayout<Float>.size) else {
+            reportFormatErrorOnce("Screen capture returned a non-contiguous audio buffer.")
+            return
         }
 
-        onSamples(floats, sampleRate)
+        let floatCount = length / MemoryLayout<Float>.size
+        let ptsSeconds = CMTimeGetSeconds(
+            CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+        )
+        let presentationTimeSeconds = ptsSeconds.isFinite ? ptsSeconds : nil
+        data.withMemoryRebound(to: Float.self, capacity: floatCount) { ptr in
+            var offset = 0
+            while offset < floatCount {
+                let count = min(
+                    CallCaptureWAVWriter.maximumInputChunkSamples,
+                    floatCount - offset
+                )
+                onSamples(
+                    UnsafeBufferPointer(start: ptr + offset, count: count),
+                    sampleRate,
+                    presentationTimeSeconds.map {
+                        $0 + Double(offset) / sampleRate
+                    }
+                )
+                offset += count
+            }
+        }
     }
-}
 
-// MARK: - Spill folder naming
-
-/// Folder name for a call's on-disk artifacts. Matches the format
-/// `TranscriptStorage.saveCall` uses (`yyyy-MM-dd_HH-mm-ss-SSS`) so the spilled
-/// `system.wav` lands in the same directory the final transcript is written to,
-/// given the same `startTime`.
-enum CallSpillNaming {
-    static func folderName(from date: Date) -> String {
-        let f = DateFormatter()
-        f.locale = Locale(identifier: "en_US_POSIX")
-        f.dateFormat = "yyyy-MM-dd_HH-mm-ss-SSS"
-        return f.string(from: date)
+    private func reportFormatErrorOnce(_ message: String) {
+        let shouldReport = formatErrorLock.withLock {
+            guard !formatErrorReported else { return false }
+            formatErrorReported = true
+            return true
+        }
+        if shouldReport { onError?(message) }
     }
 }
 
@@ -716,12 +2044,15 @@ enum CallRecorderError: Error, LocalizedError {
     case noDisplay
     case noAudio
     case alreadyRunning
+    case captureStorageUnavailable(String)
 
     var errorDescription: String? {
         switch self {
         case .noDisplay: return "No display found for screen capture"
         case .noAudio: return "No audio captured"
         case .alreadyRunning: return "Call recording is already running"
+        case let .captureStorageUnavailable(detail):
+            return "Call capture storage is unavailable. \(detail)"
         }
     }
 }

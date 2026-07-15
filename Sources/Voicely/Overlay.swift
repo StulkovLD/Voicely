@@ -10,8 +10,162 @@ enum OverlayMode: Sendable, Equatable {
     case fileQueuePaused(title: String)
 }
 
+struct OverlayAccessibilityAnnouncement: Sendable, Equatable {
+    let label: String
+    let message: String
+    let priority: Int
+}
+
+struct OverlayPlacementRequest {
+    let screens: [CGRect]
+    let focusedElementRect: CGRect?
+    let focusedWindowRect: CGRect?
+    let fallbackScreen: CGRect?
+    let panelSize: CGSize
+    let screenMargin: CGFloat
+    let bottomOffset: CGFloat
+
+    init(
+        screens: [CGRect],
+        focusedElementRect: CGRect?,
+        focusedWindowRect: CGRect?,
+        fallbackScreen: CGRect?,
+        panelSize: CGSize,
+        screenMargin: CGFloat = 24,
+        bottomOffset: CGFloat = 140
+    ) {
+        self.screens = screens
+        self.focusedElementRect = focusedElementRect
+        self.focusedWindowRect = focusedWindowRect
+        self.fallbackScreen = fallbackScreen
+        self.panelSize = panelSize
+        self.screenMargin = screenMargin
+        self.bottomOffset = bottomOffset
+    }
+}
+
+struct OverlayPlacement: Equatable {
+    let screenFrame: CGRect
+    let frame: CGRect
+    let targetRect: CGRect?
+}
+
+enum OverlayPlacementResolver {
+    static func resolve(_ request: OverlayPlacementRequest) -> OverlayPlacement? {
+        guard !request.screens.isEmpty else { return nil }
+
+        let resolvedTarget = [request.focusedElementRect, request.focusedWindowRect]
+            .compactMap { $0 }
+            .compactMap(normalizedRect)
+            .lazy
+            .compactMap { targetRect -> (screenFrame: CGRect, targetRect: CGRect)? in
+                guard let screenFrame = targetScreen(for: targetRect, screens: request.screens) else {
+                    return nil
+                }
+                return (screenFrame: screenFrame, targetRect: targetRect)
+            }
+            .first
+
+        let targetRect = resolvedTarget?.targetRect
+        let screenFrame = resolvedTarget?.screenFrame
+            ?? fallbackScreen(in: request.screens, preferred: request.fallbackScreen)
+
+        guard let screenFrame else { return nil }
+
+        let idealMidX = targetRect?.midX ?? screenFrame.midX
+        let originX = clampedOrigin(
+            ideal: idealMidX - request.panelSize.width / 2,
+            minimum: screenFrame.minX + request.screenMargin,
+            maximum: screenFrame.maxX - request.screenMargin - request.panelSize.width,
+            fallback: screenFrame.minX + max((screenFrame.width - request.panelSize.width) / 2, 0)
+        )
+        let originY = clampedOrigin(
+            ideal: screenFrame.minY + request.bottomOffset,
+            minimum: screenFrame.minY + request.screenMargin,
+            maximum: screenFrame.maxY - request.screenMargin - request.panelSize.height,
+            fallback: screenFrame.minY + max((screenFrame.height - request.panelSize.height) / 2, 0)
+        )
+
+        return OverlayPlacement(
+            screenFrame: screenFrame,
+            frame: CGRect(origin: CGPoint(x: originX, y: originY), size: request.panelSize),
+            targetRect: targetRect
+        )
+    }
+
+    private static func normalizedRect(_ rect: CGRect) -> CGRect? {
+        guard rect.width > 0,
+              rect.height > 0,
+              rect.origin.x.isFinite,
+              rect.origin.y.isFinite,
+              rect.width.isFinite,
+              rect.height.isFinite else { return nil }
+        return rect
+    }
+
+    private static func targetScreen(for targetRect: CGRect, screens: [CGRect]) -> CGRect? {
+        let center = CGPoint(x: targetRect.midX, y: targetRect.midY)
+        if let containingScreen = screens.first(where: { $0.contains(center) }) {
+            return containingScreen
+        }
+
+        let intersections = screens.map { screen in
+            (screen: screen, area: screen.intersection(targetRect).area)
+        }
+        if let best = intersections.max(by: { lhs, rhs in
+            if lhs.area == rhs.area {
+                return stableScreenOrder(lhs.screen, rhs.screen)
+            }
+            return lhs.area < rhs.area
+        }), best.area > 0 {
+            return best.screen
+        }
+
+        return nil
+    }
+
+    private static func fallbackScreen(in screens: [CGRect], preferred fallbackScreen: CGRect?) -> CGRect? {
+        if let fallbackScreen,
+           let matchingScreen = screens.first(where: { $0 == fallbackScreen }) {
+            return matchingScreen
+        }
+
+        return screens.sorted(by: stableScreenOrder).first
+    }
+
+    private static func stableScreenOrder(_ lhs: CGRect, _ rhs: CGRect) -> Bool {
+        if lhs.minX != rhs.minX { return lhs.minX < rhs.minX }
+        if lhs.minY != rhs.minY { return lhs.minY < rhs.minY }
+        if lhs.width != rhs.width { return lhs.width < rhs.width }
+        return lhs.height < rhs.height
+    }
+
+    private static func clampedOrigin(
+        ideal: CGFloat,
+        minimum: CGFloat,
+        maximum: CGFloat,
+        fallback: CGFloat
+    ) -> CGFloat {
+        guard minimum <= maximum else { return fallback }
+        return min(max(ideal, minimum), maximum)
+    }
+}
+
+private extension CGRect {
+    var area: CGFloat {
+        guard !isNull, !isEmpty else { return 0 }
+        return width * height
+    }
+}
+
 @MainActor
 final class Overlay {
+    nonisolated static let panelCollectionBehavior: NSWindow.CollectionBehavior = [
+        .canJoinAllSpaces,
+        .fullScreenAuxiliary,
+        .moveToActiveSpace,
+    ]
+
     private var panel: NSPanel?
     private var bars: [CALayer] = []
     private var timer: DispatchSourceTimer?
@@ -50,13 +204,26 @@ final class Overlay {
     private let barMinHeight: CGFloat = 6
     private let barMaxHeight: CGFloat = 40
 
+    nonisolated static func accessibilityAnnouncement(
+        message: String,
+        isError: Bool
+    ) -> OverlayAccessibilityAnnouncement {
+        OverlayAccessibilityAnnouncement(
+            label: isError ? "Voicely error" : "Voicely status",
+            message: message,
+            priority: isError
+                ? NSAccessibilityPriorityLevel.high.rawValue
+                : NSAccessibilityPriorityLevel.medium.rawValue
+        )
+    }
+
     init() {
         screenObserver = NotificationCenter.default.addObserver(
             forName: NSApplication.didChangeScreenParametersNotification,
             object: nil, queue: .main
         ) { [weak self] _ in
             MainActor.assumeIsolated {
-                self?.repositionToCurrentScreen()
+                self?.repositionToTargetSurface()
             }
         }
     }
@@ -65,15 +232,10 @@ final class Overlay {
         if let obs = screenObserver { NotificationCenter.default.removeObserver(obs) }
     }
 
-    /// Reposition overlay to the screen containing the mouse cursor.
-    private func repositionToCurrentScreen() {
+    /// Reposition overlay to the currently focused user surface.
+    private func repositionToTargetSurface() {
         guard let p = panel, p.isVisible else { return }
-        let screen = NSScreen.screens.first(where: { NSMouseInRect(NSEvent.mouseLocation, $0.frame, false) }) ?? NSScreen.main
-        if let screen = screen {
-            let x = screen.frame.origin.x + (screen.frame.width - pillWidth) / 2
-            let y = screen.frame.origin.y + 140
-            p.setFrame(NSRect(x: x, y: y, width: pillWidth, height: pillHeight), display: false)
-        }
+        applyPlacement(to: p)
     }
 
     func show(mode: OverlayMode) {
@@ -84,13 +246,7 @@ final class Overlay {
         createPanelIfNeeded()
         guard let p = panel else { return }
 
-        // Reposition to current screen on every show()
-        let screen = NSScreen.screens.first(where: { NSMouseInRect(NSEvent.mouseLocation, $0.frame, false) }) ?? NSScreen.main
-        if let screen = screen {
-            let x = screen.frame.origin.x + (screen.frame.width - pillWidth) / 2
-            let y = screen.frame.origin.y + 140
-            p.setFrame(NSRect(x: x, y: y, width: pillWidth, height: pillHeight), display: false)
-        }
+        applyPlacement(to: p)
 
         // Clean up layers from other modes
         removeErrorLayer()
@@ -149,9 +305,11 @@ final class Overlay {
         text.contentsScale = p.screen?.backingScaleFactor
             ?? NSScreen.main?.backingScaleFactor ?? 2
         text.truncationMode = .middle
-        text.string = formatFileQueueMessage(title: title, progress: progress, paused: paused)
+        let message = formatFileQueueMessage(title: title, progress: progress, paused: paused)
+        text.string = message
         cv.addSublayer(text)
         errorTextLayer = text
+        publishAccessibilityMessage(message, isError: false, announce: true)
     }
 
     private func formatFileQueueMessage(title: String, progress: Double, paused: Bool) -> String {
@@ -169,8 +327,10 @@ final class Overlay {
         guard let layer = errorTextLayer else { return }
         CATransaction.begin()
         CATransaction.setDisableActions(true)
-        layer.string = formatFileQueueMessage(title: title, progress: progress, paused: false)
+        let message = formatFileQueueMessage(title: title, progress: progress, paused: false)
+        layer.string = message
         CATransaction.commit()
+        publishAccessibilityMessage(message, isError: false, announce: false)
     }
 
     /// Update download progress 0.0-1.0
@@ -183,6 +343,7 @@ final class Overlay {
         progressLayer.frame.size.width = trackWidth * CGFloat(clamped)
         textLayer.string = status
         CATransaction.commit()
+        publishAccessibilityMessage(status, isError: false, announce: false)
     }
 
     private func setupProgressBar() {
@@ -204,6 +365,7 @@ final class Overlay {
         text.string = "Downloading..."
         cv.addSublayer(text)
         progressTextLayer = text
+        publishAccessibilityMessage("Downloading", isError: false, announce: true)
 
         // Background track
         let track = CALayer()
@@ -313,15 +475,27 @@ final class Overlay {
 
     /// Show a brief info message (white), auto-hides after 5 seconds.
     func showInfo(_ message: String) {
-        showMessage(message, color: NSColor(white: 0.7, alpha: 1))
+        showMessage(
+            message,
+            color: NSColor(white: 0.7, alpha: 1),
+            isError: false
+        )
     }
 
     /// Show a brief error message (red tint), auto-hides after 5 seconds.
     func showError(_ message: String) {
-        showMessage(message, color: NSColor(red: 1.0, green: 0.4, blue: 0.4, alpha: 1))
+        showMessage(
+            message,
+            color: NSColor(red: 1.0, green: 0.4, blue: 0.4, alpha: 1),
+            isError: true
+        )
     }
 
-    private func showMessage(_ message: String, color: NSColor) {
+    private func showMessage(
+        _ message: String,
+        color: NSColor,
+        isError: Bool
+    ) {
         createPanelIfNeeded()
         guard let p = panel, let cv = p.contentView?.subviews.first?.layer else { return }
 
@@ -342,7 +516,9 @@ final class Overlay {
         text.string = message
         cv.addSublayer(text)
         errorTextLayer = text
+        publishAccessibilityMessage(message, isError: isError, announce: true)
 
+        applyPlacement(to: p)
         p.alphaValue = 0
         p.orderFrontRegardless()
         NSAnimationContext.runAnimationGroup { ctx in
@@ -364,6 +540,40 @@ final class Overlay {
     private func removeErrorLayer() {
         errorTextLayer?.removeFromSuperlayer()
         errorTextLayer = nil
+        clearAccessibilityMessage()
+    }
+
+    private func publishAccessibilityMessage(
+        _ message: String,
+        isError: Bool,
+        announce: Bool
+    ) {
+        let presentation = Self.accessibilityAnnouncement(
+            message: message,
+            isError: isError
+        )
+        if let contentView = panel?.contentView {
+            contentView.setAccessibilityElement(true)
+            contentView.setAccessibilityRole(.staticText)
+            contentView.setAccessibilityLabel(presentation.label)
+            contentView.setAccessibilityValue(presentation.message)
+        }
+        guard announce, let application = NSApp else { return }
+        NSAccessibility.post(
+            element: application,
+            notification: .announcementRequested,
+            userInfo: [
+                .announcement: presentation.message,
+                .priority: presentation.priority,
+            ]
+        )
+    }
+
+    private func clearAccessibilityMessage() {
+        guard let contentView = panel?.contentView else { return }
+        contentView.setAccessibilityValue(nil)
+        contentView.setAccessibilityLabel(nil)
+        contentView.setAccessibilityElement(false)
     }
 
     /// Safe to call from any thread (audio callback)
@@ -374,12 +584,8 @@ final class Overlay {
     private func createPanelIfNeeded() {
         guard panel == nil else { return }
 
-        let screen = NSScreen.screens.first(where: { NSMouseInRect(NSEvent.mouseLocation, $0.frame, false) }) ?? NSScreen.main
-        guard let screen = screen else { return }
-        let x = screen.frame.origin.x + (screen.frame.width - pillWidth) / 2
-        let y = screen.frame.origin.y + 140
-
-        let frame = NSRect(x: x, y: y, width: pillWidth, height: pillHeight)
+        let frame = resolvePlacement()?.frame
+            ?? NSRect(x: 0, y: 0, width: pillWidth, height: pillHeight)
 
         let p = NSPanel(
             contentRect: frame,
@@ -392,7 +598,7 @@ final class Overlay {
         p.backgroundColor = .clear
         p.hasShadow = true
         p.ignoresMouseEvents = true
-        p.collectionBehavior = [.canJoinAllSpaces, .stationary]
+        p.collectionBehavior = Self.panelCollectionBehavior
 
         let cv = p.contentView!
         cv.wantsLayer = true
@@ -435,6 +641,89 @@ final class Overlay {
 
         panel = p
         smoothLevels = Array(repeating: 0, count: barCount)
+    }
+
+    private func applyPlacement(to panel: NSPanel) {
+        guard let placement = resolvePlacement() else { return }
+        panel.setFrame(placement.frame, display: false)
+        refreshContentsScale()
+    }
+
+    private func resolvePlacement() -> OverlayPlacement? {
+        OverlayPlacementResolver.resolve(
+            OverlayPlacementRequest(
+                screens: NSScreen.screens.map(\.frame),
+                focusedElementRect: focusedElementRect(),
+                focusedWindowRect: focusedWindowRect(),
+                fallbackScreen: NSScreen.main?.frame,
+                panelSize: CGSize(width: pillWidth, height: pillHeight)
+            )
+        )
+    }
+
+    private func refreshContentsScale() {
+        let scale = panel?.screen?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 2
+        timerTextLayer?.contentsScale = scale
+        segmentProgressLayer?.contentsScale = scale
+        progressTextLayer?.contentsScale = scale
+        errorTextLayer?.contentsScale = scale
+    }
+
+    private func focusedElementRect() -> CGRect? {
+        let systemWide = AXUIElementCreateSystemWide()
+        guard let focusedElement = axElement(from: systemWide, attribute: kAXFocusedUIElementAttribute as CFString) else {
+            return nil
+        }
+        return axFrame(of: focusedElement)
+    }
+
+    private func focusedWindowRect() -> CGRect? {
+        let systemWide = AXUIElementCreateSystemWide()
+        guard let focusedApplication = axElement(from: systemWide, attribute: kAXFocusedApplicationAttribute as CFString),
+              let focusedWindow = axElement(from: focusedApplication, attribute: kAXFocusedWindowAttribute as CFString) else {
+            return nil
+        }
+        return axFrame(of: focusedWindow)
+    }
+
+    private func axElement(from element: AXUIElement, attribute: CFString) -> AXUIElement? {
+        var rawValue: AnyObject?
+        guard AXUIElementCopyAttributeValue(element, attribute, &rawValue) == .success,
+              let rawValue,
+              CFGetTypeID(rawValue) == AXUIElementGetTypeID() else { return nil }
+        return unsafeDowncast(rawValue, to: AXUIElement.self)
+    }
+
+    private func axFrame(of element: AXUIElement) -> CGRect? {
+        guard let origin = axPoint(from: element, attribute: kAXPositionAttribute as CFString),
+              let size = axSize(from: element, attribute: kAXSizeAttribute as CFString),
+              size.width > 0,
+              size.height > 0 else { return nil }
+        return CGRect(origin: origin, size: size)
+    }
+
+    private func axPoint(from element: AXUIElement, attribute: CFString) -> CGPoint? {
+        var rawValue: AnyObject?
+        guard AXUIElementCopyAttributeValue(element, attribute, &rawValue) == .success,
+              let rawValue,
+              CFGetTypeID(rawValue) == AXValueGetTypeID() else { return nil }
+        let axValue = unsafeDowncast(rawValue, to: AXValue.self)
+        guard AXValueGetType(axValue) == .cgPoint else { return nil }
+        var point = CGPoint.zero
+        guard AXValueGetValue(axValue, .cgPoint, &point) else { return nil }
+        return point
+    }
+
+    private func axSize(from element: AXUIElement, attribute: CFString) -> CGSize? {
+        var rawValue: AnyObject?
+        guard AXUIElementCopyAttributeValue(element, attribute, &rawValue) == .success,
+              let rawValue,
+              CFGetTypeID(rawValue) == AXValueGetTypeID() else { return nil }
+        let axValue = unsafeDowncast(rawValue, to: AXValue.self)
+        guard AXValueGetType(axValue) == .cgSize else { return nil }
+        var size = CGSize.zero
+        guard AXValueGetValue(axValue, .cgSize, &size) else { return nil }
+        return size
     }
 
     private func startAnimation() {

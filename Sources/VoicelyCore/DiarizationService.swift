@@ -66,13 +66,44 @@ public enum DiarizationError: Error, LocalizedError {
     }
 }
 
+/// Narrow dependency used by file transcription. Production uses
+/// `DiarizationService`; tests can verify URL routing without loading models.
+public protocol FileDiarizing: Sendable {
+    func diarize(fileURL: URL) async throws -> [SpeakerTurn]
+}
+
+/// FluidAudio does not annotate `OfflineDiarizerManager` as Sendable even
+/// though its URL pipeline explicitly runs internal detached tasks over
+/// read-only models. The box stays private to `DiarizationService`, whose actor
+/// serializes prepare/process calls.
+private final class OfflineDiarizerBox: @unchecked Sendable {
+    private let manager = OfflineDiarizerManager()
+
+    func prepareModels() async throws {
+        try await manager.prepareModels()
+    }
+
+    func process(_ url: URL) async throws -> DiarizationResult {
+        try await manager.process(url)
+    }
+}
+
 /// Actor-isolated wrapper so the non-`Sendable` `DiarizerManager` and its
 /// downloaded models never cross an isolation boundary. All FluidAudio calls
 /// run inside the actor; the inference itself is offloaded to the ANE by
 /// FluidAudio, so holding the actor for the duration of a pass is acceptable.
-public actor DiarizationService {
+public actor DiarizationService: FileDiarizing {
     /// FluidAudio's diarizer. Lazily created on first `diarize(...)`.
     private var manager: DiarizerManager?
+    /// Separate offline/VBx pipeline used only by disk-backed file input. It has
+    /// different models and clustering semantics, so the existing samples and
+    /// call-WAV overloads deliberately remain on `DiarizerManager`.
+    private var offlineManager: OfflineDiarizerBox?
+
+    /// Short gap tolerated when ASR and diarization land on slightly different
+    /// boundaries. Segments still prefer real overlap first; this only rescues
+    /// near-miss assignments that would otherwise render as `Speaker ?`.
+    nonisolated static let nearestTurnTolerance: Double = 0.3
 
     /// FluidAudio expects 16 kHz mono Float32. Callers that already resampled
     /// (the call path resamples per-channel) should pass `sampleRate: 16000`.
@@ -94,10 +125,41 @@ public actor DiarizationService {
         } catch {
             throw DiarizationError.modelsUnavailable(error.localizedDescription)
         }
-        let m = DiarizerManager()
+        let m = DiarizerManager(config: Self.configFromEnvironment())
         m.initialize(models: models)
         manager = m
         return m
+    }
+
+    private func ensureOfflineManager() async throws -> OfflineDiarizerBox {
+        if let offlineManager { return offlineManager }
+        let manager = OfflineDiarizerBox()
+        do {
+            try await manager.prepareModels()
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            throw DiarizationError.modelsUnavailable(error.localizedDescription)
+        }
+        offlineManager = manager
+        return manager
+    }
+
+    /// Diarizer runtime config. Voicely defaults to a slightly lower clustering
+    /// threshold than FluidAudio's 0.7 because short remote speaker changes in
+    /// calls were being merged into one speaker. FluidAudio documents: lower
+    /// threshold = more speakers. The env override is kept for real-world tuning
+    /// without rebuilding the app.
+    nonisolated static func configFromEnvironment(
+        _ env: [String: String] = ProcessInfo.processInfo.environment
+    ) -> DiarizerConfig {
+        var config = DiarizerConfig.default
+        config.clusteringThreshold = 0.55
+        if let raw = env["VOICELY_DIARIZATION_CLUSTERING_THRESHOLD"],
+           let threshold = Float(raw) {
+            config.clusteringThreshold = min(0.9, max(0.5, threshold))
+        }
+        return config
     }
 
     // MARK: - Diarize (samples)
@@ -127,6 +189,31 @@ public actor DiarizationService {
         return Self.makeStableTurns(from: result.segments)
     }
 
+    // MARK: - Diarize (disk-backed source URL)
+
+    /// Diarize an arbitrary AVFoundation-supported audio/video source without
+    /// materializing its PCM in Voicely. FluidAudio's offline manager converts
+    /// the source and serves inference windows through a memory-mapped backing.
+    ///
+    /// This overload is intentionally separate from `diarize(samples:)` and
+    /// `diarize(wavURL:)`: switching those call paths to the offline/VBx models
+    /// would silently change existing call-speaker behavior.
+    public func diarize(fileURL: URL) async throws -> [SpeakerTurn] {
+        try Task.checkCancellation()
+        let manager = try await ensureOfflineManager()
+
+        let result: DiarizationResult
+        do {
+            result = try await manager.process(fileURL)
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            throw DiarizationError.diarizationFailed(error.localizedDescription)
+        }
+        try Task.checkCancellation()
+        return Self.makeStableTurns(from: result.segments)
+    }
+
     // MARK: - Diarize (WAV file URL)
 
     /// Convenience overload for the call path: read a WAV file (e.g. the call's
@@ -144,8 +231,9 @@ public actor DiarizationService {
 
     /// Stamp each `DialogueSegment` with the `speakerIndex` of the `SpeakerTurn`
     /// it overlaps most (by intersection length on the `[start, end]` axis).
-    /// Segments with no overlapping turn keep `speakerID == nil`. Pure and order-
-    /// preserving; safe to call off the actor.
+    /// When no overlap exists, borrow the nearest turn within a short boundary
+    /// tolerance. Segments with no overlapping or near-enough turn keep
+    /// `speakerID == nil`. Pure and order-preserving; safe to call off the actor.
     ///
     /// Both inputs must share the same timeline (seconds from the same origin).
     public nonisolated static func assignSpeakers(
@@ -154,19 +242,14 @@ public actor DiarizationService {
     ) -> [DialogueSegment] {
         guard !turns.isEmpty else { return segments }
         return segments.map { seg in
-            var best: (index: Int, overlap: Double)? = nil
-            for turn in turns {
-                let lo = max(seg.start, turn.start)
-                let hi = min(seg.end, turn.end)
-                let overlap = hi - lo
-                guard overlap > 0 else { continue }
-                if best == nil || overlap > best!.overlap {
-                    best = (turn.speakerIndex, overlap)
-                }
-            }
-            guard let best else { return seg }
+            let speakerIndex = bestOverlappingSpeakerIndex(for: seg, turns: turns)
+                ?? nearestSpeakerIndex(
+                    for: seg,
+                    turns: turns,
+                    maxGap: nearestTurnTolerance)
+            guard let speakerIndex else { return seg }
             var copy = seg
-            copy.speakerID = best.index
+            copy.speakerID = speakerIndex
             return copy
         }
     }
@@ -203,6 +286,67 @@ public actor DiarizationService {
             ))
         }
         return turns
+    }
+
+    /// Best overlapping speaker, if any, by greatest intersection length.
+    /// Equal overlaps keep the earliest turn encountered, preserving the
+    /// timeline order from diarization output.
+    nonisolated static func bestOverlappingSpeakerIndex(
+        for segment: DialogueSegment,
+        turns: [SpeakerTurn]
+    ) -> Int? {
+        var best: (speakerIndex: Int, overlap: Double)? = nil
+        for turn in turns {
+            let lo = max(segment.start, turn.start)
+            let hi = min(segment.end, turn.end)
+            let overlap = hi - lo
+            guard overlap > 0 else { continue }
+            if best == nil || overlap > best!.overlap {
+                best = (turn.speakerIndex, overlap)
+            }
+        }
+        return best?.speakerIndex
+    }
+
+    /// Nearest speaker turn within `maxGap` when strict overlap found nothing.
+    /// Ties break deterministically by earlier turn start, then earlier turn end,
+    /// then lower speaker index.
+    nonisolated static func nearestSpeakerIndex(
+        for segment: DialogueSegment,
+        turns: [SpeakerTurn],
+        maxGap: Double
+    ) -> Int? {
+        var best: (speakerIndex: Int, gap: Double, start: Double, end: Double)? = nil
+        for turn in turns {
+            let gap = gapBetween(segment: segment, and: turn)
+            guard gap <= maxGap else { continue }
+            if best == nil
+                || gap < best!.gap
+                || (gap == best!.gap && turn.start < best!.start)
+                || (gap == best!.gap && turn.start == best!.start && turn.end < best!.end)
+                || (gap == best!.gap && turn.start == best!.start
+                    && turn.end == best!.end && turn.speakerIndex < best!.speakerIndex)
+            {
+                best = (turn.speakerIndex, gap, turn.start, turn.end)
+            }
+        }
+        return best?.speakerIndex
+    }
+
+    /// Positive distance between two non-overlapping intervals on the same
+    /// timeline. Touching boundaries have gap 0 and are eligible for the
+    /// nearest-turn rescue path.
+    nonisolated static func gapBetween(
+        segment: DialogueSegment,
+        and turn: SpeakerTurn
+    ) -> Double {
+        if segment.end <= turn.start {
+            return turn.start - segment.end
+        }
+        if turn.end <= segment.start {
+            return segment.start - turn.end
+        }
+        return 0
     }
 
     /// Decode an audio file at `url` into 16 kHz mono Float32 samples via
@@ -255,12 +399,9 @@ public actor DiarizationService {
         }
 
         var convError: NSError?
-        var fed = false
+        let converterInput = SingleBufferAudioConverterInput(inBuf)
         converter.convert(to: outBuf, error: &convError) { _, outStatus in
-            if fed { outStatus.pointee = .endOfStream; return nil }
-            fed = true
-            outStatus.pointee = .haveData
-            return inBuf
+            converterInput.provide(status: outStatus)
         }
         if let convError {
             throw DiarizationError.audioReadFailed("Resample failed: \(convError.localizedDescription)")

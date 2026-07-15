@@ -4,6 +4,43 @@ import AVFoundation
 
 final class AudioExtractorTests: XCTestCase {
 
+    private func allocatedBytes<T>(for values: [T]) -> (
+        pointer: UnsafeMutableRawPointer,
+        byteCount: Int
+    ) {
+        let byteCount = values.count * MemoryLayout<T>.stride
+        let pointer = UnsafeMutableRawPointer.allocate(
+            byteCount: max(1, byteCount),
+            alignment: MemoryLayout<T>.alignment
+        )
+        values.withUnsafeBytes { source in
+            if let baseAddress = source.baseAddress, byteCount > 0 {
+                pointer.copyMemory(from: baseAddress, byteCount: byteCount)
+            }
+        }
+        return (pointer, byteCount)
+    }
+
+    private func appendMemory(
+        _ memory: (pointer: UnsafeMutableRawPointer, byteCount: Int),
+        to blockBuffer: CMBlockBuffer
+    ) throws {
+        let status = CMBlockBufferAppendMemoryBlock(
+            blockBuffer,
+            memoryBlock: memory.pointer,
+            length: memory.byteCount,
+            blockAllocator: kCFAllocatorNull,
+            customBlockSource: nil,
+            offsetToData: 0,
+            dataLength: memory.byteCount,
+            flags: 0
+        )
+        XCTAssertEqual(status, kCMBlockBufferNoErr)
+        if status != kCMBlockBufferNoErr {
+            throw AudioExtractionError.blockBufferReadFailed(status: status)
+        }
+    }
+
     /// Generates a 16 kHz mono wav file at a temp location containing `seconds`
     /// worth of a 440 Hz sine wave. Returns its URL.
     private func generateToneWav(seconds: Double) throws -> URL {
@@ -119,6 +156,136 @@ final class AudioExtractorTests: XCTestCase {
             "progress callback must fire at least once")
         XCTAssertLessThanOrEqual(values.last ?? 0, 1.0)
         XCTAssertGreaterThanOrEqual(values.first ?? 1, 0.0)
+    }
+
+    func testStreamPCMDeliversMultipleBoundedChunks() async throws {
+        let url = try generateToneWav(seconds: 1.2)
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        actor ChunkCollector {
+            var counts: [Int] = []
+            var starts: [Int] = []
+
+            func add(_ chunk: AudioExtractor.PCMChunk) {
+                counts.append(chunk.samples.count)
+                starts.append(chunk.startSample)
+            }
+
+            func snapshot() -> (counts: [Int], starts: [Int]) {
+                (counts, starts)
+            }
+        }
+        let collector = ChunkCollector()
+
+        let summary = try await AudioExtractor.streamPCM(
+            from: url,
+            chunkSampleCount: 8_000,
+            onProgress: { _ in }
+        ) { chunk in
+            await collector.add(chunk)
+        }
+
+        let snapshot = await collector.snapshot()
+        XCTAssertEqual(snapshot.counts, [8_000, 8_000, 3_200])
+        XCTAssertEqual(snapshot.starts, [0, 8_000, 16_000])
+        XCTAssertEqual(summary.totalSamples, snapshot.counts.reduce(0, +))
+        XCTAssertEqual(summary.chunkCount, 3)
+        XCTAssertEqual(summary.maxBufferedSamples, 8_000)
+        XCTAssertLessThanOrEqual(summary.maxBufferedSamples, 8_000)
+    }
+
+    func testStreamPCMStopsWhenChunkConsumerCancels() async throws {
+        let url = try generateToneWav(seconds: 4)
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        actor CallCounter {
+            var value = 0
+            func increment() { value += 1 }
+        }
+        let counter = CallCounter()
+
+        do {
+            _ = try await AudioExtractor.streamPCM(
+                from: url,
+                chunkSampleCount: 8_000,
+                onProgress: { _ in }
+            ) { _ in
+                await counter.increment()
+                throw CancellationError()
+            }
+            XCTFail("expected cancellation")
+        } catch is CancellationError {
+            // Expected: AVAssetReader is cancelled by streamPCM's defer.
+        }
+
+        let callCount = await counter.value
+        XCTAssertEqual(callCount, 1)
+    }
+
+    func testSegmentedCMBlockBufferCopiesEveryFloatInOrder() throws {
+        let first = allocatedBytes(for: [Float](arrayLiteral: 0.25, -0.5, 0.75))
+        let second = allocatedBytes(for: [Float](arrayLiteral: 1.0, -1.25, 1.5))
+        defer {
+            first.pointer.deallocate()
+            second.pointer.deallocate()
+        }
+
+        var blockBuffer: CMBlockBuffer?
+        XCTAssertEqual(
+            CMBlockBufferCreateEmpty(
+                allocator: kCFAllocatorDefault,
+                capacity: 2,
+                flags: 0,
+                blockBufferOut: &blockBuffer
+            ),
+            kCMBlockBufferNoErr
+        )
+        let buffer = try XCTUnwrap(blockBuffer)
+        try appendMemory(first, to: buffer)
+        try appendMemory(second, to: buffer)
+
+        var copied: [Float] = []
+        var byteOffset = 0
+        while let chunk = try AudioExtractor.copyPCMFloatChunk(
+            in: buffer,
+            byteOffset: byteOffset,
+            maximumSamplesPerCopy: 2
+        ) {
+            copied.append(contentsOf: chunk.samples)
+            byteOffset = chunk.nextByteOffset
+        }
+
+        XCTAssertEqual(copied, [0.25, -0.5, 0.75, 1.0, -1.25, 1.5])
+    }
+
+    func testMisalignedCMBlockBufferReturnsTypedError() throws {
+        let bytes = allocatedBytes(for: [UInt8](repeating: 0xA5, count: 5))
+        defer { bytes.pointer.deallocate() }
+
+        var blockBuffer: CMBlockBuffer?
+        XCTAssertEqual(
+            CMBlockBufferCreateEmpty(
+                allocator: kCFAllocatorDefault,
+                capacity: 1,
+                flags: 0,
+                blockBufferOut: &blockBuffer
+            ),
+            kCMBlockBufferNoErr
+        )
+        let buffer = try XCTUnwrap(blockBuffer)
+        try appendMemory(bytes, to: buffer)
+
+        do {
+            _ = try AudioExtractor.copyPCMFloatChunk(
+                in: buffer,
+                byteOffset: 0
+            )
+            XCTFail("expected malformed PCM error")
+        } catch AudioExtractionError.malformedPCMData(let byteCount) {
+            XCTAssertEqual(byteCount, 5)
+        } catch {
+            XCTFail("unexpected error: \(error)")
+        }
     }
 
     func testThrowsOnMissingFile() async {

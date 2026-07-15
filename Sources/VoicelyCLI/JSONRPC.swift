@@ -31,8 +31,12 @@ enum JSONValue: Sendable, Equatable {
                 self = .bool(n.boolValue)
             } else if CFNumberIsFloatType(n) {
                 self = .double(n.doubleValue)
+            } else if let exactInteger = Int(n.stringValue) {
+                self = .int(exactInteger)
             } else {
-                self = .int(n.intValue)
+                // Preserve an out-of-range integer as a numeric value that the
+                // JSON-RPC id validator can reject without trapping or wrapping.
+                self = .double(n.doubleValue)
             }
         case let s as String:
             self = .string(s)
@@ -73,7 +77,7 @@ enum JSONValue: Sendable, Equatable {
 
 /// A JSON-RPC id: a string, a number, or null (used only on parse errors).
 /// We preserve the client's original type so responses echo it faithfully.
-enum JSONRPCID: Sendable, Equatable {
+enum JSONRPCID: Sendable, Equatable, Hashable {
     case string(String)
     case int(Int)
     case null
@@ -86,11 +90,30 @@ enum JSONRPCID: Sendable, Equatable {
         }
     }
 
+    var logDescription: String {
+        switch self {
+        case .string(let value): return value
+        case .int(let value): return String(value)
+        case .null: return "null"
+        }
+    }
+
     init?(from value: JSONValue) {
         switch value {
         case .string(let s): self = .string(s)
         case .int(let i): self = .int(i)
-        case .double(let d): self = .int(Int(d))
+        case .double(let d):
+            // `Int(Double)` traps for out-of-range values. JSON also permits
+            // exponent notation and fractions, while JSON-RPC recommends
+            // integer IDs. Accept only a finite, integral, exactly representable
+            // value inside Int's half-open floating-point bounds.
+            guard d.isFinite,
+                  d.rounded(.towardZero) == d,
+                  d >= Double(Int.min),
+                  d < Double(Int.max) else { return nil }
+            let integer = Int(d)
+            guard Double(integer) == d else { return nil }
+            self = .int(integer)
         default: return nil
         }
     }
@@ -111,7 +134,14 @@ struct JSONRPCMessage: Sendable {
         guard case let .object(obj) = value else {
             throw JSONRPCParseError.notAnObject
         }
-        self.id = obj["id"].flatMap(JSONRPCID.init(from:))
+        if let rawID = obj["id"] {
+            guard let parsedID = JSONRPCID(from: rawID) else {
+                throw JSONRPCParseError.invalidID
+            }
+            self.id = parsedID
+        } else {
+            self.id = nil
+        }
         if case let .string(m)? = obj["method"] { self.method = m } else { self.method = nil }
         self.params = obj["params"]
     }
@@ -119,6 +149,79 @@ struct JSONRPCMessage: Sendable {
 
 enum JSONRPCParseError: Error {
     case notAnObject
+    case invalidID
+}
+
+// MARK: - Bounded newline framing
+
+/// Incremental newline-delimited reader for MCP stdio. It never retains more
+/// than one configured frame plus one small read chunk. Oversized input is
+/// drained through its newline before `.oversized` is returned, so the next
+/// valid JSON-RPC frame remains synchronized.
+struct JSONRPCFrameReader {
+    enum Event: Equatable {
+        case frame(Data)
+        case oversized
+    }
+
+    static let defaultMaximumFrameBytes = 1_048_576
+
+    private let input: FileHandle
+    private let maximumFrameBytes: Int
+    private let readChunkBytes: Int
+    private var buffer = Data()
+    private var discardingOversizedFrame = false
+    private var reachedEOF = false
+
+    init(
+        input: FileHandle,
+        maximumFrameBytes: Int = Self.defaultMaximumFrameBytes,
+        readChunkBytes: Int = 64 * 1_024
+    ) {
+        self.input = input
+        self.maximumFrameBytes = max(1, maximumFrameBytes)
+        self.readChunkBytes = max(1, readChunkBytes)
+    }
+
+    mutating func nextFrame() throws -> Event? {
+        while true {
+            if discardingOversizedFrame {
+                if let newline = buffer.firstIndex(of: 0x0A) {
+                    buffer.removeSubrange(buffer.startIndex...newline)
+                    discardingOversizedFrame = false
+                    return .oversized
+                }
+                if reachedEOF {
+                    buffer.removeAll(keepingCapacity: false)
+                    discardingOversizedFrame = false
+                    return .oversized
+                }
+                // No delimiter in this chunk. Drop it before reading more.
+                buffer.removeAll(keepingCapacity: true)
+            } else if let newline = buffer.firstIndex(of: 0x0A) {
+                var frame = Data(buffer[..<newline])
+                buffer.removeSubrange(buffer.startIndex...newline)
+                if frame.last == 0x0D { frame.removeLast() }
+                return frame.count > maximumFrameBytes ? .oversized : .frame(frame)
+            } else if buffer.count > maximumFrameBytes {
+                discardingOversizedFrame = true
+                continue
+            } else if reachedEOF {
+                guard !buffer.isEmpty else { return nil }
+                var frame = buffer
+                buffer.removeAll(keepingCapacity: false)
+                if frame.last == 0x0D { frame.removeLast() }
+                return frame.count > maximumFrameBytes ? .oversized : .frame(frame)
+            }
+
+            let chunk = try input.read(upToCount: readChunkBytes) ?? Data()
+            if chunk.isEmpty {
+                reachedEOF = true
+            } else {
+                buffer.append(chunk)
+            }
+        }
+    }
 }
 
 // MARK: - Outgoing response

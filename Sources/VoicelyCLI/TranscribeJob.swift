@@ -12,7 +12,64 @@ import VoicelyCore
 // Runs on the main actor because Transcriber is @MainActor (same as the app).
 
 /// Chunk size used by the app's file queue: 30 s at 16 kHz.
-private let chunkSampleCount = 16000 * 30
+private let cliChunkSampleCount = 16000 * 30
+
+/// One ASR runtime per CLI process. The MCP server shares one instance across
+/// concurrent requests, so they share both the loaded engine and its scheduler.
+@MainActor
+final class CLITranscriptionRuntime {
+    let coordinator: TranscriptionCoordinator
+    let transcriber: Transcriber
+    private var diarizerStorage: (any FileDiarizing)?
+
+    init(
+        coordinator: TranscriptionCoordinator = TranscriptionCoordinator(),
+        diarizer: (any FileDiarizing)? = nil
+    ) {
+        self.coordinator = coordinator
+        self.transcriber = Transcriber(coordinator: coordinator)
+        self.diarizerStorage = diarizer
+    }
+
+    /// Lazily creates one actor-isolated diarizer for the whole CLI process.
+    /// MCP heavy admission is acquired before `execute` reaches this method, so
+    /// rejected requests never instantiate the backend or trigger model work.
+    func sharedDiarizer() -> any FileDiarizing {
+        if let diarizerStorage { return diarizerStorage }
+        let created = DiarizationService()
+        diarizerStorage = created
+        return created
+    }
+}
+
+enum TranscribeJobError: LocalizedError, Equatable {
+    case unknownModelVariant(String)
+    case unsupportedLanguage(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .unknownModelVariant(let variant):
+            return "Unknown model '\(variant)'. Use one of: \(WhisperModel.all.map(\.variant).joined(separator: ", "))."
+        case .unsupportedLanguage(let language):
+            return "Unsupported language '\(language)'. Use ru or en."
+        }
+    }
+}
+
+@MainActor
+private final class CLITranscriptionAccumulator {
+    var textFragments: [String] = []
+    var segments: [WhisperSegment] = []
+    var detectedLanguage: String?
+    var completedChunks = 0
+}
+
+/// Testable result from the bounded file-processing core. The production CLI
+/// returns only `result`; focused tests also assert the decoded-PCM high-water.
+struct TranscribeJobExecution: Sendable {
+    let result: TranscribeResult
+    let maximumBufferedSamples: Int
+}
 
 @MainActor
 struct TranscribeJob {
@@ -21,11 +78,26 @@ struct TranscribeJob {
     let forcedLanguage: String?
     let modelVariant: String?
 
-    func execute() async throws -> TranscribeResult {
-        let transcriber = Transcriber()
-        if let modelVariant,
-           let picked = WhisperModel.all.first(where: { $0.variant == modelVariant }) {
-            transcriber.selectModel(picked)
+    func execute(runtime suppliedRuntime: CLITranscriptionRuntime? = nil) async throws -> TranscribeResult {
+        try Task.checkCancellation()
+
+        if let forcedLanguage, !["ru", "en"].contains(forcedLanguage) {
+            throw TranscribeJobError.unsupportedLanguage(forcedLanguage)
+        }
+        let selectedModel: WhisperModel?
+        if let modelVariant {
+            guard let picked = WhisperModel.all.first(where: { $0.variant == modelVariant }) else {
+                throw TranscribeJobError.unknownModelVariant(modelVariant)
+            }
+            selectedModel = picked
+        } else {
+            selectedModel = nil
+        }
+
+        let runtime = suppliedRuntime ?? CLITranscriptionRuntime()
+        let transcriber = runtime.transcriber
+        if let selectedModel {
+            transcriber.selectModel(selectedModel)
         }
         transcriber.preferredLanguage = forcedLanguage
         transcriber.onProgress = { status in
@@ -33,87 +105,166 @@ struct TranscribeJob {
             if !msg.isEmpty { logErr(msg) }
         }
 
+        // Freeze model, engine and request settings before the first await. A
+        // concurrent MCP request may mutate the shared Transcriber while this
+        // request waits for model preparation or an ASR lease.
+        let session = try transcriber.makeSession(priority: .file)
+        defer { transcriber.resetLanguageSession(session) }
+
         // Load the model (download on first run). Progress goes to stderr.
-        logErr("Loading model \(transcriber.selectedModel.displayName)…")
-        try await transcriber.preloadModel()
-        transcriber.resetLanguageSession()
+        logErr("Loading model \(session.model.displayName)…")
+        try await transcriber.preloadModel(for: session)
+        try Task.checkCancellation()
 
-        guard let engine = transcriber.currentEngine as? any SampleTranscribing else {
-            throw TranscriberError.modelNotReady
-        }
+        let engine = transcriber.sampleTranscriber(for: session)
 
-        // 1. Extract PCM (16 kHz mono Float32).
+        let diarizer: (any FileDiarizing)? = diarize ? runtime.sharedDiarizer() : nil
+        let execution = try await Self.processFile(
+            sourceURL: fileURL,
+            engine: engine,
+            shouldDiarize: diarize,
+            forcedLanguage: forcedLanguage,
+            modelName: session.model.displayName,
+            diarizer: diarizer,
+            chunkSampleCount: cliChunkSampleCount
+        )
+        try Task.checkCancellation()
+        return execution.result
+    }
+
+    /// Bounded file-processing core shared by the one-shot CLI and MCP tool.
+    /// Decoding is backpressured: a chunk is fully transcribed before
+    /// AudioExtractor requests more PCM from AVFoundation.
+    static func processFile(
+        sourceURL: URL,
+        engine: any SampleTranscribing,
+        shouldDiarize: Bool,
+        forcedLanguage: String?,
+        modelName: String,
+        diarizer: (any FileDiarizing)?,
+        chunkSampleCount: Int = cliChunkSampleCount
+    ) async throws -> TranscribeJobExecution {
+        try Task.checkCancellation()
         logErr("Extracting audio…")
-        let samples = try await AudioExtractor.extractPCM(from: fileURL) { _ in }
 
-        // 2. Chunked transcription, accumulating absolute-offset segments.
-        var accumulatedText: [String] = []
-        var accumulatedSegments: [WhisperSegment] = []
-        var detectedLanguage: String? = nil
-
-        if !samples.isEmpty {
-            let totalChunks = max(1, Int(ceil(Double(samples.count) / Double(chunkSampleCount))))
-            var cursor = 0
-            var chunkIndex = 0
-            while cursor < samples.count {
-                let end = min(cursor + chunkSampleCount, samples.count)
-                let chunk = Array(samples[cursor..<end])
-                let chunkStartSeconds = Double(cursor) / 16000.0
-                do {
-                    let r = try await engine.transcribeSamples(
-                        chunk, translate: false, language: forcedLanguage)
-                    let trimmed = r.text.trimmingCharacters(in: .whitespacesAndNewlines)
-                    if !trimmed.isEmpty { accumulatedText.append(trimmed) }
-                    for seg in r.segments {
-                        accumulatedSegments.append(WhisperSegment(
-                            start: seg.start + chunkStartSeconds,
-                            end: seg.end + chunkStartSeconds,
-                            text: seg.text))
-                    }
-                    if detectedLanguage == nil { detectedLanguage = r.detectedLanguage }
-                } catch TranscriberError.silentAudio {
-                    // Silent chunk — skip without failing the run.
-                }
-                chunkIndex += 1
-                logErr("Transcribed chunk \(chunkIndex)/\(totalChunks)")
-                cursor = end
-            }
+        let accumulator = CLITranscriptionAccumulator()
+        let streamSummary = try await AudioExtractor.streamPCM(
+            from: sourceURL,
+            chunkSampleCount: chunkSampleCount,
+            onProgress: { _ in }
+        ) { [accumulator] chunk in
+            try await consume(
+                chunk,
+                engine: engine,
+                forcedLanguage: forcedLanguage,
+                configuredChunkSampleCount: max(1, chunkSampleCount),
+                accumulator: accumulator
+            )
         }
+        try Task.checkCancellation()
 
-        // 3. Optional single global diarization pass.
-        var diarized: [DialogueSegment]? = nil
-        if diarize, !accumulatedSegments.isEmpty {
+        var diarizedSegments: [DialogueSegment]?
+        if shouldDiarize,
+           !accumulator.segments.isEmpty,
+           let diarizer {
             logErr("Diarizing (this may download speaker models on first run)…")
-            let service = DiarizationService()
             do {
-                let turns = try await service.diarize(
-                    samples: samples,
-                    sampleRate: DiarizationService.requiredSampleRate)
-                let distinctSpeakers = Set(turns.map { $0.speakerIndex }).count
+                let turns = try await diarizer.diarize(fileURL: sourceURL)
+                try Task.checkCancellation()
+                let distinctSpeakers = Set(turns.map(\.speakerIndex)).count
                 logErr("Diarization: \(turns.count) turns, \(distinctSpeakers) distinct speaker(s)")
                 if !turns.isEmpty {
-                    let dialogue = accumulatedSegments.map { seg in
+                    let dialogue = accumulator.segments.map { segment in
                         DialogueSegment(
                             speaker: .other,
-                            start: seg.start,
-                            end: seg.end,
-                            text: seg.text,
-                            language: detectedLanguage)
+                            start: segment.start,
+                            end: segment.end,
+                            text: segment.text,
+                            language: accumulator.detectedLanguage
+                        )
                     }
-                    diarized = DiarizationService.assignSpeakers(to: dialogue, turns: turns)
+                    diarizedSegments = DiarizationService.assignSpeakers(
+                        to: dialogue,
+                        turns: turns
+                    )
                 }
+            } catch is CancellationError {
+                throw CancellationError()
             } catch {
                 logErr("Diarization failed (\(error.localizedDescription)); printing without speaker labels.")
             }
         }
 
-        return TranscribeResult(
-            sourceURL: fileURL,
-            transcript: accumulatedText.joined(separator: " "),
-            segments: accumulatedSegments,
-            diarizedSegments: diarized,
-            language: detectedLanguage,
-            modelName: transcriber.selectedModel.displayName
+        try Task.checkCancellation()
+        let result = TranscribeResult(
+            sourceURL: sourceURL,
+            transcript: accumulator.textFragments.joined(separator: " "),
+            segments: accumulator.segments,
+            diarizedSegments: diarizedSegments,
+            language: accumulator.detectedLanguage,
+            modelName: modelName
+        )
+        try Task.checkCancellation()
+        return TranscribeJobExecution(
+            result: result,
+            maximumBufferedSamples: streamSummary.maxBufferedSamples
+        )
+    }
+
+    private static func consume(
+        _ chunk: AudioExtractor.PCMChunk,
+        engine: any SampleTranscribing,
+        forcedLanguage: String?,
+        configuredChunkSampleCount: Int,
+        accumulator: CLITranscriptionAccumulator
+    ) async throws {
+        try Task.checkCancellation()
+        do {
+            let transcription = try await engine.transcribeSamples(
+                chunk.samples,
+                translate: false,
+                language: forcedLanguage
+            )
+            try Task.checkCancellation()
+
+            let trimmed = transcription.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty {
+                accumulator.textFragments.append(trimmed)
+            }
+            let chunkStartSeconds = Double(chunk.startSample) / AudioExtractor.outputSampleRate
+            for segment in transcription.segments {
+                accumulator.segments.append(WhisperSegment(
+                    start: segment.start + chunkStartSeconds,
+                    end: segment.end + chunkStartSeconds,
+                    text: segment.text
+                ))
+            }
+            if accumulator.detectedLanguage == nil {
+                accumulator.detectedLanguage = transcription.detectedLanguage
+            }
+        } catch TranscriberError.silentAudio {
+            // Silent chunk - skip without failing the run.
+        } catch is CancellationError {
+            throw CancellationError()
+        }
+
+        try Task.checkCancellation()
+        accumulator.completedChunks += 1
+        let estimatedTotalChunks: Int
+        if chunk.estimatedTotalSamples > 0 {
+            estimatedTotalChunks = max(
+                1,
+                Int(ceil(
+                    Double(chunk.estimatedTotalSamples)
+                        / Double(configuredChunkSampleCount)
+                ))
+            )
+        } else {
+            estimatedTotalChunks = accumulator.completedChunks
+        }
+        logErr(
+            "Transcribed chunk \(accumulator.completedChunks)/"
+                + "\(max(accumulator.completedChunks, estimatedTotalChunks))"
         )
     }
 }

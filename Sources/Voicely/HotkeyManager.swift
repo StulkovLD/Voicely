@@ -67,6 +67,17 @@ struct HotkeyPreset {
 
 // MARK: - Manager
 
+enum HotkeyRuntimeState: Sendable, Equatable {
+    case active
+    case permissionMissing
+    case eventTapUnavailable
+
+    static func classify(isTrusted: Bool, isTapActive: Bool) -> Self {
+        if !isTrusted { return .permissionMissing }
+        return isTapActive ? .active : .eventTapUnavailable
+    }
+}
+
 /// Hotkey conflict detection (e.g. system shortcuts, Input Sources) is the caller's responsibility.
 final class HotkeyManager: @unchecked Sendable {
     private var callback: (() -> Void)?
@@ -74,7 +85,7 @@ final class HotkeyManager: @unchecked Sendable {
     private var runLoopSource: CFRunLoopSource?
     private let comboLock = NSLock()
     private var _combo: HotkeyCombo
-    var onAccessibilityLost: (@Sendable () -> Void)?
+    var onRuntimeStateChange: (@Sendable (HotkeyRuntimeState) -> Void)?
     private var accessibilityCheckTimer: Timer?
     private var sleepObserver: NSObjectProtocol?
     private var wakeObserver: NSObjectProtocol?
@@ -99,6 +110,10 @@ final class HotkeyManager: @unchecked Sendable {
 
     /// Whether accessibility permission is currently granted
     var isAccessibilityGranted: Bool { AXIsProcessTrusted() }
+
+    var runtimeState: HotkeyRuntimeState {
+        .classify(isTrusted: isAccessibilityGranted, isTapActive: isActive)
+    }
 
     deinit {
         accessibilityCheckTimer?.invalidate()
@@ -150,13 +165,15 @@ final class HotkeyManager: @unchecked Sendable {
     func startAccessibilityMonitor() {
         accessibilityCheckTimer?.invalidate()
         accessibilityCheckTimer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
-            guard let self, self.isActive else { return }
-            if !AXIsProcessTrusted() {
+            guard let self else { return }
+            let state = self.runtimeState
+            guard state != .active else { return }
+            if state == .permissionMissing {
                 self.stopTap()
-                self.onAccessibilityLost?()
-                self.accessibilityCheckTimer?.invalidate()
-                self.accessibilityCheckTimer = nil
             }
+            self.publishRuntimeState(state)
+            self.accessibilityCheckTimer?.invalidate()
+            self.accessibilityCheckTimer = nil
         }
     }
 
@@ -234,6 +251,7 @@ final class HotkeyManager: @unchecked Sendable {
         guard AXIsProcessTrusted() else {
             print("[Voicely] Cannot create event tap - Accessibility permission not granted. "
                 + "Enable it in System Settings > Privacy & Security > Accessibility.")
+            publishRuntimeState(.permissionMissing)
             return false
         }
 
@@ -252,7 +270,12 @@ final class HotkeyManager: @unchecked Sendable {
                 if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
                     if let tap = manager.eventTap {
                         CGEvent.tapEnable(tap: tap, enable: true)
-                        print("[Voicely] Event tap re-enabled after system disable")
+                        if CGEvent.tapIsEnabled(tap: tap) {
+                            print("[Voicely] Event tap re-enabled after system disable")
+                            manager.publishRuntimeState(.active)
+                        } else {
+                            manager.publishRuntimeState(.eventTapUnavailable)
+                        }
                     }
                     return Unmanaged.passUnretained(event)
                 }
@@ -282,11 +305,14 @@ final class HotkeyManager: @unchecked Sendable {
             userInfo: Unmanaged.passUnretained(self).toOpaque()
         ) else {
             print("[Voicely] CGEvent.tapCreate() failed despite AXIsProcessTrusted() == true.")
+            publishRuntimeState(.eventTapUnavailable)
             return false
         }
 
         guard let source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0) else {
             print("[Voicely] Failed to create run loop source from event tap.")
+            CFMachPortInvalidate(tap)
+            publishRuntimeState(.eventTapUnavailable)
             return false
         }
 
@@ -295,9 +321,19 @@ final class HotkeyManager: @unchecked Sendable {
 
         CFRunLoopAddSource(CFRunLoopGetMain(), source, .commonModes)
         CGEvent.tapEnable(tap: tap, enable: true)
+        guard isActive else {
+            stopTap()
+            publishRuntimeState(.eventTapUnavailable)
+            return false
+        }
 
         print("[Voicely] Event tap registered for \(combo.displayName).")
+        publishRuntimeState(.active)
         return true
+    }
+
+    private func publishRuntimeState(_ state: HotkeyRuntimeState) {
+        onRuntimeStateChange?(state)
     }
 
     /// Stop the event tap. Disables tap first to prevent callbacks, then removes from run loop.
