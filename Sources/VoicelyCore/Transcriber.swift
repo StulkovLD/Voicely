@@ -84,6 +84,7 @@ public struct WhisperModel: Sendable, Equatable {
     public enum Backend: Sendable, Equatable {
         case whisperKit
         case gigaAMV3E2ERNNT
+        case gigaAMMultilingualCTC
     }
 
     public struct Capabilities: Sendable, Equatable {
@@ -129,6 +130,15 @@ public struct WhisperModel: Sendable, Equatable {
                 supportsTranslationToEnglish: false,
                 minimumMacOSMajorVersion: 15
             )
+        case .gigaAMMultilingualCTC:
+            // The charwise CTC model transcribes whichever of its languages it
+            // hears; there is no language input, so this behaves as detection.
+            return Capabilities(
+                supportedLanguages: ["ru", "en", "kk", "ky", "uz"],
+                supportsLanguageDetection: true,
+                supportsTranslationToEnglish: false,
+                minimumMacOSMajorVersion: 15
+            )
         }
     }
 
@@ -150,6 +160,7 @@ public struct WhisperModel: Sendable, Equatable {
 
     public static let all: [WhisperModel] = [
         WhisperModel(variant: "gigaam-v3-e2e-rnnt", displayName: "GigaAM V3 RU", sizeLabel: "~426 MB", sizeBytes: 430_000_000, minRAMGB: 8, backend: .gigaAMV3E2ERNNT),
+        WhisperModel(variant: "gigaam-multilingual-ctc", displayName: "GigaAM Multilingual", sizeLabel: "~421 MB", sizeBytes: 442_100_000, minRAMGB: 8, backend: .gigaAMMultilingualCTC),
         WhisperModel(variant: "large-v3-v20240930_turbo_632MB", displayName: "Large V3 Turbo Q", sizeLabel: "~632 MB", sizeBytes: 650_000_000, minRAMGB: 8, backend: .whisperKit),
         WhisperModel(variant: "large-v3_turbo", displayName: "Large V3 Turbo", sizeLabel: "~3 GB", sizeBytes: 3_200_000_000, minRAMGB: 24, backend: .whisperKit),
         WhisperModel(variant: "medium", displayName: "Medium", sizeLabel: "~1.5 GB", sizeBytes: 1_500_000_000, minRAMGB: 16, backend: .whisperKit),
@@ -170,6 +181,8 @@ public struct WhisperModel: Sendable, Equatable {
         switch backend {
         case .gigaAMV3E2ERNNT:
             return "Russian only, no translation, macOS 15+"
+        case .gigaAMMultilingualCTC:
+            return "RU/EN/KK/KY/UZ, plain lowercase text without punctuation, macOS 15+"
         case .whisperKit:
             return nil
         }
@@ -315,6 +328,9 @@ public struct WhisperModel: Sendable, Equatable {
             #endif
             return FileManager.default.homeDirectoryForCurrentUser
                 .appendingPathComponent("Documents/huggingface/models/smkrv/gigaam-v3-e2e-rnnt-coreml")
+        case .gigaAMMultilingualCTC:
+            return FileManager.default.homeDirectoryForCurrentUser
+                .appendingPathComponent("Documents/voicely/models/gigaam-multilingual-ctc")
         }
     }
 
@@ -521,6 +537,9 @@ public final class Transcriber {
         case .gigaAMV3E2ERNNT:
             vlog("Using GigaAM v3, model: \(model.variant) (RAM: \(WhisperModel.systemRAMGB) GB)")
             return GigaAMEngine(model: model, onProgress: onProgress)
+        case .gigaAMMultilingualCTC:
+            vlog("Using GigaAM Multilingual CTC, model: \(model.variant) (RAM: \(WhisperModel.systemRAMGB) GB)")
+            return GigaAMCTCEngine(model: model, onProgress: onProgress)
         }
     }
 

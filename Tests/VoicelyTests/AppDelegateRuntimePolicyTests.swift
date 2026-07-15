@@ -113,6 +113,27 @@ final class AppDelegateRuntimePolicyTests: XCTestCase {
         )
     }
 
+    func testMultilingualCTCLanguageModesFollowCapabilities() throws {
+        let multilingual = try XCTUnwrap(
+            WhisperModel.all.first { $0.backend == .gigaAMMultilingualCTC }
+        )
+        XCTAssertFalse(multilingual.isSupported(on: OperatingSystemVersion(
+            majorVersion: 14, minorVersion: 7, patchVersion: 0
+        )))
+        XCTAssertTrue(multilingual.isSupported(on: OperatingSystemVersion(
+            majorVersion: 15, minorVersion: 0, patchVersion: 0
+        )))
+        XCTAssertEqual(AppDelegate.compatibleLanguageModes(for: multilingual), [.auto])
+        XCTAssertEqual(
+            AppDelegate.normalizedLanguageMode(.translateToEnglish, for: multilingual),
+            .auto
+        )
+        XCTAssertEqual(
+            AppDelegate.normalizedLanguageMode(.auto, for: multilingual),
+            .auto
+        )
+    }
+
     func testFileQueueProductionWiringUsesRawEngineAndSharedCoordinator() throws {
         let coordinator = TranscriptionCoordinator()
         let engine = RuntimePolicyEngine()

@@ -1,127 +1,88 @@
 @preconcurrency import AVFoundation
-import Accelerate
 import CoreML
 import Foundation
 
-struct GigaAMTokenDecoder {
-    static func decode(tokenIDs: [Int], pieces: [String]) -> String {
-        let raw = tokenIDs.compactMap { id in
-            guard id >= 0, id < pieces.count else { return nil }
-            return pieces[id]
-        }.joined()
-        return normalize(raw)
-    }
-
-    private static func normalize(_ raw: String) -> String {
-        guard !raw.isEmpty else { return "" }
-        var text = raw.replacingOccurrences(of: "▁", with: " ")
-        text = text.replacingOccurrences(of: #"\s+([,.;:!?])"#, with: "$1", options: .regularExpression)
-        text = text.replacingOccurrences(of: #"([«(\[])[ ]+"#, with: "$1", options: .regularExpression)
-        text = text.replacingOccurrences(of: #"\s+([»)\]])"#, with: "$1", options: .regularExpression)
-        text = text.replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
-        return text.trimmingCharacters(in: .whitespacesAndNewlines)
+/// Charwise CTC greedy decode: argmax labels per frame, collapse repeats,
+/// drop blanks, join vocab characters. The vocab has no word-piece markers —
+/// the space character is an ordinary vocab entry.
+enum GigaAMCTCDecoder {
+    static func decode(frameLabels: [Int], vocab: [String], blankID: Int) -> String {
+        var pieces: [String] = []
+        var previous = -1
+        for label in frameLabels {
+            if label != previous, label != blankID, label >= 0, label < vocab.count {
+                pieces.append(vocab[label])
+            }
+            previous = label
+        }
+        return pieces.joined().trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }
 
-private struct GigaAMModelInfo: Decodable {
+private struct GigaAMCTCModelInfo: Decodable {
     let numClasses: Int
     let blankID: Int
-    let predHidden: Int
-    let predRnnLayers: Int
-    let encHidden: Int
     let vocabSize: Int
-    let charwise: Bool
+    let languages: [String]
     let melNFFT: Int
     let melWinLength: Int
     let melHopLength: Int
-    let melCenter: Bool
+    let subsamplingFactor: Int
 
     private enum CodingKeys: String, CodingKey {
         case numClasses = "num_classes"
         case blankID = "blank_id"
-        case predHidden = "pred_hidden"
-        case predRnnLayers = "pred_rnn_layers"
-        case encHidden = "enc_hidden"
         case vocabSize = "vocab_size"
-        case charwise
+        case languages
         case melNFFT = "mel_n_fft"
         case melWinLength = "mel_win_length"
         case melHopLength = "mel_hop_length"
-        case melCenter = "mel_center"
+        case subsamplingFactor = "subsampling_factor"
     }
 }
 
-private struct GigaAMConvertInfo: Decodable {
+private struct GigaAMCTCConvertInfo: Decodable {
     let windowSec: Int
     let melFrames: Int
+    let encFrames: Int
 
     private enum CodingKeys: String, CodingKey {
         case windowSec = "window_sec"
         case melFrames = "mel_frames"
+        case encFrames = "enc_frames"
     }
 }
 
-/// Core ML model instances are published once after loading and never mutated.
-/// GigaAMEngine serializes runtime publication and admits one transcription at
-/// a time, so crossing the loader Task boundary cannot create concurrent model
-/// mutation. Keep this invariant if runtime ownership changes.
-private struct GigaAMRuntime: @unchecked Sendable {
-    let encoder: MLModel
-    let decoder: MLModel
-    let joint: MLModel
-    let pieces: [String]
-    let info: GigaAMModelInfo
-    let convert: GigaAMConvertInfo
+/// See GigaAMRuntime for the publication invariant: the model is published
+/// once under the state lock and only one transcription runs at a time.
+private struct GigaAMCTCRuntime: @unchecked Sendable {
+    let model: MLModel
+    let vocab: [String]
+    let info: GigaAMCTCModelInfo
+    let convert: GigaAMCTCConvertInfo
 }
 
-private enum GigaAMConstants {
-    static let supportedLanguage = "ru"
-    static let maxSymbolsPerFrame = 10
+private enum GigaAMCTCConstants {
     static let computeUnits: MLComputeUnits = .cpuAndGPU
     static let windowSamples = 30 * 16000
     static let minNonSilentRMS: Float = 0.005
+    static let packageName = "GigaAMMultilingualCTC.mlpackage"
     /// A tail shorter than one mel window (20 ms) yields no frames; feeding it
     /// to the front-end would abort the whole transcription instead.
     static let minTailSamples = 320
 }
 
-/// A cancellation epoch invalidates work already in flight without poisoning
-/// the next request. Tokens are request-scoped and never reset globally.
-final class GigaAMRequestCancellation: @unchecked Sendable {
-    typealias Token = UInt64
-
-    private let lock = NSLock()
-    private var epoch: Token = 0
-
-    func begin() -> Token {
-        lock.withLock { epoch }
-    }
-
-    func cancelCurrentRequests() {
-        lock.withLock { epoch &+= 1 }
-    }
-
-    func isCurrent(_ token: Token) -> Bool {
-        lock.withLock { epoch == token }
-    }
-
-    func check(_ token: Token) throws {
-        try Task.checkCancellation()
-        guard isCurrent(token) else { throw CancellationError() }
-    }
-}
-
-final class GigaAMEngine: @unchecked Sendable, TranscriberEngine, SampleTranscribing, PreloadableTranscriberEngine, CancelableTranscriberEngine, DownloadReportingTranscriberEngine, LanguageSessionResettable {
+final class GigaAMCTCEngine: @unchecked Sendable, TranscriberEngine, SampleTranscribing, PreloadableTranscriberEngine, CancelableTranscriberEngine, DownloadReportingTranscriberEngine, LanguageSessionResettable {
     private let model: WhisperModel
     private let onProgress: (@Sendable (TranscriberStatus) -> Void)?
     private let stateLock = NSLock()
     private let requestCancellation = GigaAMRequestCancellation()
 
-    private var runtime: GigaAMRuntime?
+    private var runtime: GigaAMCTCRuntime?
     private var isLoading = false
     private var isDownloadInProgress = false
     private var isTranscribing = false
-    private var activeLoadTask: Task<GigaAMRuntime, Error>?
+    private var activeLoadTask: Task<GigaAMCTCRuntime, Error>?
 
     var isCurrentlyDownloading: Bool {
         stateLock.lock()
@@ -141,19 +102,19 @@ final class GigaAMEngine: @unchecked Sendable, TranscriberEngine, SampleTranscri
     }
 
     func cancel() {
-        let loadTask: Task<GigaAMRuntime, Error>?
+        let loadTask: Task<GigaAMCTCRuntime, Error>?
         requestCancellation.cancelCurrentRequests()
         stateLock.lock()
         isDownloadInProgress = false
         loadTask = activeLoadTask
         stateLock.unlock()
         loadTask?.cancel()
-        vlog("GigaAM: cancel requested")
+        vlog("GigaAM CTC: cancel requested")
     }
 
     func resetLanguageSession() {
-        // GigaAM v3 e2e RNNT is Russian-only in this integration path, so there
-        // is no detect-then-latch session state to clear.
+        // The multilingual CTC model transcribes whatever language it hears;
+        // there is no detect-then-latch session state to clear.
     }
 
     func transcribe(audio: AVAudioPCMBuffer, translate: Bool = false, language: String? = nil) async throws -> String {
@@ -179,17 +140,17 @@ final class GigaAMEngine: @unchecked Sendable, TranscriberEngine, SampleTranscri
 
         guard !samples.isEmpty else { throw TranscriberError.recordingTooShort }
         let rms = GigaAMDSP.peakWindowRMS(samples)
-        if rms < GigaAMConstants.minNonSilentRMS {
+        if rms < GigaAMCTCConstants.minNonSilentRMS {
             throw TranscriberError.silentAudio
         }
 
         var allSegments: [WhisperSegment] = []
         var cursor = 0
-        let chunkSize = GigaAMConstants.windowSamples
+        let chunkSize = GigaAMCTCConstants.windowSamples
         while cursor < samples.count {
             try checkCancellation(cancellationToken)
             let end = min(cursor + chunkSize, samples.count)
-            if end - cursor < GigaAMConstants.minTailSamples, !allSegments.isEmpty {
+            if end - cursor < GigaAMCTCConstants.minTailSamples, !allSegments.isEmpty {
                 break
             }
             let chunk = Array(samples[cursor..<end])
@@ -204,7 +165,37 @@ final class GigaAMEngine: @unchecked Sendable, TranscriberEngine, SampleTranscri
         }
 
         let text = allSegments.map(\.text).joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines)
-        return WhisperTranscription(text: text, segments: allSegments, detectedLanguage: text.isEmpty ? nil : GigaAMConstants.supportedLanguage)
+        return WhisperTranscription(
+            text: text,
+            segments: allSegments,
+            detectedLanguage: Self.dominantScriptLanguage(text)
+        )
+    }
+
+    /// Script-based language attribution: the charwise model has no language
+    /// output, but the emitted alphabet identifies the script reliably.
+    /// Central-Asian Cyrillic extensions map to kk/ky/uz ambiguously, so they
+    /// return nil rather than a guess.
+    static func dominantScriptLanguage(_ text: String) -> String? {
+        var latin = 0
+        var cyrillic = 0
+        for scalar in text.unicodeScalars {
+            switch scalar {
+            case "a"..."z":
+                latin += 1
+            case "\u{0456}", "\u{0493}", "\u{049B}", "\u{04A3}", "\u{04AF}",
+                 "\u{04B1}", "\u{04BB}", "\u{04D9}", "\u{04E9}":
+                // і ғ қ ң ү ұ һ ә ө — kk/ky/uz cannot be told apart.
+                return nil
+            case "\u{0430}"..."\u{044F}", "\u{0451}":
+                cyrillic += 1
+            default:
+                break
+            }
+        }
+        if cyrillic > latin { return "ru" }
+        if latin > cyrillic { return "en" }
+        return nil
     }
 
     private func transcribeSingleWindow(
@@ -224,83 +215,71 @@ final class GigaAMEngine: @unchecked Sendable, TranscriberEngine, SampleTranscri
             melWinLength: runtime.info.melWinLength,
             melHopLength: runtime.info.melHopLength,
             melFrames: runtime.convert.melFrames,
-            windowSamples: GigaAMConstants.windowSamples
+            windowSamples: GigaAMCTCConstants.windowSamples
         )
         try checkCancellation(cancellationToken)
 
-        let encodedOut = try await runtime.encoder.prediction(from: MLDictionaryFeatureProvider(dictionary: [
+        let output = try await runtime.model.prediction(from: MLDictionaryFeatureProvider(dictionary: [
             "features": features,
             "length": try GigaAMDSP.makeInt32Array(shape: [1], values: [Int32(trueFrames)])
         ]))
-        guard let encoded = encodedOut.featureValue(for: "encoded")?.multiArrayValue,
-              let encodedLenArray = encodedOut.featureValue(for: "encoded_len")?.multiArrayValue else {
-            throw TranscriberError.whisperKitFailed("GigaAM encoder outputs missing")
+        guard let logProbs = output.featureValue(for: "log_probs")?.multiArrayValue else {
+            throw TranscriberError.whisperKitFailed("GigaAM CTC output missing")
         }
-        let encodedLen = max(0, min(runtime.convert.melFrames / 4 + 1, encodedLenArray.intValue(at: [0])))
-        if encodedLen == 0 {
+
+        // The exporter cannot compute the valid encoder length in fp16, so the
+        // caller derives it with integer math from the true mel frame count.
+        // (trueFrames - 1) / factor + 1 matches the encoder's own output
+        // length, verified empirically across boundary values against the
+        // PyTorch reference.
+        let encLen = max(0, min(
+            runtime.convert.encFrames,
+            (trueFrames - 1) / runtime.info.subsamplingFactor + 1
+        ))
+        if encLen == 0 {
             return WhisperTranscription(text: "", segments: [], detectedLanguage: nil)
         }
 
-        var emitted: [Int] = []
-        var h = [Float](repeating: 0, count: runtime.info.predHidden)
-        var c = [Float](repeating: 0, count: runtime.info.predHidden)
-        var lastToken = runtime.info.blankID
-
-        for frame in 0..<encodedLen {
-            try checkCancellation(cancellationToken)
-            let encT = Self.extractFrame(encoded, frame: frame, hiddenSize: runtime.info.encHidden)
-            for _ in 0..<GigaAMConstants.maxSymbolsPerFrame {
-                let decoderOut = try await runtime.decoder.prediction(from: MLDictionaryFeatureProvider(dictionary: [
-                    "token": try GigaAMDSP.makeInt32Array(shape: [1, 1], values: [Int32(lastToken)]),
-                    "h_in": try GigaAMDSP.makeFloat32Array(shape: [1, 1, runtime.info.predHidden], values: h),
-                    "c_in": try GigaAMDSP.makeFloat32Array(shape: [1, 1, runtime.info.predHidden], values: c)
-                ]))
-                guard let decOut = decoderOut.featureValue(for: "dec_out")?.multiArrayValue,
-                      let hOut = decoderOut.featureValue(for: "h_out")?.multiArrayValue,
-                      let cOut = decoderOut.featureValue(for: "c_out")?.multiArrayValue else {
-                    throw TranscriberError.whisperKitFailed("GigaAM decoder outputs missing")
+        var frameLabels: [Int] = []
+        frameLabels.reserveCapacity(encLen)
+        for frame in 0..<encLen {
+            var bestIndex = 0
+            var bestValue = -Float.infinity
+            for cls in 0..<runtime.info.numClasses {
+                let value = logProbs.float(at: [0, frame, cls])
+                if value > bestValue {
+                    bestValue = value
+                    bestIndex = cls
                 }
-                let decT = Self.extractVector(decOut, count: runtime.info.predHidden)
-
-                let jointOut = try await runtime.joint.prediction(from: MLDictionaryFeatureProvider(dictionary: [
-                    "enc_t": try GigaAMDSP.makeFloat32Array(shape: [1, runtime.info.encHidden], values: encT),
-                    "dec_t": try GigaAMDSP.makeFloat32Array(shape: [1, runtime.info.predHidden], values: decT)
-                ]))
-                guard let logits = jointOut.featureValue(for: "logits")?.multiArrayValue else {
-                    throw TranscriberError.whisperKitFailed("GigaAM joint outputs missing")
-                }
-                let nextToken = Self.argmax(logits, count: runtime.info.numClasses)
-                if nextToken == runtime.info.blankID {
-                    break
-                }
-                emitted.append(nextToken)
-                h = Self.extractVector(hOut, count: runtime.info.predHidden)
-                c = Self.extractVector(cOut, count: runtime.info.predHidden)
-                lastToken = nextToken
             }
+            frameLabels.append(bestIndex)
         }
 
-        let rawText = GigaAMTokenDecoder.decode(tokenIDs: emitted, pieces: runtime.pieces)
-        let text = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
+        let text = GigaAMCTCDecoder.decode(
+            frameLabels: frameLabels,
+            vocab: runtime.vocab,
+            blankID: runtime.info.blankID
+        )
         guard !text.isEmpty, !Transcriber.isHallucinationText(text) else {
             return WhisperTranscription(text: "", segments: [], detectedLanguage: nil)
         }
         let segment = WhisperSegment(start: offsetSec, end: offsetSec + durationSec, text: text)
-        return WhisperTranscription(text: text, segments: [segment], detectedLanguage: GigaAMConstants.supportedLanguage)
+        return WhisperTranscription(text: text, segments: [segment], detectedLanguage: nil)
     }
 
     private func validateRequest(translate: Bool, language: String?) throws {
-        if translate {
-            throw TranscriberError.notAvailable
-        }
-        if let language, !language.isEmpty, language.lowercased() != GigaAMConstants.supportedLanguage {
+        let normalizedLanguage = (language?.isEmpty == true) ? nil : language
+        if model.requestValidationError(
+            translateToEnglish: translate,
+            language: normalizedLanguage
+        ) != nil {
             throw TranscriberError.notAvailable
         }
     }
 
     private func ensureRuntimeLoaded(
         cancellationToken: GigaAMRequestCancellation.Token
-    ) async throws -> GigaAMRuntime {
+    ) async throws -> GigaAMCTCRuntime {
         try GigaAMPlatformReadiness.requireSupported()
         try checkCancellation(cancellationToken)
         if let runtime = currentRuntime() { return runtime }
@@ -350,7 +329,7 @@ final class GigaAMEngine: @unchecked Sendable, TranscriberEngine, SampleTranscri
         return runtime
     }
 
-    private func currentRuntime() -> GigaAMRuntime? {
+    private func currentRuntime() -> GigaAMCTCRuntime? {
         stateLock.lock()
         defer { stateLock.unlock() }
         return runtime
@@ -371,7 +350,7 @@ final class GigaAMEngine: @unchecked Sendable, TranscriberEngine, SampleTranscri
     }
 
     private func setActiveLoadTask(
-        _ task: Task<GigaAMRuntime, Error>,
+        _ task: Task<GigaAMCTCRuntime, Error>,
         cancellationToken: GigaAMRequestCancellation.Token
     ) {
         stateLock.lock()
@@ -381,7 +360,7 @@ final class GigaAMEngine: @unchecked Sendable, TranscriberEngine, SampleTranscri
     }
 
     private func finishLoading(
-        _ runtime: GigaAMRuntime?,
+        _ runtime: GigaAMCTCRuntime?,
         cancellationToken: GigaAMRequestCancellation.Token
     ) {
         let mayPublish = requestCancellation.isCurrent(cancellationToken)
@@ -416,9 +395,9 @@ final class GigaAMEngine: @unchecked Sendable, TranscriberEngine, SampleTranscri
     private static func loadRuntime(
         model: WhisperModel,
         onProgress: (@Sendable (TranscriberStatus) -> Void)?,
-        engine: GigaAMEngine,
+        engine: GigaAMCTCEngine,
         cancellationToken: GigaAMRequestCancellation.Token
-    ) async throws -> GigaAMRuntime {
+    ) async throws -> GigaAMCTCRuntime {
         try GigaAMPlatformReadiness.requireSupported()
         try engine.checkCancellation(cancellationToken)
 
@@ -432,9 +411,17 @@ final class GigaAMEngine: @unchecked Sendable, TranscriberEngine, SampleTranscri
         defer { withExtendedLifetime(interprocessLock) {} }
         try engine.checkCancellation(cancellationToken)
         try fileSystem.createPrivateDirectory(at: sourceRoot)
-        let preflightCompiledCacheReady = GigaAMCompiledCache.isReady(compiledRoot: compiledRoot)
+        let preflightCompiledCacheReady = GigaAMCompiledCache.isReady(
+            compiledRoot: compiledRoot,
+            policy: .multilingualCTC
+        )
 
-        let downloader = GigaAMAssetDownloader(fileSystem: fileSystem)
+        let downloader = GigaAMAssetDownloader(
+            assets: GigaAMMultilingualAssetCatalog.assets,
+            revision: GigaAMMultilingualAssetCatalog.revision,
+            fileSystem: fileSystem,
+            resolveURL: { GigaAMMultilingualAssetCatalog.resolveURL(for: $0) }
+        )
         let installResult: GigaAMAssetInstallResult
         engine.setDownloading(true)
         do {
@@ -442,7 +429,7 @@ final class GigaAMEngine: @unchecked Sendable, TranscriberEngine, SampleTranscri
                 in: sourceRoot,
                 additionalRequiredBytes: preflightCompiledCacheReady
                     ? 0
-                    : GigaAMAssetCatalog.totalExpectedByteCount
+                    : GigaAMMultilingualAssetCatalog.totalExpectedByteCount
             ) { completed, total in
                 let progress = total > 0 ? Double(completed) / Double(total) : 1
                 onProgress?(.downloadingModel(progress: min(0.95, progress)))
@@ -456,8 +443,10 @@ final class GigaAMEngine: @unchecked Sendable, TranscriberEngine, SampleTranscri
         try GigaAMSecureStorage.hardenTree(at: sourceRoot)
 
         _ = installResult
-        let compiledCacheWasReady = GigaAMCompiledCache.isReady(compiledRoot: compiledRoot)
-        let mustRebuildCompiledCache = !compiledCacheWasReady
+        // ensureAssets never touches compiledRoot and the interprocess lock is
+        // held throughout, so the preflight answer is still valid — re-hashing
+        // the ~440 MB compiled tree here would add seconds for no information.
+        let mustRebuildCompiledCache = !preflightCompiledCacheReady
 
         if mustRebuildCompiledCache {
             if FileManager.default.fileExists(atPath: compiledRoot.path)
@@ -469,97 +458,35 @@ final class GigaAMEngine: @unchecked Sendable, TranscriberEngine, SampleTranscri
         onProgress?(.loadingModel)
 
         let decoder = JSONDecoder()
-        let pieces = try decoder.decode([String].self, from: Data(contentsOf: sourceRoot.appendingPathComponent("tokens.json")))
-        let info = try decoder.decode(GigaAMModelInfo.self, from: Data(contentsOf: sourceRoot.appendingPathComponent("model_info.json")))
-        let convert = try decoder.decode(GigaAMConvertInfo.self, from: Data(contentsOf: sourceRoot.appendingPathComponent("convert_info.json")))
+        let vocab = try decoder.decode([String].self, from: Data(contentsOf: sourceRoot.appendingPathComponent("tokens.json")))
+        let info = try decoder.decode(GigaAMCTCModelInfo.self, from: Data(contentsOf: sourceRoot.appendingPathComponent("model_info.json")))
+        let convert = try decoder.decode(GigaAMCTCConvertInfo.self, from: Data(contentsOf: sourceRoot.appendingPathComponent("convert_info.json")))
+        guard vocab.count == info.vocabSize, info.blankID == info.numClasses - 1 else {
+            throw GigaAMAssetDownloadError.insecureTopology(sourceRoot.path)
+        }
 
         let config = MLModelConfiguration()
-        config.computeUnits = GigaAMConstants.computeUnits
-        let encoderModel = try loadCompiledModel(
-            packageURL: sourceRoot.appendingPathComponent("GigaAMv3Encoder.mlpackage"),
-            compiledRoot: compiledRoot,
-            configuration: config,
-            allowCompilation: mustRebuildCompiledCache
-        )
-        let decoderModel = try loadCompiledModel(
-            packageURL: sourceRoot.appendingPathComponent("GigaAMv3DecoderStep.mlpackage"),
-            compiledRoot: compiledRoot,
-            configuration: config,
-            allowCompilation: mustRebuildCompiledCache
-        )
-        let jointModel = try loadCompiledModel(
-            packageURL: sourceRoot.appendingPathComponent("GigaAMv3JointStep.mlpackage"),
-            compiledRoot: compiledRoot,
-            configuration: config,
-            allowCompilation: mustRebuildCompiledCache
-        )
-        try engine.checkCancellation(cancellationToken)
-        if mustRebuildCompiledCache {
-            try GigaAMCompiledCache.seal(compiledRoot: compiledRoot)
-        }
-        guard GigaAMCompiledCache.isReady(compiledRoot: compiledRoot) else {
-            throw GigaAMAssetDownloadError.insecureTopology(compiledRoot.path)
-        }
-        return GigaAMRuntime(
-            encoder: encoderModel,
-            decoder: decoderModel,
-            joint: jointModel,
-            pieces: pieces,
-            info: info,
-            convert: convert
-        )
-    }
-
-    private static func loadCompiledModel(
-        packageURL: URL,
-        compiledRoot: URL,
-        configuration: MLModelConfiguration,
-        allowCompilation: Bool
-    ) throws -> MLModel {
-        try FileManager.default.createDirectory(at: compiledRoot, withIntermediateDirectories: true)
-        let compiledURL = compiledRoot.appendingPathComponent(
-            packageURL.deletingPathExtension().lastPathComponent + ".mlmodelc"
-        )
+        config.computeUnits = GigaAMCTCConstants.computeUnits
+        let compiledURL = compiledRoot.appendingPathComponent("GigaAMMultilingualCTC.mlmodelc")
         if !FileManager.default.fileExists(atPath: compiledURL.path) {
-            guard allowCompilation else {
+            guard mustRebuildCompiledCache else {
                 throw GigaAMAssetDownloadError.insecureTopology(compiledURL.path)
             }
-            let temporaryCompiledURL = try MLModel.compileModel(at: packageURL)
+            let temporaryCompiledURL = try await MLModel.compileModel(
+                at: sourceRoot.appendingPathComponent(GigaAMCTCConstants.packageName)
+            )
             if FileManager.default.fileExists(atPath: compiledURL.path) {
                 try? FileManager.default.removeItem(at: compiledURL)
             }
             try FileManager.default.moveItem(at: temporaryCompiledURL, to: compiledURL)
         }
-        return try MLModel(contentsOf: compiledURL, configuration: configuration)
-    }
-
-    private static func extractFrame(_ encoded: MLMultiArray, frame: Int, hiddenSize: Int) -> [Float] {
-        (0..<hiddenSize).map { encoded.float(at: [0, $0, frame]) }
-    }
-
-    private static func extractVector(_ array: MLMultiArray, count: Int) -> [Float] {
-        if array.shape.count == 2 {
-            return (0..<count).map { array.float(at: [0, $0]) }
+        let mlModel = try MLModel(contentsOf: compiledURL, configuration: config)
+        try engine.checkCancellation(cancellationToken)
+        if mustRebuildCompiledCache {
+            // seal validates the fresh tree internally; the preflight already
+            // validated the reused one.
+            try GigaAMCompiledCache.seal(compiledRoot: compiledRoot, policy: .multilingualCTC)
         }
-        return (0..<count).map { array.float(at: [0, 0, $0]) }
+        return GigaAMCTCRuntime(model: mlModel, vocab: vocab, info: info, convert: convert)
     }
-
-    private static func argmax(_ logits: MLMultiArray, count: Int) -> Int {
-        var bestIndex = 0
-        var bestValue = -Float.infinity
-        for i in 0..<count {
-            let value: Float
-            if logits.shape.count == 2 {
-                value = logits.float(at: [0, i])
-            } else {
-                value = logits.float(at: [0, 0, i])
-            }
-            if value > bestValue {
-                bestValue = value
-                bestIndex = i
-            }
-        }
-        return bestIndex
-    }
-
 }

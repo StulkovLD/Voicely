@@ -321,17 +321,16 @@ struct GigaAMCompiledCacheMarker: Codable, Equatable {
     let compiledTreeSHA256: String
 }
 
-enum GigaAMCompiledCache {
-    static let markerName = ".validated-cache-manifest.json"
-    static let expectedPackageNames: Set<String> = [
-        "GigaAMv3Encoder.mlmodelc",
-        "GigaAMv3DecoderStep.mlmodelc",
-        "GigaAMv3JointStep.mlmodelc",
-    ]
+/// Identifies one model's source manifest and expected compiled artifacts.
+/// The v3 policy is the default everywhere to keep existing call sites and
+/// fixtures unchanged.
+struct GigaAMCompiledCachePolicy: Sendable {
+    let expectedPackageNames: Set<String>
+    let sourceManifestSHA256: String
 
-    static var sourceManifestSHA256: String {
-        var lines = ["revision|\(GigaAMAssetCatalog.revision)"]
-        lines.append(contentsOf: GigaAMAssetCatalog.assets.map {
+    static func manifestSHA256(revision: String, assets: [GigaAMAssetDescriptor]) -> String {
+        var lines = ["revision|\(revision)"]
+        lines.append(contentsOf: assets.map {
             "\($0.relativePath)|\($0.expectedByteCount)|\($0.expectedSHA256.lowercased())"
         })
         return SHA256.hash(data: Data(lines.joined(separator: "\n").utf8))
@@ -339,11 +338,42 @@ enum GigaAMCompiledCache {
             .joined()
     }
 
-    static func isReady(compiledRoot: URL) -> Bool {
-        (try? requireReady(compiledRoot: compiledRoot)) != nil
+    static let v3 = GigaAMCompiledCachePolicy(
+        expectedPackageNames: [
+            "GigaAMv3Encoder.mlmodelc",
+            "GigaAMv3DecoderStep.mlmodelc",
+            "GigaAMv3JointStep.mlmodelc",
+        ],
+        sourceManifestSHA256: manifestSHA256(
+            revision: GigaAMAssetCatalog.revision,
+            assets: GigaAMAssetCatalog.assets
+        )
+    )
+
+    static let multilingualCTC = GigaAMCompiledCachePolicy(
+        expectedPackageNames: ["GigaAMMultilingualCTC.mlmodelc"],
+        sourceManifestSHA256: manifestSHA256(
+            revision: GigaAMMultilingualAssetCatalog.revision,
+            assets: GigaAMMultilingualAssetCatalog.assets
+        )
+    )
+}
+
+enum GigaAMCompiledCache {
+    static let markerName = ".validated-cache-manifest.json"
+    static var expectedPackageNames: Set<String> {
+        GigaAMCompiledCachePolicy.v3.expectedPackageNames
     }
 
-    static func seal(compiledRoot: URL) throws {
+    static var sourceManifestSHA256: String {
+        GigaAMCompiledCachePolicy.v3.sourceManifestSHA256
+    }
+
+    static func isReady(compiledRoot: URL, policy: GigaAMCompiledCachePolicy = .v3) -> Bool {
+        (try? requireReady(compiledRoot: compiledRoot, policy: policy)) != nil
+    }
+
+    static func seal(compiledRoot: URL, policy: GigaAMCompiledCachePolicy = .v3) throws {
         try GigaAMSecureStorage.hardenTree(at: compiledRoot)
         let markerURL = compiledRoot.appendingPathComponent(markerName)
         if FileManager.default.fileExists(atPath: markerURL.path) {
@@ -352,7 +382,7 @@ enum GigaAMCompiledCache {
         }
         let marker = GigaAMCompiledCacheMarker(
             schemaVersion: 1,
-            sourceManifestSHA256: sourceManifestSHA256,
+            sourceManifestSHA256: policy.sourceManifestSHA256,
             compiledTreeSHA256: try compiledTreeSHA256(compiledRoot: compiledRoot)
         )
         let encoder = JSONEncoder()
@@ -361,20 +391,23 @@ enum GigaAMCompiledCache {
             encoder.encode(marker),
             to: markerURL
         )
-        try requireReady(compiledRoot: compiledRoot)
+        try requireReady(compiledRoot: compiledRoot, policy: policy)
     }
 
-    private static func requireReady(compiledRoot: URL) throws {
+    private static func requireReady(
+        compiledRoot: URL,
+        policy: GigaAMCompiledCachePolicy
+    ) throws {
         try GigaAMSecureStorage.requireDirectory(compiledRoot)
         let children = try FileManager.default.contentsOfDirectory(
             at: compiledRoot,
             includingPropertiesForKeys: nil,
             options: []
         )
-        guard Set(children.map(\.lastPathComponent)) == expectedPackageNames.union([markerName]) else {
+        guard Set(children.map(\.lastPathComponent)) == policy.expectedPackageNames.union([markerName]) else {
             throw GigaAMAssetDownloadError.insecureTopology(compiledRoot.path)
         }
-        for packageName in expectedPackageNames {
+        for packageName in policy.expectedPackageNames {
             try GigaAMSecureStorage.requireDirectory(compiledRoot.appendingPathComponent(packageName))
         }
         let markerURL = compiledRoot.appendingPathComponent(markerName)
@@ -384,7 +417,7 @@ enum GigaAMCompiledCache {
             from: Data(contentsOf: markerURL)
         )
         guard marker.schemaVersion == 1,
-              marker.sourceManifestSHA256 == sourceManifestSHA256,
+              marker.sourceManifestSHA256 == policy.sourceManifestSHA256,
               marker.compiledTreeSHA256 == (try compiledTreeSHA256(compiledRoot: compiledRoot)) else {
             throw GigaAMAssetDownloadError.insecureTopology(markerURL.path)
         }

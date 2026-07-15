@@ -7,6 +7,7 @@ final class WhisperModelCatalogTests: XCTestCase {
             WhisperModel.all.map(\.variant),
             [
                 "gigaam-v3-e2e-rnnt",
+                "gigaam-multilingual-ctc",
                 "large-v3-v20240930_turbo_632MB",
                 "large-v3_turbo",
                 "medium",
@@ -17,15 +18,15 @@ final class WhisperModelCatalogTests: XCTestCase {
     func testAvailabilityFollowsRAMThresholds() {
         XCTAssertEqual(
             WhisperModel.available(forSystemRAMGB: 8).map(\.variant),
-            ["gigaam-v3-e2e-rnnt", "large-v3-v20240930_turbo_632MB"]
+            ["gigaam-v3-e2e-rnnt", "gigaam-multilingual-ctc", "large-v3-v20240930_turbo_632MB"]
         )
         XCTAssertEqual(
             WhisperModel.available(forSystemRAMGB: 16).map(\.variant),
-            ["gigaam-v3-e2e-rnnt", "large-v3-v20240930_turbo_632MB", "medium"]
+            ["gigaam-v3-e2e-rnnt", "gigaam-multilingual-ctc", "large-v3-v20240930_turbo_632MB", "medium"]
         )
         XCTAssertEqual(
             WhisperModel.available(forSystemRAMGB: 24).map(\.variant),
-            ["gigaam-v3-e2e-rnnt", "large-v3-v20240930_turbo_632MB", "large-v3_turbo", "medium"]
+            ["gigaam-v3-e2e-rnnt", "gigaam-multilingual-ctc", "large-v3-v20240930_turbo_632MB", "large-v3_turbo", "medium"]
         )
     }
 
@@ -75,5 +76,29 @@ final class WhisperModelCatalogTests: XCTestCase {
         XCTAssertTrue(whisper.capabilities.supportsTranslationToEnglish)
         XCTAssertNil(whisper.requestValidationError(translateToEnglish: true, language: nil))
         XCTAssertNil(whisper.requestValidationError(translateToEnglish: false, language: "en"))
+
+        let multilingual = try XCTUnwrap(
+            WhisperModel.all.first { $0.backend == .gigaAMMultilingualCTC }
+        )
+        XCTAssertEqual(multilingual.capabilities.supportedLanguages, ["ru", "en", "kk", "ky", "uz"])
+        XCTAssertTrue(multilingual.capabilities.supportsLanguageDetection)
+        XCTAssertFalse(multilingual.capabilities.supportsTranslationToEnglish)
+        XCTAssertEqual(multilingual.capabilities.minimumMacOSMajorVersion, 15)
+        XCTAssertNotNil(multilingual.requestValidationError(translateToEnglish: true, language: nil))
+        XCTAssertNotNil(multilingual.requestValidationError(translateToEnglish: false, language: "de"))
+        XCTAssertNil(multilingual.requestValidationError(translateToEnglish: false, language: "en"))
+        XCTAssertNil(multilingual.requestValidationError(translateToEnglish: false, language: "ru"))
+        XCTAssertNil(multilingual.requestValidationError(translateToEnglish: false, language: nil))
+    }
+
+    func testMultilingualLabelStatesItsCapabilityBoundary() throws {
+        let model = try XCTUnwrap(
+            WhisperModel.all.first { $0.variant == "gigaam-multilingual-ctc" }
+        )
+        XCTAssertEqual(model.ramRequirementLabel, "8 GB RAM")
+        let label = model.userFacingLabel(isRecommended: false)
+        XCTAssertTrue(label.contains("RU/EN/KK/KY/UZ"))
+        XCTAssertTrue(label.contains("lowercase"))
+        XCTAssertTrue(label.contains("macOS 15+"))
     }
 }
