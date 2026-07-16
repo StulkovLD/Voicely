@@ -11,7 +11,7 @@ struct GigaAMMultilingualAssetCatalog {
     /// Sber CDN, as pinned by the gigaam package (_MODEL_HASHES).
     static let upstreamCheckpointMD5 = "5379d887c53ccd9cb95981e2a1832720"
 
-    static let repository = "StulkovLD/gigaam-multilingual-ctc-coreml"
+    static let repository = "voicely/gigaam-multilingual-ctc-coreml"
     static let revision = "ab9175850971b212640fd4b2404feacb658219f5"
 
     static let assets: [GigaAMAssetDescriptor] = [
