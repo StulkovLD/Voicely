@@ -160,10 +160,14 @@ private extension CGRect {
 
 @MainActor
 final class Overlay {
+    // .canJoinAllSpaces and .moveToActiveSpace are mutually exclusive; macOS 26
+    // raises NSInternalInconsistencyException when both are set, which crashed
+    // the overlay panel on first creation and froze launch at "Preparing".
+    // The pill must appear on whatever space the user is on, including
+    // fullscreen apps, so keep canJoinAllSpaces + fullScreenAuxiliary.
     nonisolated static let panelCollectionBehavior: NSWindow.CollectionBehavior = [
         .canJoinAllSpaces,
         .fullScreenAuxiliary,
-        .moveToActiveSpace,
     ]
 
     private var panel: NSPanel?
@@ -674,20 +678,39 @@ final class Overlay {
         errorTextLayer?.contentsScale = scale
     }
 
-    private func focusedElementRect() -> CGRect? {
+    // AXUIElementCopyAttributeValue is a synchronous cross-process call to the
+    // focused app's accessibility server. Without a messaging timeout it blocks
+    // the main thread until that app replies — an unresponsive or slow-to-answer
+    // frontmost app (some Electron/heavy apps) froze Voicely at launch when the
+    // overlay tried to place itself. Cap every AX query so it fails fast and the
+    // overlay falls back to the main screen instead of hanging.
+    private static let axMessagingTimeout: Float = 0.25
+
+    private func systemWideElementWithTimeout() -> AXUIElement {
         let systemWide = AXUIElementCreateSystemWide()
+        AXUIElementSetMessagingTimeout(systemWide, Self.axMessagingTimeout)
+        return systemWide
+    }
+
+    private func focusedElementRect() -> CGRect? {
+        let systemWide = systemWideElementWithTimeout()
         guard let focusedElement = axElement(from: systemWide, attribute: kAXFocusedUIElementAttribute as CFString) else {
             return nil
         }
+        AXUIElementSetMessagingTimeout(focusedElement, Self.axMessagingTimeout)
         return axFrame(of: focusedElement)
     }
 
     private func focusedWindowRect() -> CGRect? {
-        let systemWide = AXUIElementCreateSystemWide()
-        guard let focusedApplication = axElement(from: systemWide, attribute: kAXFocusedApplicationAttribute as CFString),
-              let focusedWindow = axElement(from: focusedApplication, attribute: kAXFocusedWindowAttribute as CFString) else {
+        let systemWide = systemWideElementWithTimeout()
+        guard let focusedApplication = axElement(from: systemWide, attribute: kAXFocusedApplicationAttribute as CFString) else {
             return nil
         }
+        AXUIElementSetMessagingTimeout(focusedApplication, Self.axMessagingTimeout)
+        guard let focusedWindow = axElement(from: focusedApplication, attribute: kAXFocusedWindowAttribute as CFString) else {
+            return nil
+        }
+        AXUIElementSetMessagingTimeout(focusedWindow, Self.axMessagingTimeout)
         return axFrame(of: focusedWindow)
     }
 

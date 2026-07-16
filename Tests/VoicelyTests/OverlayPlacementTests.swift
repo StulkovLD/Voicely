@@ -98,7 +98,10 @@ final class OverlayPlacementTests: XCTestCase {
 
         XCTAssertTrue(behavior.contains(.canJoinAllSpaces))
         XCTAssertTrue(behavior.contains(.fullScreenAuxiliary))
-        XCTAssertTrue(behavior.contains(.moveToActiveSpace))
+        // .moveToActiveSpace is mutually exclusive with .canJoinAllSpaces;
+        // macOS 26 raises an exception if both are set. canJoinAllSpaces
+        // already puts the pill on the user's current space.
+        XCTAssertFalse(behavior.contains(.moveToActiveSpace))
         XCTAssertFalse(behavior.contains(.stationary))
     }
 
