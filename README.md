@@ -29,25 +29,22 @@
 
 ## Install
 
-To download and verify the current community DMG:
+One command — download, verify, install, launch:
 
 ```bash
 curl -fsSL https://voicely.art/install.sh | sh
 ```
 
 The current public build is ad-hoc signed and is not notarized by Apple. The
-helper verifies the DMG SHA-256 and the app's ad-hoc code integrity in a private
-staging directory, applies and verifies macOS quarantine, saves the versioned
-DMG in `~/Downloads`, and opens the exact verified read-only volume in Finder.
-It does not bypass Gatekeeper, copy the app, launch it, or run setup.
+installer verifies the DMG SHA-256 and the app's ad-hoc code integrity in a
+private staging directory, then installs transactionally: the new bundle is
+staged and re-verified, the previous version is kept as a backup until the new
+one passes every gate, and a failure at any point rolls back cleanly.
+Re-running updates in place and keeps your transcripts, model & settings.
 
-Drag `Voicely.app` to **Applications** yourself. If macOS blocks the first open,
-go to **System Settings → Privacy & Security**, review the warning, and choose
-**Open Anyway** only if you trust this community build. A future Developer ID +
-notarized release can use the automatic transactional install path.
-
-Ad-hoc code identity can change between releases, so macOS may ask you to grant
-Microphone, Accessibility, or Screen Recording again after an update.
+Ad-hoc code identity changes between releases, so the installer resets this
+app's permission grants for a clean re-prompt: expect macOS to ask for
+Microphone and Accessibility again after an update.
 
 **What happens on first launch**
 1. Look for the Voicely menu-bar icon.
