@@ -218,11 +218,16 @@ final class Overlay {
     }
 
     init() {
+        // Task { @MainActor } instead of MainActor.assumeIsolated: the
+        // notification block runs outside any Swift concurrency context, and
+        // the runtime's executor check inside assumeIsolated dereferences
+        // garbage there (SIGSEGV on macOS 26). Enqueueing a real task hops to
+        // the main actor without that check.
         screenObserver = NotificationCenter.default.addObserver(
             forName: NSApplication.didChangeScreenParametersNotification,
             object: nil, queue: .main
         ) { [weak self] _ in
-            MainActor.assumeIsolated {
+            Task { @MainActor in
                 self?.repositionToTargetSurface()
             }
         }
@@ -731,8 +736,10 @@ final class Overlay {
         tick = 0
         let t = DispatchSource.makeTimerSource(queue: .main)
         t.schedule(deadline: .now(), repeating: 1.0 / 30.0)
+        // See screenObserver: dispatch handlers run outside Swift concurrency,
+        // where assumeIsolated's executor check crashes on macOS 26.
         t.setEventHandler { [weak self] in
-            MainActor.assumeIsolated {
+            Task { @MainActor in
                 self?.animationTick()
             }
         }

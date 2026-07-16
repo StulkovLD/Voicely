@@ -34,7 +34,7 @@ struct Voicely: AsyncParsableCommand {
 /// Single source of truth for the CLI's reported version. Kept here so `voicely
 /// --version` and `voicely status` agree.
 enum VoicelyCLIVersion {
-    static let current = "1.0.5"
+    static let current = "1.0.6"
 }
 
 // MARK: - stderr / stdout helpers

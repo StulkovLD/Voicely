@@ -3,7 +3,7 @@ import Quartz
 
 // MARK: - Hotkey Combo
 
-struct HotkeyCombo: Equatable, Codable {
+struct HotkeyCombo: Equatable, Codable, Sendable {
     let keyCode: Int64
     let modifiers: UInt64
 

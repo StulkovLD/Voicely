@@ -2414,15 +2414,23 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         field.alignment = .center
         alert.accessoryView = field
 
-        var captured: HotkeyCombo?
-        let monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+        // The monitor block runs inside AppKit's modal event dispatch, outside
+        // any Swift concurrency context. An isolation-inheriting closure gets a
+        // runtime executor check there, which crashes on macOS 26 — keep the
+        // block @Sendable (no MainActor state) and defer the UI write.
+        let capturedBox = RecordedHotkeyBox()
+        let fieldRef = field
+        let monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { @Sendable event in
             // Let unmodified Escape pass through so user can cancel the dialog
             if event.keyCode == 53 && event.modifierFlags.intersection([.command, .option, .shift, .control]).isEmpty {
                 return event
             }
             let flags = HotkeyCombo.cgEventFlags(from: event.modifierFlags)
-            captured = HotkeyCombo(keyCode: Int64(event.keyCode), modifiers: flags)
-            field.stringValue = captured!.displayName
+            let combo = HotkeyCombo(keyCode: Int64(event.keyCode), modifiers: flags)
+            capturedBox.set(combo)
+            Task { @MainActor in
+                fieldRef.stringValue = combo.displayName
+            }
             return nil
         }
 
@@ -2433,7 +2441,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             NSEvent.removeMonitor(monitor)
         }
 
-        if response == .alertSecondButtonReturn, let combo = captured {
+        if response == .alertSecondButtonReturn, let combo = capturedBox.current {
             // Require at least one modifier to prevent consuming plain keypresses system-wide
             let comboFlags = CGEventFlags(rawValue: combo.modifiers)
             let hasModifier = comboFlags.contains(.maskControl) || comboFlags.contains(.maskAlternate)
@@ -3632,8 +3640,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         guard fileQueueTweenTimer == nil else { return }
         let t = DispatchSource.makeTimerSource(queue: .main)
         t.schedule(deadline: .now(), repeating: 1.0 / 30.0)
+        // Dispatch handlers run outside Swift concurrency; assumeIsolated's
+        // executor check crashes there on macOS 26 (see Overlay.swift).
         t.setEventHandler { [weak self] in
-            MainActor.assumeIsolated { self?.fileQueueTweenTick() }
+            Task { @MainActor in self?.fileQueueTweenTick() }
         }
         t.resume()
         fileQueueTweenTimer = t
@@ -3690,5 +3700,20 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             let request = UNNotificationRequest(identifier: identifier, content: content, trigger: nil)
             center.add(request)
         }
+    }
+}
+
+/// Thread-safe capture cell for the hotkey-recording event monitor: the
+/// monitor block is @Sendable and may not touch MainActor state directly.
+private final class RecordedHotkeyBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: HotkeyCombo?
+
+    func set(_ combo: HotkeyCombo) {
+        lock.withLock { value = combo }
+    }
+
+    var current: HotkeyCombo? {
+        lock.withLock { value }
     }
 }
