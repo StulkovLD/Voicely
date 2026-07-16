@@ -440,7 +440,19 @@ enum GigaAMCompiledCache {
 protocol GigaAMAssetTransport: Sendable {
     /// Stream `url` to the on-disk staging destination. The destination is never
     /// a live model path; validation and the final atomic rename happen later.
-    func download(from url: URL, to stagingURL: URL) async throws
+    /// `onBytes(written, expected)` reports byte progress during the transfer
+    /// (expected may be -1 if the server omits Content-Length).
+    func download(
+        from url: URL,
+        to stagingURL: URL,
+        onBytes: @Sendable @escaping (Int64, Int64) -> Void
+    ) async throws
+}
+
+extension GigaAMAssetTransport {
+    func download(from url: URL, to stagingURL: URL) async throws {
+        try await download(from: url, to: stagingURL, onBytes: { _, _ in })
+    }
 }
 
 protocol GigaAMAssetFileSystem: Sendable {
@@ -534,21 +546,111 @@ struct FoundationGigaAMAssetFileSystem: @unchecked Sendable, GigaAMAssetFileSyst
     }
 }
 
-struct URLSessionGigaAMAssetTransport: GigaAMAssetTransport {
-    func download(from url: URL, to stagingURL: URL) async throws {
-        let (temporaryURL, response) = try await URLSession.shared.download(from: url)
-        defer { try? FileManager.default.removeItem(at: temporaryURL) }
-        try Task.checkCancellation()
+/// URLSessionDownloadDelegate that streams byte progress and moves the finished
+/// temp file into staging synchronously (the temp URL is deleted once the
+/// delegate callback returns), bridging the task to async via a continuation.
+private final class GigaAMDownloadDelegate: NSObject, URLSessionDownloadDelegate, @unchecked Sendable {
+    private let stagingURL: URL
+    private let onBytes: @Sendable (Int64, Int64) -> Void
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<Void, Error>?
+    private var moveError: Error?
+    private var moved = false
 
-        guard let httpResponse = response as? HTTPURLResponse,
-              (200..<300).contains(httpResponse.statusCode) else {
-            throw URLError(.badServerResponse)
-        }
-        if FileManager.default.fileExists(atPath: stagingURL.path) {
-            try FileManager.default.removeItem(at: stagingURL)
-        }
-        try FileManager.default.moveItem(at: temporaryURL, to: stagingURL)
+    init(stagingURL: URL, onBytes: @escaping @Sendable (Int64, Int64) -> Void) {
+        self.stagingURL = stagingURL
+        self.onBytes = onBytes
     }
+
+    func setContinuation(_ c: CheckedContinuation<Void, Error>) {
+        lock.withLock { continuation = c }
+    }
+
+    private func finish(_ result: Result<Void, Error>) {
+        let c: CheckedContinuation<Void, Error>? = lock.withLock {
+            let taken = continuation
+            continuation = nil
+            return taken
+        }
+        c?.resume(with: result)
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        downloadTask: URLSessionDownloadTask,
+        didWriteData bytesWritten: Int64,
+        totalBytesWritten: Int64,
+        totalBytesExpectedToWrite: Int64
+    ) {
+        onBytes(totalBytesWritten, totalBytesExpectedToWrite)
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        downloadTask: URLSessionDownloadTask,
+        didFinishDownloadingTo location: URL
+    ) {
+        // Validate the HTTP status and move synchronously before returning.
+        if let http = downloadTask.response as? HTTPURLResponse,
+           !(200..<300).contains(http.statusCode) {
+            lock.withLock { moveError = URLError(.badServerResponse) }
+            return
+        }
+        do {
+            if FileManager.default.fileExists(atPath: stagingURL.path) {
+                try FileManager.default.removeItem(at: stagingURL)
+            }
+            try FileManager.default.moveItem(at: location, to: stagingURL)
+            lock.withLock { moved = true }
+        } catch {
+            lock.withLock { moveError = error }
+        }
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        didCompleteWithError error: Error?
+    ) {
+        if let error {
+            finish(.failure(error))
+            return
+        }
+        let (didMove, err): (Bool, Error?) = lock.withLock { (moved, moveError) }
+        if let err { finish(.failure(err)) }
+        else if didMove { finish(.success(())) }
+        else { finish(.failure(URLError(.cannotWriteToFile))) }
+    }
+}
+
+struct URLSessionGigaAMAssetTransport: GigaAMAssetTransport {
+    func download(
+        from url: URL,
+        to stagingURL: URL,
+        onBytes: @Sendable @escaping (Int64, Int64) -> Void
+    ) async throws {
+        let delegate = GigaAMDownloadDelegate(stagingURL: stagingURL, onBytes: onBytes)
+        let session = URLSession(configuration: .default, delegate: delegate, delegateQueue: nil)
+        defer { session.finishTasksAndInvalidate() }
+        let task = session.downloadTask(with: url)
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                delegate.setContinuation(continuation)
+                task.resume()
+            }
+        } onCancel: {
+            task.cancel()
+        }
+        try Task.checkCancellation()
+    }
+}
+
+/// Thread-safe accumulator for bytes completed across files.
+private final class ByteCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var total: Int64 = 0
+    var value: Int64 { lock.withLock { total } }
+    func add(_ n: Int64) { lock.withLock { total += n } }
 }
 
 struct GigaAMAssetInstallResult: Sendable, Equatable {
@@ -603,7 +705,8 @@ struct GigaAMAssetDownloader: Sendable {
     func ensureAssets(
         in sourceRoot: URL,
         additionalRequiredBytes: Int64,
-        onProgress: @Sendable (Int, Int) -> Void = { _, _ in }
+        onProgress: @Sendable @escaping (Int, Int) -> Void = { _, _ in },
+        onBytes: @Sendable @escaping (Int64, Int64) -> Void = { _, _ in }
     ) async throws -> GigaAMAssetInstallResult {
         try Task.checkCancellation()
         try fileSystem.createPrivateDirectory(at: sourceRoot)
@@ -656,6 +759,10 @@ struct GigaAMAssetDownloader: Sendable {
         var downloadedAssetCount = 0
         var replacedAssetCount = 0
         let totalDownloads = assetsNeedingDownload.count
+        // Byte-level progress across all files, so the huge weights file (the
+        // bulk of the bytes) advances the bar instead of freezing it.
+        let totalBytesToDownload = downloadBytes
+        let completedBytesBox = ByteCounter()
 
         for asset in assetsNeedingDownload {
             try Task.checkCancellation()
@@ -675,7 +782,12 @@ struct GigaAMAssetDownloader: Sendable {
             }
 
             do {
-                try await transport.download(from: resolveURL(asset), to: staging)
+                let alreadyCompleted = completedBytesBox.value
+                let assetBytes = asset.expectedByteCount
+                try await transport.download(from: resolveURL(asset), to: staging) { written, _ in
+                    let clamped = min(max(0, written), assetBytes)
+                    onBytes(alreadyCompleted + clamped, totalBytesToDownload)
+                }
                 try Task.checkCancellation()
                 guard fileSystem.fileExists(at: staging) else {
                     throw GigaAMAssetDownloadError.assetUnavailable(
@@ -695,7 +807,9 @@ struct GigaAMAssetDownloader: Sendable {
                 try fileSystem.setPrivateFilePermissions(at: destination)
                 downloadedAssetCount += 1
                 validatedAssetCount += 1
+                completedBytesBox.add(assetBytes)
                 onProgress(downloadedAssetCount, totalDownloads)
+                onBytes(completedBytesBox.value, totalBytesToDownload)
             } catch is CancellationError {
                 try? quarantinePartial(staging, asset: asset, under: sourceRoot)
                 throw CancellationError()

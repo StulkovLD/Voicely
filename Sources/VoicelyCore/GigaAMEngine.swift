@@ -442,11 +442,13 @@ final class GigaAMEngine: @unchecked Sendable, TranscriberEngine, SampleTranscri
                 in: sourceRoot,
                 additionalRequiredBytes: preflightCompiledCacheReady
                     ? 0
-                    : GigaAMAssetCatalog.totalExpectedByteCount
-            ) { completed, total in
-                let progress = total > 0 ? Double(completed) / Double(total) : 1
-                onProgress?(.downloadingModel(progress: min(0.95, progress)))
-            }
+                    : GigaAMAssetCatalog.totalExpectedByteCount,
+                onBytes: { bytes, totalBytes in
+                    guard totalBytes > 0 else { return }
+                    let progress = Double(bytes) / Double(totalBytes)
+                    onProgress?(.downloadingModel(progress: min(0.95, progress)))
+                }
+            )
             engine.setDownloading(false)
         } catch {
             engine.setDownloading(false)

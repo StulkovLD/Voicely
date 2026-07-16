@@ -463,11 +463,13 @@ final class GigaAMCTCEngine: @unchecked Sendable, TranscriberEngine, SampleTrans
                 in: sourceRoot,
                 additionalRequiredBytes: preflightCompiledCacheReady
                     ? 0
-                    : GigaAMMultilingualAssetCatalog.totalExpectedByteCount
-            ) { completed, total in
-                let progress = total > 0 ? Double(completed) / Double(total) : 1
-                onProgress?(.downloadingModel(progress: min(0.95, progress)))
-            }
+                    : GigaAMMultilingualAssetCatalog.totalExpectedByteCount,
+                onBytes: { bytes, totalBytes in
+                    guard totalBytes > 0 else { return }
+                    let progress = Double(bytes) / Double(totalBytes)
+                    onProgress?(.downloadingModel(progress: min(0.95, progress)))
+                }
+            )
             engine.setDownloading(false)
         } catch {
             engine.setDownloading(false)

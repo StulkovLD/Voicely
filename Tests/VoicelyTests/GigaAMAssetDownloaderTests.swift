@@ -115,7 +115,11 @@ private final class MockGigaAMTransport: @unchecked Sendable, GigaAMAssetTranspo
         self.behavior = behavior
     }
 
-    func download(from url: URL, to stagingURL: URL) async throws {
+    func download(
+        from url: URL,
+        to stagingURL: URL,
+        onBytes: @Sendable @escaping (Int64, Int64) -> Void
+    ) async throws {
         lock.withLock {
             requestedURLs.append(url)
             started = true
@@ -123,6 +127,7 @@ private final class MockGigaAMTransport: @unchecked Sendable, GigaAMAssetTranspo
         switch behavior {
         case .success(let data):
             fileSystem.put(data, at: stagingURL)
+            onBytes(Int64(data.count), Int64(data.count))
         case .partialThenOffline(let partial):
             fileSystem.put(partial, at: stagingURL)
             throw URLError(.notConnectedToInternet)
