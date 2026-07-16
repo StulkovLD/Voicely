@@ -75,6 +75,7 @@ private enum GigaAMCTCConstants {
 final class GigaAMCTCEngine: @unchecked Sendable, TranscriberEngine, SampleTranscribing, PreloadableTranscriberEngine, CancelableTranscriberEngine, DownloadReportingTranscriberEngine, LanguageSessionResettable {
     private let model: WhisperModel
     private let onProgress: (@Sendable (TranscriberStatus) -> Void)?
+    private let punctuator: PunctuationRestorer?
     private let stateLock = NSLock()
     private let requestCancellation = GigaAMRequestCancellation()
 
@@ -90,9 +91,14 @@ final class GigaAMCTCEngine: @unchecked Sendable, TranscriberEngine, SampleTrans
         return isDownloadInProgress
     }
 
-    init(model: WhisperModel, onProgress: (@Sendable (TranscriberStatus) -> Void)? = nil) {
+    init(
+        model: WhisperModel,
+        onProgress: (@Sendable (TranscriberStatus) -> Void)? = nil,
+        punctuator: PunctuationRestorer? = nil
+    ) {
         self.model = model
         self.onProgress = onProgress
+        self.punctuator = punctuator
     }
 
     func preload() async throws {
@@ -165,11 +171,39 @@ final class GigaAMCTCEngine: @unchecked Sendable, TranscriberEngine, SampleTrans
         }
 
         let text = allSegments.map(\.text).joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines)
-        return WhisperTranscription(
-            text: text,
-            segments: allSegments,
-            detectedLanguage: Self.dominantScriptLanguage(text)
-        )
+        let language = Self.dominantScriptLanguage(text)
+
+        // GigaAM Multilingual emits lowercase without punctuation; restore it
+        // when a punctuator is wired. Never let this fail transcription.
+        guard let punctuator, !text.isEmpty else {
+            return WhisperTranscription(text: text, segments: allSegments, detectedLanguage: language)
+        }
+        let restoredText = (try? await punctuator.restore(text, language: language)) ?? text
+        let restoredSegments = try await restoreSegments(allSegments, punctuator: punctuator, language: language)
+        return WhisperTranscription(text: restoredText, segments: restoredSegments, detectedLanguage: language)
+    }
+
+    /// Punctuate each segment independently so timestamped file/call transcripts
+    /// carry punctuation too. Per-segment context is smaller than the whole
+    /// text, which is acceptable for dictation-length windows.
+    private func restoreSegments(
+        _ segments: [WhisperSegment],
+        punctuator: PunctuationRestorer,
+        language: String?
+    ) async throws -> [WhisperSegment] {
+        guard segments.count > 1 else {
+            guard let only = segments.first, !only.text.isEmpty else { return segments }
+            let restored = (try? await punctuator.restore(only.text, language: language)) ?? only.text
+            return [WhisperSegment(start: only.start, end: only.end, text: restored)]
+        }
+        var out: [WhisperSegment] = []
+        out.reserveCapacity(segments.count)
+        for seg in segments {
+            let restored = seg.text.isEmpty ? seg.text
+                : ((try? await punctuator.restore(seg.text, language: language)) ?? seg.text)
+            out.append(WhisperSegment(start: seg.start, end: seg.end, text: restored))
+        }
+        return out
     }
 
     /// Script-based language attribution: the charwise model has no language

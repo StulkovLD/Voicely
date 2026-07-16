@@ -52,9 +52,7 @@ final class WhisperModelCatalogTests: XCTestCase {
         }
         XCTAssertEqual(model.ramRequirementLabel, "8 GB RAM")
         let label = model.userFacingLabel(isRecommended: false)
-        XCTAssertTrue(label.contains("Russian only"))
-        XCTAssertTrue(label.contains("no translation"))
-        XCTAssertTrue(label.contains("macOS 15+"))
+        XCTAssertTrue(label.contains("Russian, punctuated"))
     }
 
     func testModelCapabilitiesMatchActualBackends() throws {
@@ -98,7 +96,13 @@ final class WhisperModelCatalogTests: XCTestCase {
         XCTAssertEqual(model.ramRequirementLabel, "8 GB RAM")
         let label = model.userFacingLabel(isRecommended: false)
         XCTAssertTrue(label.contains("RU/EN/KK/KY/UZ"))
-        XCTAssertTrue(label.contains("lowercase"))
-        XCTAssertTrue(label.contains("macOS 15+"))
+        XCTAssertTrue(label.contains("punctuated"))
+    }
+
+    func testWhisperKitModelsAreLabeledUniversal() throws {
+        let model = try XCTUnwrap(
+            WhisperModel.all.first { $0.backend == .whisperKit }
+        )
+        XCTAssertTrue(model.userFacingLabel(isRecommended: false).contains("Universal, punctuated"))
     }
 }

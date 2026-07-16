@@ -180,11 +180,11 @@ public struct WhisperModel: Sendable, Equatable {
     public var onboardingHint: String? {
         switch backend {
         case .gigaAMV3E2ERNNT:
-            return "Russian only, no translation, macOS 15+"
+            return "Russian, punctuated"
         case .gigaAMMultilingualCTC:
-            return "RU/EN/KK/KY/UZ, plain lowercase text without punctuation, macOS 15+"
+            return "RU/EN/KK/KY/UZ · punctuated"
         case .whisperKit:
-            return nil
+            return "Universal, punctuated"
         }
     }
 
@@ -539,7 +539,11 @@ public final class Transcriber {
             return GigaAMEngine(model: model, onProgress: onProgress)
         case .gigaAMMultilingualCTC:
             vlog("Using GigaAM Multilingual CTC, model: \(model.variant) (RAM: \(WhisperModel.systemRAMGB) GB)")
-            return GigaAMCTCEngine(model: model, onProgress: onProgress)
+            return GigaAMCTCEngine(
+                model: model,
+                onProgress: onProgress,
+                punctuator: CoreMLPunctuationRestorer()
+            )
         }
     }
 
