@@ -3364,26 +3364,37 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     /// Programmatic menubar icon - 7-bar waveform matching the Voicely logo.
+    /// AppKit calls the drawing handler from its image-rendering machinery,
+    /// outside any Swift concurrency context. A closure written inline here
+    /// inherits the AppDelegate's MainActor isolation, and the runtime's
+    /// executor check then dereferences garbage — SIGSEGV in
+    /// swift_task_isCurrentExecutor on launch (macOS 26). The handler must be
+    /// a nonisolated function.
     static func makeMenuBarIcon() -> NSImage {
-        let size = NSSize(width: 18, height: 18)
-        let icon = NSImage(size: size, flipped: false) { rect in
-            let heights: [CGFloat] = [3.5, 7, 11, 15, 11, 7, 3.5]
-            let barW: CGFloat = 1.8
-            let gap: CGFloat = 0.7
-            let total = CGFloat(heights.count) * barW + CGFloat(heights.count - 1) * gap
-            let startX = (rect.width - total) / 2
-            let cy = rect.height / 2
-
-            NSColor.black.setFill()
-            for (i, h) in heights.enumerated() {
-                let x = startX + CGFloat(i) * (barW + gap)
-                let r = NSRect(x: x, y: cy - h / 2, width: barW, height: h)
-                NSBezierPath(roundedRect: r, xRadius: barW / 2, yRadius: barW / 2).fill()
-            }
-            return true
-        }
+        let icon = NSImage(
+            size: NSSize(width: 18, height: 18),
+            flipped: false,
+            drawingHandler: Self.drawMenuBarIconBars
+        )
         icon.isTemplate = true
         return icon
+    }
+
+    nonisolated static func drawMenuBarIconBars(_ rect: NSRect) -> Bool {
+        let heights: [CGFloat] = [3.5, 7, 11, 15, 11, 7, 3.5]
+        let barW: CGFloat = 1.8
+        let gap: CGFloat = 0.7
+        let total = CGFloat(heights.count) * barW + CGFloat(heights.count - 1) * gap
+        let startX = (rect.width - total) / 2
+        let cy = rect.height / 2
+
+        NSColor.black.setFill()
+        for (i, h) in heights.enumerated() {
+            let x = startX + CGFloat(i) * (barW + gap)
+            let r = NSRect(x: x, y: cy - h / 2, width: barW, height: h)
+            NSBezierPath(roundedRect: r, xRadius: barW / 2, yRadius: barW / 2).fill()
+        }
+        return true
     }
 
     nonisolated static func debugLog(_ message: String) {
