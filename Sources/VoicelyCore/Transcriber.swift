@@ -85,6 +85,7 @@ public struct WhisperModel: Sendable, Equatable {
         case whisperKit
         case gigaAMV3E2ERNNT
         case gigaAMMultilingualCTC
+        case parakeetTDTV3
     }
 
     public struct Capabilities: Sendable, Equatable {
@@ -139,6 +140,19 @@ public struct WhisperModel: Sendable, Equatable {
                 supportsTranslationToEnglish: false,
                 minimumMacOSMajorVersion: 15
             )
+        case .parakeetTDTV3:
+            // Parakeet TDT 0.6B v3: the 25 European languages of the NVIDIA
+            // model card. The model decodes whichever of them it hears; an
+            // explicit language only prunes mismatched scripts during decoding.
+            return Capabilities(
+                supportedLanguages: [
+                    "bg", "cs", "da", "de", "el", "en", "es", "et", "fi", "fr",
+                    "hr", "hu", "it", "lt", "lv", "mt", "nl", "pl", "pt", "ro",
+                    "ru", "sk", "sl", "sv", "uk",
+                ],
+                supportsLanguageDetection: true,
+                supportsTranslationToEnglish: false
+            )
         }
     }
 
@@ -159,6 +173,7 @@ public struct WhisperModel: Sendable, Equatable {
     }
 
     public static let all: [WhisperModel] = [
+        WhisperModel(variant: "parakeet-tdt-0.6b-v3", displayName: "Parakeet V3", sizeLabel: "~470 MB", sizeBytes: 500_000_000, minRAMGB: 8, backend: .parakeetTDTV3),
         WhisperModel(variant: "gigaam-v3-e2e-rnnt", displayName: "GigaAM V3 RU", sizeLabel: "~426 MB", sizeBytes: 430_000_000, minRAMGB: 8, backend: .gigaAMV3E2ERNNT),
         WhisperModel(variant: "gigaam-multilingual-ctc", displayName: "GigaAM Multilingual", sizeLabel: "~421 MB", sizeBytes: 442_100_000, minRAMGB: 8, backend: .gigaAMMultilingualCTC),
         WhisperModel(variant: "large-v3-v20240930_turbo_632MB", displayName: "Large V3 Turbo Q", sizeLabel: "~632 MB", sizeBytes: 650_000_000, minRAMGB: 8, backend: .whisperKit),
@@ -187,6 +202,8 @@ public struct WhisperModel: Sendable, Equatable {
     /// coverage, not by claim.
     public var onboardingHint: String? {
         switch backend {
+        case .parakeetTDTV3:
+            return "Fastest · 25 European languages"
         case .gigaAMV3E2ERNNT:
             return "Best in Russian · RU only"
         case .gigaAMMultilingualCTC:
@@ -238,6 +255,7 @@ public struct WhisperModel: Sendable, Equatable {
         let preferredVariants: [String]
         if ram >= 24 {
             preferredVariants = [
+                "parakeet-tdt-0.6b-v3",
                 "large-v3_turbo",
                 "medium",
                 "large-v3-v20240930_turbo_632MB",
@@ -245,12 +263,14 @@ public struct WhisperModel: Sendable, Equatable {
             ]
         } else if ram >= 16 {
             preferredVariants = [
+                "parakeet-tdt-0.6b-v3",
                 "medium",
                 "large-v3-v20240930_turbo_632MB",
                 "gigaam-v3-e2e-rnnt",
             ]
         } else {
             preferredVariants = [
+                "parakeet-tdt-0.6b-v3",
                 "large-v3-v20240930_turbo_632MB",
                 "gigaam-v3-e2e-rnnt",
             ]
@@ -339,6 +359,9 @@ public struct WhisperModel: Sendable, Equatable {
         case .gigaAMMultilingualCTC:
             return FileManager.default.homeDirectoryForCurrentUser
                 .appendingPathComponent("Documents/voicely/models/gigaam-multilingual-ctc")
+        case .parakeetTDTV3:
+            return FileManager.default.homeDirectoryForCurrentUser
+                .appendingPathComponent("Documents/voicely/models/parakeet-tdt-0.6b-v3")
         }
     }
 
@@ -552,6 +575,9 @@ public final class Transcriber {
                 onProgress: onProgress,
                 punctuator: CoreMLPunctuationRestorer()
             )
+        case .parakeetTDTV3:
+            vlog("Using Parakeet TDT v3, model: \(model.variant) (RAM: \(WhisperModel.systemRAMGB) GB)")
+            return ParakeetEngine(model: model, onProgress: onProgress)
         }
     }
 

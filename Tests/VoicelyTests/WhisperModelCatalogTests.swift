@@ -6,6 +6,7 @@ final class WhisperModelCatalogTests: XCTestCase {
         XCTAssertEqual(
             WhisperModel.all.map(\.variant),
             [
+                "parakeet-tdt-0.6b-v3",
                 "gigaam-v3-e2e-rnnt",
                 "gigaam-multilingual-ctc",
                 "large-v3-v20240930_turbo_632MB",
@@ -18,30 +19,33 @@ final class WhisperModelCatalogTests: XCTestCase {
     func testAvailabilityFollowsRAMThresholds() {
         XCTAssertEqual(
             WhisperModel.available(forSystemRAMGB: 8).map(\.variant),
-            ["gigaam-v3-e2e-rnnt", "gigaam-multilingual-ctc", "large-v3-v20240930_turbo_632MB"]
+            ["parakeet-tdt-0.6b-v3", "gigaam-v3-e2e-rnnt", "gigaam-multilingual-ctc", "large-v3-v20240930_turbo_632MB"]
         )
         XCTAssertEqual(
             WhisperModel.available(forSystemRAMGB: 16).map(\.variant),
-            ["gigaam-v3-e2e-rnnt", "gigaam-multilingual-ctc", "large-v3-v20240930_turbo_632MB", "medium"]
+            ["parakeet-tdt-0.6b-v3", "gigaam-v3-e2e-rnnt", "gigaam-multilingual-ctc", "large-v3-v20240930_turbo_632MB", "medium"]
         )
         XCTAssertEqual(
             WhisperModel.available(forSystemRAMGB: 24).map(\.variant),
-            ["gigaam-v3-e2e-rnnt", "gigaam-multilingual-ctc", "large-v3-v20240930_turbo_632MB", "large-v3_turbo", "medium"]
+            ["parakeet-tdt-0.6b-v3", "gigaam-v3-e2e-rnnt", "gigaam-multilingual-ctc", "large-v3-v20240930_turbo_632MB", "large-v3_turbo", "medium"]
         )
     }
 
+    /// Parakeet v3 is the recommendation on every tier: measured ~34x realtime
+    /// on a live 44-min call (debug build) against multi-minute Whisper, with
+    /// RU/EN quality on par (FLEURS 5.51/4.85 WER per the NVIDIA model card).
     func testRecommendationFollowsProductTiers() {
         XCTAssertEqual(
             WhisperModel.recommended(forSystemRAMGB: 8, availableDiskBytes: nil).variant,
-            "large-v3-v20240930_turbo_632MB"
+            "parakeet-tdt-0.6b-v3"
         )
         XCTAssertEqual(
             WhisperModel.recommended(forSystemRAMGB: 16, availableDiskBytes: nil).variant,
-            "medium"
+            "parakeet-tdt-0.6b-v3"
         )
         XCTAssertEqual(
             WhisperModel.recommended(forSystemRAMGB: 24, availableDiskBytes: nil).variant,
-            "large-v3_turbo"
+            "parakeet-tdt-0.6b-v3"
         )
     }
 
@@ -87,6 +91,29 @@ final class WhisperModelCatalogTests: XCTestCase {
         XCTAssertNil(multilingual.requestValidationError(translateToEnglish: false, language: "en"))
         XCTAssertNil(multilingual.requestValidationError(translateToEnglish: false, language: "ru"))
         XCTAssertNil(multilingual.requestValidationError(translateToEnglish: false, language: nil))
+
+        let parakeet = try XCTUnwrap(
+            WhisperModel.all.first { $0.backend == .parakeetTDTV3 }
+        )
+        XCTAssertEqual(parakeet.capabilities.supportedLanguages?.count, 25)
+        XCTAssertTrue(parakeet.capabilities.supportedLanguages?.contains("ru") ?? false)
+        XCTAssertTrue(parakeet.capabilities.supportedLanguages?.contains("en") ?? false)
+        XCTAssertTrue(parakeet.capabilities.supportsLanguageDetection)
+        XCTAssertFalse(parakeet.capabilities.supportsTranslationToEnglish)
+        XCTAssertEqual(parakeet.capabilities.minimumMacOSMajorVersion, 14)
+        XCTAssertNotNil(parakeet.requestValidationError(translateToEnglish: true, language: nil))
+        XCTAssertNotNil(parakeet.requestValidationError(translateToEnglish: false, language: "ja"))
+        XCTAssertNil(parakeet.requestValidationError(translateToEnglish: false, language: "de"))
+        XCTAssertNil(parakeet.requestValidationError(translateToEnglish: false, language: "ru"))
+    }
+
+    func testParakeetLabelStatesSpeedAndCoverage() throws {
+        let model = try XCTUnwrap(
+            WhisperModel.all.first { $0.backend == .parakeetTDTV3 }
+        )
+        let label = model.userFacingLabel(isRecommended: false)
+        XCTAssertTrue(label.contains("Fastest"), label)
+        XCTAssertTrue(label.contains("25 European languages"), label)
     }
 
     func testMultilingualLabelStatesItsCapabilityBoundary() throws {

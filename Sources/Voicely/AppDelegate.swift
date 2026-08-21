@@ -2138,6 +2138,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let body: [(String, Bool)] = [
             ("Offline voice-to-text, calls, and file transcription.\n\n", false),
             ("Speech recognition: WhisperKit (MIT) + OpenAI Whisper models.\n", false),
+            ("Parakeet ASR: NVIDIA Parakeet TDT 0.6B v3 weights, licensed CC-BY-4.0; CoreML conversion by FluidInference.\n", false),
             ("Speaker diarization: FluidAudio (Apache-2.0).\n", false),
             ("Diarization models: pyannote segmentation and WeSpeaker embeddings, licensed CC-BY-4.0.\n", false),
         ]

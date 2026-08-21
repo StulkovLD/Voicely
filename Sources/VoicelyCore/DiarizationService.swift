@@ -1,11 +1,10 @@
-import AVFoundation
 import Foundation
 @preconcurrency import FluidAudio
 
 // MARK: - Diarization Service
 //
-// Thin wrapper over FluidAudio's offline-capable `DiarizerManager`
-// (Pyannote powerset segmentation + WeSpeaker embeddings, running on CoreML /
+// Thin wrapper over FluidAudio's `OfflineDiarizerManager` (Pyannote powerset
+// segmentation + WeSpeaker embeddings + VBx clustering, running on CoreML /
 // the Apple Neural Engine). Produces "who spoke when" speaker turns and maps
 // them back onto ASR `DialogueSegment`s.
 //
@@ -14,8 +13,7 @@ import Foundation
 // read the per-segment `speakerID` it assigns. Speaker indices are 1-based and
 // STABLE within a single `diarize(...)` pass (a global one-pass numbering keyed
 // by first appearance of each FluidAudio speaker identity, so the index does
-// not depend on FluidAudio's internal id string format which differs between
-// the streaming "1"/"2" and offline "S1"/"S2" conventions).
+// not depend on FluidAudio's internal id string format).
 //
 // MODEL WEIGHTS / ATTRIBUTION (CC-BY-4.0):
 // FluidAudio's diarization models are CoreML conversions of:
@@ -51,7 +49,7 @@ public enum DiarizationError: Error, LocalizedError {
     case modelsUnavailable(String)
     /// The diarization pass itself failed inside FluidAudio.
     case diarizationFailed(String)
-    /// The provided WAV file could not be read into Float samples.
+    /// The provided audio file could not be read.
     case audioReadFailed(String)
 
     public var errorDescription: String? {
@@ -88,26 +86,18 @@ private final class OfflineDiarizerBox: @unchecked Sendable {
     }
 }
 
-/// Actor-isolated wrapper so the non-`Sendable` `DiarizerManager` and its
+/// Actor-isolated wrapper so FluidAudio's non-`Sendable` manager and its
 /// downloaded models never cross an isolation boundary. All FluidAudio calls
 /// run inside the actor; the inference itself is offloaded to the ANE by
 /// FluidAudio, so holding the actor for the duration of a pass is acceptable.
 public actor DiarizationService: FileDiarizing {
-    /// FluidAudio's diarizer. Lazily created on first `diarize(...)`.
-    private var manager: DiarizerManager?
-    /// Separate offline/VBx pipeline used only by disk-backed file input. It has
-    /// different models and clustering semantics, so the existing samples and
-    /// call-WAV overloads deliberately remain on `DiarizerManager`.
+    /// FluidAudio's offline/VBx diarizer. Lazily created on first `diarize(...)`.
     private var offlineManager: OfflineDiarizerBox?
 
     /// Short gap tolerated when ASR and diarization land on slightly different
     /// boundaries. Segments still prefer real overlap first; this only rescues
     /// near-miss assignments that would otherwise render as `Speaker ?`.
     nonisolated static let nearestTurnTolerance: Double = 0.3
-
-    /// FluidAudio expects 16 kHz mono Float32. Callers that already resampled
-    /// (the call path resamples per-channel) should pass `sampleRate: 16000`.
-    public static let requiredSampleRate: Double = 16000
 
     public init() {}
 
@@ -117,20 +107,6 @@ public actor DiarizationService: FileDiarizing {
     /// manager. Idempotent: once a manager exists this is a no-op. Models are
     /// fetched from FluidAudio's HuggingFace mirror on first use and cached on
     /// disk by FluidAudio for subsequent launches.
-    private func ensureManager() async throws -> DiarizerManager {
-        if let manager { return manager }
-        let models: DiarizerModels
-        do {
-            models = try await DiarizerModels.downloadIfNeeded()
-        } catch {
-            throw DiarizationError.modelsUnavailable(error.localizedDescription)
-        }
-        let m = DiarizerManager(config: Self.configFromEnvironment())
-        m.initialize(models: models)
-        manager = m
-        return m
-    }
-
     private func ensureOfflineManager() async throws -> OfflineDiarizerBox {
         if let offlineManager { return offlineManager }
         let manager = OfflineDiarizerBox()
@@ -145,59 +121,13 @@ public actor DiarizationService: FileDiarizing {
         return manager
     }
 
-    /// Diarizer runtime config. Voicely defaults to a slightly lower clustering
-    /// threshold than FluidAudio's 0.7 because short remote speaker changes in
-    /// calls were being merged into one speaker. FluidAudio documents: lower
-    /// threshold = more speakers. The env override is kept for real-world tuning
-    /// without rebuilding the app.
-    nonisolated static func configFromEnvironment(
-        _ env: [String: String] = ProcessInfo.processInfo.environment
-    ) -> DiarizerConfig {
-        var config = DiarizerConfig.default
-        config.clusteringThreshold = 0.55
-        if let raw = env["VOICELY_DIARIZATION_CLUSTERING_THRESHOLD"],
-           let threshold = Float(raw) {
-            config.clusteringThreshold = min(0.9, max(0.5, threshold))
-        }
-        return config
-    }
-
-    // MARK: - Diarize (samples)
-
-    /// Diarize 16 kHz mono Float32 samples into 1-based stable speaker turns.
-    ///
-    /// `sampleRate` is forwarded to FluidAudio. FluidAudio's models are trained
-    /// for 16 kHz; pass already-resampled audio at `requiredSampleRate` for best
-    /// results. Empty input returns `[]` without touching the model.
-    public func diarize(samples: [Float], sampleRate: Double) async throws -> [SpeakerTurn] {
-        guard !samples.isEmpty else { return [] }
-        let manager = try await ensureManager()
-
-        let result: DiarizationResult
-        do {
-            // `performCompleteDiarization` is synchronous (throws). It is generic
-            // over RandomAccessCollection<Float> with Int index — a plain [Float]
-            // satisfies that. Runs inside the actor; FluidAudio offloads to ANE.
-            result = try manager.performCompleteDiarization(
-                samples,
-                sampleRate: Int(sampleRate.rounded())
-            )
-        } catch {
-            throw DiarizationError.diarizationFailed(error.localizedDescription)
-        }
-
-        return Self.makeStableTurns(from: result.segments)
-    }
-
     // MARK: - Diarize (disk-backed source URL)
 
     /// Diarize an arbitrary AVFoundation-supported audio/video source without
     /// materializing its PCM in Voicely. FluidAudio's offline manager converts
     /// the source and serves inference windows through a memory-mapped backing.
-    ///
-    /// This overload is intentionally separate from `diarize(samples:)` and
-    /// `diarize(wavURL:)`: switching those call paths to the offline/VBx models
-    /// would silently change existing call-speaker behavior.
+    /// Every consumer (the calls' system channel, the file queue, the CLI)
+    /// enters through this single overload.
     public func diarize(fileURL: URL) async throws -> [SpeakerTurn] {
         try Task.checkCancellation()
         let manager = try await ensureOfflineManager()
@@ -212,19 +142,6 @@ public actor DiarizationService: FileDiarizing {
         }
         try Task.checkCancellation()
         return Self.makeStableTurns(from: result.segments)
-    }
-
-    // MARK: - Diarize (WAV file URL)
-
-    /// Convenience overload for the call path: read a WAV file (e.g. the call's
-    /// `system.wav`) into 16 kHz mono Float32 and diarize it. FluidAudio's stable
-    /// `DiarizerManager` has no native URL entry point, so we decode + resample
-    /// here via AVFoundation and delegate to `diarize(samples:sampleRate:)`.
-    ///
-    /// Returned turn timestamps are seconds from the start of the file.
-    public func diarize(wavURL: URL) async throws -> [SpeakerTurn] {
-        let samples = try Self.readMono16k(from: wavURL)
-        return try await diarize(samples: samples, sampleRate: Self.requiredSampleRate)
     }
 
     // MARK: - Assign speakers to ASR segments
@@ -256,11 +173,11 @@ public actor DiarizationService: FileDiarizing {
 
     // MARK: - Internal helpers
 
-    /// Map FluidAudio's opaque `speakerId` strings ("1"/"2" streaming, "S1"/"S2"
-    /// offline) to 1-based indices by ORDER OF FIRST APPEARANCE across the
-    /// segment list. This makes the numbering stable within one pass and
-    /// independent of FluidAudio's id-string format. Segments are kept in their
-    /// original chronological order. Empty `speakerId`s are skipped.
+    /// Map FluidAudio's opaque `speakerId` strings (e.g. "S1"/"S2") to 1-based
+    /// indices by ORDER OF FIRST APPEARANCE across the segment list. This makes
+    /// the numbering stable within one pass and independent of FluidAudio's
+    /// id-string format. Segments are kept in their original chronological
+    /// order. Empty `speakerId`s are skipped.
     nonisolated static func makeStableTurns(
         from segments: [TimedSpeakerSegment]
     ) -> [SpeakerTurn] {
@@ -347,85 +264,5 @@ public actor DiarizationService: FileDiarizing {
             return segment.start - turn.end
         }
         return 0
-    }
-
-    /// Decode an audio file at `url` into 16 kHz mono Float32 samples via
-    /// AVFoundation. Handles arbitrary input sample rates / channel counts by
-    /// converting through `AVAudioConverter`. Used by the WAV-URL overload.
-    nonisolated static func readMono16k(from url: URL) throws -> [Float] {
-        let file: AVAudioFile
-        do {
-            file = try AVAudioFile(forReading: url)
-        } catch {
-            throw DiarizationError.audioReadFailed(error.localizedDescription)
-        }
-
-        let srcFormat = file.processingFormat
-        guard let dstFormat = AVAudioFormat(
-            commonFormat: .pcmFormatFloat32,
-            sampleRate: requiredSampleRate,
-            channels: 1,
-            interleaved: false
-        ) else {
-            throw DiarizationError.audioReadFailed("Could not create 16 kHz mono format")
-        }
-
-        // Fast path: already 16 kHz mono Float32 — read straight through.
-        if abs(srcFormat.sampleRate - requiredSampleRate) < 1,
-           srcFormat.channelCount == 1,
-           srcFormat.commonFormat == .pcmFormatFloat32 {
-            return try readAllFloat(file: file, format: srcFormat)
-        }
-
-        guard let converter = AVAudioConverter(from: srcFormat, to: dstFormat) else {
-            throw DiarizationError.audioReadFailed("Could not create audio converter")
-        }
-
-        let frameCount = AVAudioFrameCount(file.length)
-        guard frameCount > 0 else { return [] }
-        guard let inBuf = AVAudioPCMBuffer(pcmFormat: srcFormat, frameCapacity: frameCount) else {
-            throw DiarizationError.audioReadFailed("Could not allocate input buffer")
-        }
-        do {
-            try file.read(into: inBuf)
-        } catch {
-            throw DiarizationError.audioReadFailed(error.localizedDescription)
-        }
-
-        let ratio = requiredSampleRate / srcFormat.sampleRate
-        let outCapacity = AVAudioFrameCount(ceil(Double(inBuf.frameLength) * ratio)) + 1
-        guard let outBuf = AVAudioPCMBuffer(pcmFormat: dstFormat, frameCapacity: outCapacity) else {
-            throw DiarizationError.audioReadFailed("Could not allocate output buffer")
-        }
-
-        var convError: NSError?
-        let converterInput = SingleBufferAudioConverterInput(inBuf)
-        converter.convert(to: outBuf, error: &convError) { _, outStatus in
-            converterInput.provide(status: outStatus)
-        }
-        if let convError {
-            throw DiarizationError.audioReadFailed("Resample failed: \(convError.localizedDescription)")
-        }
-        guard let ch = outBuf.floatChannelData?[0] else { return [] }
-        return Array(UnsafeBufferPointer(start: ch, count: Int(outBuf.frameLength)))
-    }
-
-    /// Read an entire (already mono Float32) file into a `[Float]`.
-    private nonisolated static func readAllFloat(
-        file: AVAudioFile,
-        format: AVAudioFormat
-    ) throws -> [Float] {
-        let frameCount = AVAudioFrameCount(file.length)
-        guard frameCount > 0 else { return [] }
-        guard let buf = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frameCount) else {
-            throw DiarizationError.audioReadFailed("Could not allocate read buffer")
-        }
-        do {
-            try file.read(into: buf)
-        } catch {
-            throw DiarizationError.audioReadFailed(error.localizedDescription)
-        }
-        guard let ch = buf.floatChannelData?[0] else { return [] }
-        return Array(UnsafeBufferPointer(start: ch, count: Int(buf.frameLength)))
     }
 }

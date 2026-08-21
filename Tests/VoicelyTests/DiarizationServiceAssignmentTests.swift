@@ -1,32 +1,6 @@
 import XCTest
 @testable import VoicelyCore
 
-final class DiarizationServiceConfigTests: XCTestCase {
-    func testDefaultClusteringThresholdIsTunedForShortCallSpeakerChanges() {
-        let config = DiarizationService.configFromEnvironment([:])
-        XCTAssertEqual(config.clusteringThreshold, 0.55, accuracy: 0.0001)
-    }
-
-    func testEnvironmentCanOverrideClusteringThresholdForFieldTuning() {
-        let config = DiarizationService.configFromEnvironment([
-            "VOICELY_DIARIZATION_CLUSTERING_THRESHOLD": "0.6"
-        ])
-        XCTAssertEqual(config.clusteringThreshold, 0.6, accuracy: 0.0001)
-    }
-
-    func testEnvironmentThresholdIsClampedToFluidAudioSupportedRange() {
-        let low = DiarizationService.configFromEnvironment([
-            "VOICELY_DIARIZATION_CLUSTERING_THRESHOLD": "0.1"
-        ])
-        XCTAssertEqual(low.clusteringThreshold, 0.5, accuracy: 0.0001)
-
-        let high = DiarizationService.configFromEnvironment([
-            "VOICELY_DIARIZATION_CLUSTERING_THRESHOLD": "1.2"
-        ])
-        XCTAssertEqual(high.clusteringThreshold, 0.9, accuracy: 0.0001)
-    }
-}
-
 final class DiarizationServiceAssignmentTests: XCTestCase {
     private func segment(
         start: Double,

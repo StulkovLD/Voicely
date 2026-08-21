@@ -12,7 +12,7 @@ let package = Package(
         // WeSpeaker embeddings, CoreML/ANE). Models download at runtime on
         // first use, not at build time. Platform requirement .macOS(.v14)
         // matches Voicely's deployment target.
-        .package(url: "https://github.com/FluidInference/FluidAudio.git", from: "0.15.0"),
+        .package(url: "https://github.com/FluidInference/FluidAudio.git", from: "0.15.6"),
         // swift-argument-parser — declarative subcommand parsing for the headless
         // `voicely` CLI (VoicelyCLI target). Apple-maintained, no runtime deps.
         .package(url: "https://github.com/apple/swift-argument-parser.git", from: "1.3.0"),
