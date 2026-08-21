@@ -122,8 +122,13 @@ final class MCPRequestCoordinatorTests: XCTestCase {
 
         await operation.release()
         try await Task.sleep(for: .milliseconds(50))
+        // Contract change (2026-08-19): a response the operation still managed
+        // to compute publishes even after shutdown — the client asked and the
+        // answer exists. The old token-strip silently threw away initialize's
+        // ready answer on stdin-EOF (measured live). Only an explicit
+        // cancel(id:) suppresses publication.
         let publishedCount = await recorder.count()
-        XCTAssertEqual(publishedCount, 0)
+        XCTAssertEqual(publishedCount, 1)
         let activeCount = await coordinator.activeRequestCount
         XCTAssertEqual(activeCount, 0)
     }

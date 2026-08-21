@@ -214,11 +214,19 @@ struct JSONRPCFrameReader {
                 return frame.count > maximumFrameBytes ? .oversized : .frame(frame)
             }
 
-            let chunk = try input.read(upToCount: readChunkBytes) ?? Data()
-            if chunk.isEmpty {
+            // Raw read(2): FileHandle.read(upToCount:) goes through dispatch,
+            // which accumulates the FULL requested length before returning
+            // unless EOF lands first — measured live 2026-08-19: a one-line
+            // request on an open pipe sat invisible while `printf | …` (EOF)
+            // was served instantly. POSIX read returns whatever has arrived.
+            var scratch = [UInt8](repeating: 0, count: readChunkBytes)
+            let count = scratch.withUnsafeMutableBytes { raw -> Int in
+                Darwin.read(input.fileDescriptor, raw.baseAddress, raw.count)
+            }
+            if count <= 0 {
                 reachedEOF = true
             } else {
-                buffer.append(chunk)
+                buffer.append(contentsOf: scratch[0..<count])
             }
         }
     }

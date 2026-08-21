@@ -117,12 +117,13 @@ actor MCPRequestCoordinator {
 
     func shutdown() {
         acceptingRequests = false
-        let tasks = entries.values.map(\.task)
-        // Remove every publication token before cancellation. Detached work may
-        // unwind later, but `complete` cannot publish it and server exit is not
-        // held hostage by a cancellation-ignoring backend.
-        entries.removeAll()
-        for task in tasks { task.cancel() }
+        // Cancel without stripping publication tokens: a fast request whose
+        // response is already computed still publishes (its `complete` call is
+        // queued on this actor ahead of us or lands right after). Measured on
+        // stdin-EOF: initialize's ready answer was thrown away by the old
+        // token-strip. A backend that ignores cancellation cannot hold exit
+        // hostage either way — the process leaves when the read loop ends.
+        for entry in entries.values { entry.task.cancel() }
     }
 
     var activeRequestCount: Int { entries.count }
@@ -135,7 +136,10 @@ actor MCPRequestCoordinator {
     ) async {
         guard let entry = entries[id], entry.token == token else { return }
         entries.removeValue(forKey: id)
-        guard !Task.isCancelled, let response else { return }
+        // A computed response publishes even if shutdown has since cancelled
+        // the task: the client asked, the answer exists. Explicit per-request
+        // cancel(id:) removed the entry, so the guard above already covers it.
+        guard let response else { return }
         await publish(response)
     }
 }
@@ -257,9 +261,24 @@ struct MCPServer {
             await sink.write(response)
         }
         let heavyAdmission = MCPHeavyRequestAdmission()
-        var frameReader = JSONRPCFrameReader(input: .standardInput)
 
-        while let frame = try frameReader.nextFrame() {
+        // stdin is read on a dedicated thread. A blocking FileHandle.read
+        // inside the concurrency world pinned the cooperative thread and —
+        // measured live, 2026-08-19 — never surfaced bytes that arrived on an
+        // open pipe: the server greeted, then sat deaf while Claude Code's
+        // initialize timed out. A plain thread plus AsyncStream keeps the
+        // actor world free and wakes on every frame.
+        let frames = AsyncStream<JSONRPCFrameReader.Event> { continuation in
+            Thread.detachNewThread {
+                var reader = JSONRPCFrameReader(input: .standardInput)
+                while let event = try? reader.nextFrame() {
+                    continuation.yield(event)
+                }
+                continuation.finish()
+            }
+        }
+
+        for await frame in frames {
             guard case let .frame(frameData) = frame else {
                 await sink.write(.error(
                     id: .null,
