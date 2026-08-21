@@ -416,6 +416,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Menu
         let menu = NSMenu()
+        // Manual isEnabled on Dictate/Record Call/Transcribe File is the guard
+        // surface; with autoenables on, AppKit recomputes enablement itself and
+        // those assignments are fiction.
+        menu.autoenablesItems = false
 
         dictateMenuItem = NSMenuItem(title: "Dictate  (\(hotkey.combo.displayName))", action: #selector(toggleDictation), keyEquivalent: "")
         menu.addItem(dictateMenuItem)
@@ -772,7 +776,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         )
         let alert = NSAlert()
         alert.messageText = "Choose Voice Model"
-        alert.informativeText = "Choose the local model to install on this Mac. The first model download can be 426 MB to 3 GB, and the first prepare step may take a minute.\n\nYou can change models later from the Model menu. For the best Russian experience, choose GigaAM V3 RU. Screen Recording is only requested when you first record a call."
+        alert.informativeText = "Choose the local model to install on this Mac. The download is about 470 MB, and the first prepare step may take a minute.\n\nScreen Recording is only requested when you first record a call."
 
         let popup = NSPopUpButton(frame: NSRect(x: 0, y: 0, width: 460, height: 26), pullsDown: false)
         for model in available {
@@ -2129,6 +2133,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func rebuildLanguageSubmenu(selected: LanguageMode) {
         guard let item = languageMenuItem else { return }
+        // A menu of exactly one choice is furniture, not a control.
+        let modes = Self.compatibleLanguageModes(for: transcriber.selectedModel)
+        item.isHidden = (modes == [.auto])
         let submenu = NSMenu()
         let enabled = Self.runtimeMutationsAllowed(
             appState: state,
@@ -2714,6 +2721,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 handleHotkeyRuntimeState(active ? .active : hotkey.runtimeState)
             } else {
                 handleHotkeyRuntimeState(.permissionMissing)
+            }
+            // A check that ends in silence reads as a hang; say the good news.
+            if result.accessibilityGranted, modelState.isReady {
+                overlay.showInfo("All permissions OK")
             }
             // Restart model preload if the app still has no ready model. The
             // model picker / downloader should stay available even when the
@@ -3442,7 +3453,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         } else if msg.contains("disk") || msg.contains("space") || msg.contains("no space") {
             return "Not enough disk space. Free up storage and retry."
         }
-        return "Model failed. Select another in the menu."
+        return "Model failed. Check disk space and pick the model again."
     }
 
     /// Programmatic menubar icon - 7-bar waveform matching the Voicely logo.

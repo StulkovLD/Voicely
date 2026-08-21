@@ -544,6 +544,11 @@ final class Overlay {
         let resumeStart = recordingStartTime
 
         self.mode = .error
+        // A `hide()` may still be fading out; its completion is gated on
+        // `generation`, so bumping it here keeps that orderOut from killing
+        // this toast 0.3 s in (lived: "Ready" after the first model install
+        // flashed and vanished).
+        generation += 1
         stopAnimation()
         removeProgressBar()
         removeErrorLayer()
