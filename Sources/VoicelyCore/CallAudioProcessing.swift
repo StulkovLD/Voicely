@@ -59,7 +59,11 @@ public enum CallAudioProcessing {
 
     /// The rate WhisperKit and FluidAudio both consume.
     public static let targetRate: Double = 16000
-    public static let systemASRMaxWindowSeconds: Double = 30
+    /// Bounded read window for disk-backed call channels. Every window seam
+    /// can cut through a word, so fewer seams read better; Parakeet chunks
+    /// long input internally with seam repair, which our outer cuts bypass.
+    /// 300 s of 16 kHz mono Float32 is ~19 MB — still a bounded read.
+    public static let systemASRMaxWindowSeconds: Double = 300
     public static let systemASRContextPaddingSeconds: Double = 0.25
     public static let sameSpeakerMergeGapSeconds: Double = 0.20
 

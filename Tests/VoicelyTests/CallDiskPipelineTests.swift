@@ -5,7 +5,7 @@ import XCTest
 @testable import VoicelyCore
 
 final class CallDiskPipelineTests: XCTestCase {
-    func testLongCallReaderMaterializesOnlyRequestedThirtySecondWindow() throws {
+    func testLongCallReaderMaterializesOnlyTheRequestedBoundedWindow() throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("voicely-call-window-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
@@ -19,8 +19,8 @@ final class CallDiskPipelineTests: XCTestCase {
             endTime: 120
         )
 
-        XCTAssertEqual(samples.count, 30 * 16_000,
-                       "a 120-second source must still allocate one bounded ASR window")
+        XCTAssertEqual(samples.count, 60 * 16_000,
+                       "the requested 60 s window fits inside the 300 s bound and must arrive whole")
         XCTAssertEqual(try CallAudioFileWindowReader.durationSeconds(of: url), 120, accuracy: 0.01)
     }
 

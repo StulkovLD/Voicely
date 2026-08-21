@@ -175,7 +175,11 @@ final class Overlay {
     }
 
     private let barCount = 32
-    private let pillWidth: CGFloat = 160
+    /// Width of the pill in its resting modes. Message toasts may stretch the
+    /// pill (`messagePillWidth`) so the text actually fits; every `show(mode:)`
+    /// returns to this base.
+    private let basePillWidth: CGFloat = 160
+    private var pillWidth: CGFloat = 160
     private let pillHeight: CGFloat = 56
     private let pillRadius: CGFloat = 28
     private let barWidth: CGFloat = 2
@@ -252,6 +256,7 @@ final class Overlay {
         createPanelIfNeeded()
         guard let p = panel else { return }
 
+        setPillWidth(basePillWidth)
         applyPlacement(to: p)
 
         // Clean up layers from other modes
@@ -501,6 +506,23 @@ final class Overlay {
         )
     }
 
+    /// Width that actually fits `message` at the toast font, clamped so short
+    /// toasts keep the familiar pill and long ones stop before absurd.
+    nonisolated static func messagePillWidth(for message: String) -> CGFloat {
+        let font = NSFont.systemFont(ofSize: 11, weight: .medium)
+        let textWidth = (message as NSString).size(withAttributes: [.font: font]).width
+        return min(440, max(160, ceil(textWidth) + 32))
+    }
+
+    private func setPillWidth(_ width: CGFloat) {
+        guard pillWidth != width else { return }
+        pillWidth = width
+        guard let p = panel else { return }
+        if let blur = p.contentView?.subviews.first {
+            blur.frame = NSRect(x: 0, y: 0, width: width, height: pillHeight)
+        }
+    }
+
     private func showMessage(
         _ message: String,
         color: NSColor,
@@ -509,11 +531,25 @@ final class Overlay {
         createPanelIfNeeded()
         guard let p = panel, let cv = p.contentView?.subviews.first?.layer else { return }
 
+        // A toast must not kill an active session's pill: remember what was on
+        // screen and put it back when the toast expires. The recording clock
+        // keeps its epoch — the session did not restart.
+        let resumeMode: OverlayMode?
+        switch mode {
+        case .recording, .loading, .downloading, .fileQueue, .fileQueuePaused:
+            resumeMode = mode
+        case .error, nil:
+            resumeMode = nil
+        }
+        let resumeStart = recordingStartTime
+
         self.mode = .error
         stopAnimation()
         removeProgressBar()
         removeErrorLayer()
         for bar in bars { bar.opacity = 0 }
+
+        setPillWidth(Self.messagePillWidth(for: message))
 
         let text = CATextLayer()
         text.frame = CGRect(x: 12, y: (pillHeight - 16) / 2, width: pillWidth - 24, height: 16)
@@ -539,12 +575,22 @@ final class Overlay {
 
         pendingHide?.cancel()
         let work = DispatchWorkItem { [weak self] in
-            guard self?.mode == .error else { return }
-            self?.removeErrorLayer()
-            self?.hide()
+            guard let self, self.mode == .error else { return }
+            self.removeErrorLayer()
+            if let resumeMode {
+                self.show(mode: resumeMode)
+                self.recordingStartTime = resumeStart
+            } else {
+                self.hide()
+            }
         }
         pendingHide = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + 5, execute: work)
+        // Toasts over an active session return to it quickly; terminal toasts
+        // stay the full 5 s the reading owner asked for.
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + (resumeMode == nil ? 5 : 2.5),
+            execute: work
+        )
     }
 
     private func removeErrorLayer() {

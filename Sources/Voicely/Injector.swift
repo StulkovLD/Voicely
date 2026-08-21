@@ -122,21 +122,24 @@ final class Injector {
             AppDelegate.debugLog("Injector: secure target; saved to disk only")
             return .blockedSecureTarget
         case .copyOnly:
-            // A terminal is a text surface with no writable caret: its
-            // scrollback is read-only, so AX has nothing to insert into, but it
-            // accepts synthetic typing. Only type into a text surface — typing
-            // blind would spray keystrokes into whatever else has focus (a
-            // Finder window would start a rename or a search).
+            // No writable caret. Two shapes land here and both accept synthetic
+            // typing: a terminal (text surface, read-only scrollback), and an
+            // Electron app whose AX bridge does not answer the focus probe at
+            // all (VS Code returns kAXErrorCannotComplete, measured live
+            // 2026-08-19 — the probe sees "nothing focused" while the user's
+            // caret blinks in its terminal). The desktop must stay clipboard:
+            // typing at Finder would spray type-select. So: type when the
+            // focus is a text surface, or when the frontmost app is a real
+            // app that is not Finder and not us.
             let copied = copyOnly(text, startedSecure: startedSecure, currentSecure: probe.isSecure)
-            guard copied == .copiedOnly, probe.isTextSurface else {
-                if !probe.isTextSurface {
-                    AppDelegate.debugLog("Injector: no caret and not a text surface; clipboard only")
+            guard copied == .copiedOnly else { return copied }
+            if probe.isTextSurface || Self.frontmostAppAcceptsTyping() {
+                if typeUnicode(text) {
+                    AppDelegate.debugLog("Injector: typed via unicode key events (textSurface=\(probe.isTextSurface))")
+                    return .directInsert
                 }
-                return copied
-            }
-            if typeUnicode(text) {
-                AppDelegate.debugLog("Injector: typed into text surface via unicode key events")
-                return .directInsert
+            } else {
+                AppDelegate.debugLog("Injector: no caret, no typing target; clipboard only")
             }
             return copied
         case .insert:
@@ -256,6 +259,16 @@ final class Injector {
             down.post(tap: .cghidEventTap)
             up.post(tap: .cghidEventTap)
         }
+        return true
+    }
+
+    /// The user aimed their caret at a real app, even if its AX bridge won't
+    /// say so. Finder means "the desktop" (typing there would type-select
+    /// files), and our own process never receives dictation.
+    private static func frontmostAppAcceptsTyping() -> Bool {
+        guard let front = NSWorkspace.shared.frontmostApplication else { return false }
+        if front.bundleIdentifier == "com.apple.finder" { return false }
+        if front.processIdentifier == ProcessInfo.processInfo.processIdentifier { return false }
         return true
     }
 

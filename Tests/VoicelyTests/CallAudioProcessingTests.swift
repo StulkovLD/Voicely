@@ -101,15 +101,18 @@ final class CallAudioProcessingTests: XCTestCase {
     }
 
     func testLongSystemTurnIsSplitIntoBoundedWindowsWithoutTimelineLoss() {
+        // The window mechanics are what is under test, so the bound is passed
+        // explicitly; the shipped default is 300 s (fewer seams for Parakeet).
         let windows = CallAudioProcessing.systemTranscriptionWindows(
             turns: [SpeakerTurn(speakerIndex: 1, start: 0, end: 65)],
-            audioDuration: 65
+            audioDuration: 65,
+            maxWindowSeconds: 30
         )
 
         XCTAssertGreaterThan(windows.count, 1)
         XCTAssertTrue(windows.allSatisfy { $0.speakerID == 1 })
         XCTAssertTrue(windows.allSatisfy {
-            $0.audioEnd - $0.audioStart <= CallAudioProcessing.systemASRMaxWindowSeconds + 1e-9
+            $0.audioEnd - $0.audioStart <= 30 + 1e-9
         })
         XCTAssertEqual(windows.first?.contentStart, 0)
         XCTAssertEqual(windows.last?.contentEnd, 65)

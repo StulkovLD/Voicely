@@ -136,7 +136,10 @@ public final class FileTranscriptionQueue {
         transcriber: any SampleTranscribing,
         modelName: String,
         centralRoot: URL,
-        chunkSampleCount: Int = 16000 * 30,
+        // 300 s per chunk (~19 MB Float32): every chunk seam can cut a word,
+        // and Parakeet handles long input internally with seam repair, so the
+        // outer cut should be rare, not the 30 s cadence the old engines used.
+        chunkSampleCount: Int = 16000 * 300,
         coordinator: TranscriptionCoordinator = TranscriptionCoordinator(),
         diarizer: (any FileDiarizing)? = nil
     ) {
