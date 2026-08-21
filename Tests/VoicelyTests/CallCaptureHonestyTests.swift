@@ -317,7 +317,7 @@ final class CallCaptureHonestyTests: XCTestCase {
         XCTAssertTrue(markdown.contains("system_duration_seconds: 3.00"))
         XCTAssertTrue(markdown.contains("channel_end_gap_seconds: 27.00"))
         XCTAssertTrue(markdown.contains("[Partial capture] System audio channel was effectively silent"))
-        XCTAssertTrue(markdown.contains("[00:00:00] You"))
+        XCTAssertTrue(markdown.contains("[00:00] You"))
     }
 
     func testPartialJSONLPrependsCaptureMetadataLine() {

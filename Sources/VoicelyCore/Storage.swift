@@ -326,6 +326,8 @@ public final class TranscriptStorage {
             "type: call",
             "date: \(isoFormatter.string(from: startTime))",
             "source_app: \(escapeYAML(app))",
+            "duration: \(CallTranscriptMerger.durationLabel(for: segments))",
+            "speakers: \(CallTranscriptMerger.speakersSummary(for: segments))",
         ]
         if captureMetadata.isPartial {
             frontMatter.append("partial_capture: true")

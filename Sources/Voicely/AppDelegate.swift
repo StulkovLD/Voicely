@@ -1514,6 +1514,72 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             )
         }
 
+        // The accepted call architecture (owner, 2026-08-19): transcribe ONE
+        // mix of system+mic, diarize that mix globally, and identify You as
+        // the diarized cluster the mic's own speech covers best. One file —
+        // one transcript: an echo can no longer yield the same sentence twice
+        // (You + Speaker N), and several people on one mic separate into
+        // distinct voices. Any mixing failure degrades honestly to the
+        // previous two-channel path below.
+        if !skipSystemChannel, let systemFileURL = audio.systemFileURL {
+            let mixURL = systemFileURL
+                .deletingLastPathComponent()
+                .appendingPathComponent("mix.wav")
+            do {
+                let mixDuration = try CallMixdown.mixdown(
+                    system: systemFileURL,
+                    mic: audio.micFileURL,
+                    to: mixURL
+                )
+                let totalWindows = max(1, Int(ceil(
+                    mixDuration / CallAudioFileWindowReader.maximumWindowSeconds
+                )))
+                var completedWindows = 0
+                updateCallTranscriptionProgress(.transcribing(
+                    completedWindows: 0,
+                    totalWindows: totalWindows
+                ))
+                let turns = await self.diarizeSystemFile(mixURL)
+                var mixSegments = await self.transcribeCallFile(
+                    fileURL: mixURL,
+                    durationSeconds: mixDuration,
+                    speaker: .other,
+                    onWindowComplete: { [weak self] in
+                        guard let self else { return }
+                        completedWindows += 1
+                        self.updateCallTranscriptionProgress(.transcribing(
+                            completedWindows: completedWindows,
+                            totalWindows: totalWindows
+                        ))
+                    }
+                )
+                mixSegments = DiarizationService.assignSpeakers(to: mixSegments, turns: turns)
+                var youIndex: Int?
+                if let micURL = audio.micFileURL {
+                    let activity = (try? CallMixdown.speechIntervals(micURL: micURL)) ?? []
+                    youIndex = CallMixdown.youSpeakerIndex(turns: turns, micActivity: activity)
+                    if youIndex == nil {
+                        AppDelegate.debugLog("call mix: no diarized cluster matched mic activity; every voice stays remote")
+                    }
+                }
+                guard !Task.isCancelled else {
+                    AppDelegate.debugLog("call finalization cancelled before artifact commit; source retained")
+                    return
+                }
+                updateCallTranscriptionProgress(.saving)
+                let transcript = CallMixdown.applyYou(to: mixSegments, youSpeakerIndex: youIndex)
+                await finalizeCallArtifacts(
+                    transcript: transcript,
+                    audio: audio,
+                    sourceApp: sourceApp,
+                    captureMetadata: captureMetadata
+                )
+                return
+            } catch {
+                AppDelegate.debugLog("call mixdown failed (\(error)); falling back to the two-channel path")
+            }
+        }
+
         // Diarize the complete system channel before ASR so every remote decode
         // window is speaker-stable. Empty/failed diarization keeps the old
         // unlabeled 30-second fallback below.
@@ -1616,7 +1682,22 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             system: systemSegments,
             systemTurns: []
         )
+        await finalizeCallArtifacts(
+            transcript: transcript,
+            audio: audio,
+            sourceApp: sourceApp,
+            captureMetadata: captureMetadata
+        )
+    }
 
+    /// Persist a finished call transcript and report the outcome. Shared tail
+    /// of both call pipelines (the mixed default and the two-channel fallback).
+    private func finalizeCallArtifacts(
+        transcript: [DialogueSegment],
+        audio: CallRecorder.CallAudio,
+        sourceApp: String?,
+        captureMetadata: CallTranscriptCaptureMetadata
+    ) async {
         let saveResult = self.storage.saveCallDetailed(
             sourceCapture: audio.sourceCapture,
             segments: transcript,

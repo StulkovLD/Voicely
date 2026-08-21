@@ -102,26 +102,33 @@ public enum CallTranscriptMerger {
         return seen.sorted()
     }
 
-    /// Legend rendered at the top of the human transcript. Lists how many remote
-    /// speakers diarization found plus the local user, so a reader can map the
-    /// "Speaker N" / "You" labels below. Returns "" when no remote speaker was
-    /// diarized (nothing to disambiguate — keeps the old plain format clean).
-    public static func legend(for segments: [DialogueSegment]) -> String {
+    /// `speakers:` front-matter value: "You + N remote" from the reader's
+    /// point of view. Counts diarized remote speakers; an undiarized remote
+    /// turn still counts as one voice.
+    public static func speakersSummary(for segments: [DialogueSegment]) -> String {
         let ids = detectedSpeakerIDs(in: segments)
-        guard !ids.isEmpty else { return "" }
-        var lines: [String] = []
-        lines.append("Speakers detected: \(ids.count)")
-        lines.append("- You: you (microphone)")
-        for id in ids {
-            lines.append("- Speaker \(id): remote participant")
-        }
-        return lines.joined(separator: "\n")
+        let hasUndiarizedRemote = segments.contains { $0.speaker == .other && $0.speakerID == nil }
+        let remote = ids.count + (hasUndiarizedRemote ? 1 : 0)
+        let hasYou = segments.contains { $0.speaker == .you }
+        if remote == 0 { return hasYou ? "You" : "none" }
+        return hasYou ? "You + \(remote)" : "\(remote)"
     }
 
-    /// Human-readable markdown. Format: `[HH:MM:SS] speaker (lang): text`.
-    /// Speaker column padded to a fixed width so lines align when scanned.
-    /// When diarization stamped remote speakers, a legend block is prepended
-    /// (see `legend(for:)`). Partial captures prepend an explicit honesty note.
+    /// `duration:` front-matter value from the last segment's end.
+    public static func durationLabel(for segments: [DialogueSegment]) -> String {
+        formatTimestamp(segments.map(\.end).max() ?? 0)
+    }
+
+    /// Human-readable markdown, one block per speaker turn (the owner's
+    /// accepted shape, 2026-08-19):
+    ///
+    ///     [00:32] Speaker 1
+    ///     Everything that speaker said until the next speaker change or a
+    ///     silence longer than `blockGapSeconds`, joined into running text.
+    ///
+    /// One timestamp per block; no per-line language tag (word-level truth
+    /// lives in the JSONL next to this file). Partial captures prepend an
+    /// explicit honesty note.
     public static func humanFormat(segments: [DialogueSegment]) -> String {
         humanFormat(segments: segments, captureMetadata: .complete)
     }
@@ -181,22 +188,37 @@ public enum CallTranscriptMerger {
         return lines.joined(separator: "\n")
     }
 
+    /// Silence inside one speaker's turn that still reads as the same thought.
+    /// Longer than this starts a new block even without a speaker change.
+    static let blockGapSeconds: Double = 6.0
+
     private static func humanBody(segments: [DialogueSegment]) -> String {
-        // Width fits the widest label we render: "Speaker 10" (10 chars) while
-        // still aligning the common "You"/"Other"/"Speaker 1" cases.
-        let width = max(5, segments.map { speakerLabel(for: $0).count }.max() ?? 5)
-        var lines: [String] = []
-        for s in segments {
-            let ts = formatTimestamp(s.start)
-            let label = speakerLabel(for: s)
-            let padded = label.padding(toLength: width, withPad: " ", startingAt: 0)
-            let lang = s.language ?? "??"
-            lines.append("[\(ts)] \(padded) (\(lang)): \(s.text)")
+        var blocks: [String] = []
+        var label: String?
+        var blockStart: Double = 0
+        var blockEnd: Double = 0
+        var texts: [String] = []
+
+        func flush() {
+            guard let label, !texts.isEmpty else { return }
+            blocks.append("[\(formatTimestamp(blockStart))] \(label)\n" + texts.joined(separator: " "))
         }
-        let body = lines.joined(separator: "\n")
-        let legendText = legend(for: segments)
-        guard !legendText.isEmpty else { return body }
-        return legendText + "\n\n" + body
+
+        for s in segments {
+            let text = s.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !text.isEmpty else { continue }
+            let segmentLabel = speakerLabel(for: s)
+            if segmentLabel != label || s.start - blockEnd > blockGapSeconds {
+                flush()
+                label = segmentLabel
+                blockStart = s.start
+                texts = []
+            }
+            texts.append(text)
+            blockEnd = max(blockEnd, s.end)
+        }
+        flush()
+        return blocks.joined(separator: "\n\n")
     }
 
     private static func partialCaptureBanner(
@@ -256,9 +278,14 @@ public enum CallTranscriptMerger {
         return String(data: data, encoding: .utf8)
     }
 
+    /// mm:ss for calls under an hour, h:mm:ss beyond — the accepted shape
+    /// keeps timestamps as small as the truth allows.
     private static func formatTimestamp(_ sec: Double) -> String {
         let s = Int(sec)
-        return String(format: "%02d:%02d:%02d", s / 3600, (s / 60) % 60, s % 60)
+        if s >= 3600 {
+            return String(format: "%d:%02d:%02d", s / 3600, (s / 60) % 60, s % 60)
+        }
+        return String(format: "%02d:%02d", s / 60, s % 60)
     }
 
     private static func roundedTwo(_ v: Double) -> Double {
