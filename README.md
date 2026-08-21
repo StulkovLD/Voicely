@@ -7,14 +7,14 @@
   <img src="https://img.shields.io/badge/platform-macOS%2014%2B-lightgrey" />
   <img src="https://img.shields.io/badge/swift-6.0-orange" />
   <img src="https://img.shields.io/badge/license-MIT-green" />
-  <img src="https://img.shields.io/badge/engine-WhisperKit%20%2B%20FluidAudio-blue" />
+  <img src="https://img.shields.io/badge/engine-Parakeet%20%2B%20FluidAudio-blue" />
 </p>
 
 ## What it does
 
-**Dictation mode** (Option+Space): Press hotkey, speak, press again. Voicely inserts text only into the same non-secure Accessibility target that was focused when recording began. If focus changes or direct insertion is unavailable, it copies the transcript for manual paste; secure targets remain save-only. A floating glass pill shows the audio waveform while recording and a loading animation while transcribing.
+**Dictation mode** (Option+Space): Press hotkey, speak, press again. The transcript lands wherever your caret is — native fields via Accessibility, terminals and AX-silent apps (VS Code included) via synthetic typing. No caret in sight → the text goes to the clipboard and the pill says so. An **Output** menu setting can pin dictation to the clipboard permanently. Secure fields are save-only, always. A floating glass pill shows the live waveform while recording.
 
-**Call recording mode** (menu bar): Records system audio + microphone simultaneously. Transcribes with speaker diarization (who said what). Saves to `~/Documents/Voicely/calls/<id>/` as markdown + JSONL + WAV artifacts.
+**Call recording mode** (menu bar): Records system audio + microphone, mixes them into one track, transcribes the mix and diarizes it globally — so an echo can't duplicate a sentence, and several people on one mic separate into distinct voices. "You" is identified by matching diarized voices against your mic's own activity. Transcripts read as speaker-turn blocks (`[00:32] Speaker 1` + running prose) and save to `~/Documents/Voicely/calls/<id>/` as markdown + word-level JSONL + WAV.
 
 ## Why Voicely
 
@@ -53,17 +53,29 @@ Microphone and Accessibility again after an update.
 4. Wait for the first model download + prepare step.
 5. **Screen Recording** is only requested later, when you first use **Record Call**.
 
-Current first-model lineup:
-- **GigaAM V3 RU** — ~426 MB, needs 8 GB RAM, best Russian experience
-- **Large V3 Turbo Q** — ~632 MB, needs 8 GB RAM
-- **Medium** — ~1.5 GB, needs 16 GB RAM
-- **Large V3 Turbo** — ~3 GB, needs 24+ GB RAM
-
-Clean installs ask you to choose explicitly; Voicely does not silently auto-pick a model anymore. The first prepare step can take a minute; later launches are fast.
+Current model: **Parakeet V3** — ~470 MB, 8 GB RAM, 25 European languages
+including English and Russian, natively punctuated, roughly 30x realtime on
+Apple Silicon. It downloads on first use; the first prepare step can take a
+minute, later launches are fast.
 
 **Call recording** captures system audio via **ScreenCaptureKit** (macOS Screen Recording permission) — no BlackHole or virtual audio device needed.
 
-**Speaker diarization** runs fully on-device via **FluidAudio** (pyannote + WeSpeaker models). The diarization models download automatically on first use — no Hugging Face account or token required.
+**Speaker diarization** runs fully on-device via **FluidAudio** (pyannote community-1 + WeSpeaker models). The diarization models download automatically on first use — no Hugging Face account or token required.
+
+## Your AI agent can use Voicely
+
+The `voicely` CLI and a local MCP server make every capability agent-native:
+
+```bash
+voicely connect claude        # register the MCP server (also: codex, cursor)
+mkdir -p ~/.claude/skills/voicely && curl -fsSL https://voicely.art/skill/SKILL.md \
+  -o ~/.claude/skills/voicely/SKILL.md   # teach the agent the whole playbook
+```
+
+Four MCP tools (`transcribe_file`, `list_transcripts`, `get_transcript`,
+`get_last_call`) plus a skill that covers bootstrap-from-zero, online video via
+yt-dlp (YouTube / TikTok / Instagram), and "watching" videos by pairing
+word-level timestamps with extracted frames. Everything stays on the machine.
 
 **Build from source**
 
