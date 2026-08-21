@@ -333,6 +333,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     // #12: Cancellable transcription task and discard window
     private var transcriptionTask: Task<Void, Never>?
     private var discardWindow: Date?
+
+    /// Set when the user pressed the hotkey after the discard window closed and
+    /// was warned; the next press cancels. Reset whenever a dictation session
+    /// ends, so a stale warning never turns the next dictation's first press
+    /// into an unannounced cancel.
+    private var transcribeEscapeArmed = false
     // #7: Cancellable call recording task
     private var callTask: Task<Void, Never>?
     // AppKit termination is synchronous unless the delegate explicitly defers
@@ -637,7 +643,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 self.overlay.updateProgress(0, status: "Voice model...")
                 // Auto-hide overlay after 10s - progress continues in menu bar
                 DispatchQueue.main.asyncAfter(deadline: .now() + 10) { [weak self] in
-                    guard let self, self.overlay.currentMode == .downloading else { return }
+                    guard let self,
+                          Self.isModelSetupOverlay(self.overlay.currentMode) else { return }
                     self.overlay.hide()
                 }
             } else {
@@ -1192,8 +1199,18 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             }
 
         case .transcribing:
-            // #12/#74: Discard recording if hotkey pressed within 3s of entering transcribing state
-            if let window = discardWindow, Date().timeIntervalSince(window) < 3.0 {
+            // #12/#74: Discard recording if hotkey pressed within 3s of entering transcribing state.
+            // Past that window the hotkey used to be swallowed silently and there
+            // was no way out of a wedged transcription short of quitting, so a
+            // second press now arms the same discard — see `transcribeEscapeArmed`.
+            if let window = discardWindow,
+               Date().timeIntervalSince(window) >= 3.0,
+               !transcribeEscapeArmed {
+                transcribeEscapeArmed = true
+                overlay.showInfo("Transcribing… press again to cancel")
+                return
+            }
+            if discardWindow != nil {
                 transcriber.cancelCurrentTask()
                 transcriptionTask?.cancel()
                 transcriptionTask = nil
@@ -1204,6 +1221,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 dictationInjectionTarget = nil
                 commitActiveDictationRecovery(transcriptURL: nil)
                 discardWindow = nil
+                transcribeEscapeArmed = false
                 overlay.hide()
                 overlay.showInfo("Discarded")
                 state = .idle
@@ -1211,7 +1229,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 resetMenubar()
                 return
             }
-            // #17: Silently ignore hotkey during transcription (no repeated toast)
             return
         case .callRecording:
             overlay.showInfo("Recording call...")
@@ -1985,6 +2002,21 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         appState == .idle && !fileWorkActive
     }
 
+    /// Whether the model-setup overlay is still up, in either of the two modes
+    /// it passes through.
+    ///
+    /// A download watchdog that only recognised `.downloading` disarmed itself
+    /// the moment progress reached `.loadingModel` and the overlay switched to
+    /// `.loading` — a mode with no auto-hide. The pill then stayed on screen
+    /// forever. Both modes belong to the same "setting up a model" pill, so the
+    /// watchdog must accept either.
+    nonisolated static func isModelSetupOverlay(_ mode: OverlayMode?) -> Bool {
+        switch mode {
+        case .downloading, .loading: return true
+        default: return false
+        }
+    }
+
     nonisolated static func canStartFileTranscription(
         modelReady: Bool,
         appState: AppState
@@ -2567,7 +2599,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         overlay.show(mode: .downloading)
         overlay.updateProgress(0, status: "Voice model...")
         DispatchQueue.main.asyncAfter(deadline: .now() + 10) { [weak self] in
-            guard let self, self.overlay.currentMode == .downloading else { return }
+            guard let self,
+                  Self.isModelSetupOverlay(self.overlay.currentMode) else { return }
             self.overlay.hide()
         }
 
@@ -2725,7 +2758,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             guard !Task.isCancelled else { return }
 
             if cleanupDownloadCache {
-                transcriber.cancelAndCleanup()
+                transcriber.cancelAndCleanup(model: model)
             } else {
                 try? FileManager.default.removeItem(at: model.modelDirectory)
                 transcriber.cancelAndReset()
@@ -2769,6 +2802,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         dictationInjectionTarget = nil
         state = .idle
         discardWindow = nil
+        transcribeEscapeArmed = false
         transcriptionTask = nil
         fileQueue?.resume()
         resetMenubar()

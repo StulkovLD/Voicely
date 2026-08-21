@@ -33,10 +33,11 @@ final class DiskSpaceCheckTests: XCTestCase {
         XCTAssertTrue(desc.contains("1.2 GB"), "got: \(desc)")
     }
 
-    func testAvailableDiskSpaceReturnsPositive() async throws {
+    func testAvailableCapacityReturnsPositive() throws {
         // Smoke test: asking for the real volume's capacity must yield > 0.
+        // The installer's precheck reads capacity through this file system.
         let tmp = FileManager.default.temporaryDirectory
-        let capacity = try WhisperKitEngine.testAvailableDiskSpace(at: tmp)
+        let capacity = try FoundationGigaAMAssetFileSystem().availableCapacity(at: tmp)
         XCTAssertGreaterThan(capacity, 0,
             "temp volume must report a positive available-capacity")
     }

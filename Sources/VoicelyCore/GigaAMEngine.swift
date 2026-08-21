@@ -320,10 +320,13 @@ final class GigaAMEngine: @unchecked Sendable, TranscriberEngine, SampleTranscri
                 } onCancel: {
                     task.cancel()
                 }
+                // Publish before the epoch check: the runtime is good even if
+                // this request has since been cancelled, and the next dictation
+                // must not pay for the load a second time.
+                finishLoading(runtime)
                 try checkCancellation(cancellationToken)
-                finishLoading(runtime, cancellationToken: cancellationToken)
             } catch {
-                finishLoading(nil, cancellationToken: cancellationToken)
+                finishLoading(nil)
                 throw error
             }
         } else {
@@ -380,13 +383,12 @@ final class GigaAMEngine: @unchecked Sendable, TranscriberEngine, SampleTranscri
         if !requestCancellation.isCurrent(cancellationToken) { task.cancel() }
     }
 
-    private func finishLoading(
-        _ runtime: GigaAMRuntime?,
-        cancellationToken: GigaAMRequestCancellation.Token
-    ) {
-        let mayPublish = requestCancellation.isCurrent(cancellationToken)
+    /// Publish a loaded runtime regardless of which epoch asked for it.
+    /// See `GigaAMCTCEngine.finishLoading` — same hazard, same reasoning: a
+    /// cancelled request must not throw away a model that finished loading.
+    private func finishLoading(_ runtime: GigaAMRuntime?) {
         stateLock.lock()
-        if mayPublish {
+        if let runtime {
             self.runtime = runtime
         }
         isLoading = false

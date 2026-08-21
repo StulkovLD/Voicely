@@ -18,26 +18,23 @@ struct OverlayAccessibilityAnnouncement: Sendable, Equatable {
 
 struct OverlayPlacementRequest {
     let screens: [CGRect]
-    let focusedElementRect: CGRect?
-    let focusedWindowRect: CGRect?
-    let fallbackScreen: CGRect?
+    let cursor: CGPoint?
+    let mainScreen: CGRect?
     let panelSize: CGSize
     let screenMargin: CGFloat
     let bottomOffset: CGFloat
 
     init(
         screens: [CGRect],
-        focusedElementRect: CGRect?,
-        focusedWindowRect: CGRect?,
-        fallbackScreen: CGRect?,
+        cursor: CGPoint?,
+        mainScreen: CGRect?,
         panelSize: CGSize,
         screenMargin: CGFloat = 24,
         bottomOffset: CGFloat = 140
     ) {
         self.screens = screens
-        self.focusedElementRect = focusedElementRect
-        self.focusedWindowRect = focusedWindowRect
-        self.fallbackScreen = fallbackScreen
+        self.cursor = cursor
+        self.mainScreen = mainScreen
         self.panelSize = panelSize
         self.screenMargin = screenMargin
         self.bottomOffset = bottomOffset
@@ -47,38 +44,29 @@ struct OverlayPlacementRequest {
 struct OverlayPlacement: Equatable {
     let screenFrame: CGRect
     let frame: CGRect
-    let targetRect: CGRect?
 }
 
 enum OverlayPlacementResolver {
+    /// The pill is centred on the screen the user is on, and attaches to
+    /// nothing — no focused element, no window, no AX call.
+    ///
+    /// Attaching it to the focused element is what forced the overlay to ask
+    /// Accessibility where the caret was, which is what made it clamp the AX
+    /// messaging timeout process-wide, which is what broke every paste in the
+    /// product. This resolver reads only screen geometry and the cursor, so
+    /// none of that can come back.
+    ///
+    /// Active screen = the one under the cursor: it is a process-local,
+    /// non-blocking read that needs no permission and cannot time out, and with
+    /// "Displays have separate Spaces" it is also macOS's own notion of the
+    /// active display. `NSScreen.main` follows key-window focus, which is
+    /// unreliable for a nonactivating panel in an LSUIElement app — fallback
+    /// only.
     static func resolve(_ request: OverlayPlacementRequest) -> OverlayPlacement? {
         guard !request.screens.isEmpty else { return nil }
+        guard let screenFrame = activeScreen(in: request) else { return nil }
 
-        let resolvedTarget = [request.focusedElementRect, request.focusedWindowRect]
-            .compactMap { $0 }
-            .compactMap(normalizedRect)
-            .lazy
-            .compactMap { targetRect -> (screenFrame: CGRect, targetRect: CGRect)? in
-                guard let screenFrame = targetScreen(for: targetRect, screens: request.screens) else {
-                    return nil
-                }
-                return (screenFrame: screenFrame, targetRect: targetRect)
-            }
-            .first
-
-        let targetRect = resolvedTarget?.targetRect
-        let screenFrame = resolvedTarget?.screenFrame
-            ?? fallbackScreen(in: request.screens, preferred: request.fallbackScreen)
-
-        guard let screenFrame else { return nil }
-
-        let idealMidX = targetRect?.midX ?? screenFrame.midX
-        let originX = clampedOrigin(
-            ideal: idealMidX - request.panelSize.width / 2,
-            minimum: screenFrame.minX + request.screenMargin,
-            maximum: screenFrame.maxX - request.screenMargin - request.panelSize.width,
-            fallback: screenFrame.minX + max((screenFrame.width - request.panelSize.width) / 2, 0)
-        )
+        let originX = screenFrame.minX + max((screenFrame.width - request.panelSize.width) / 2, 0)
         let originY = clampedOrigin(
             ideal: screenFrame.minY + request.bottomOffset,
             minimum: screenFrame.minY + request.screenMargin,
@@ -88,49 +76,22 @@ enum OverlayPlacementResolver {
 
         return OverlayPlacement(
             screenFrame: screenFrame,
-            frame: CGRect(origin: CGPoint(x: originX, y: originY), size: request.panelSize),
-            targetRect: targetRect
+            frame: CGRect(origin: CGPoint(x: originX, y: originY), size: request.panelSize)
         )
     }
 
-    private static func normalizedRect(_ rect: CGRect) -> CGRect? {
-        guard rect.width > 0,
-              rect.height > 0,
-              rect.origin.x.isFinite,
-              rect.origin.y.isFinite,
-              rect.width.isFinite,
-              rect.height.isFinite else { return nil }
-        return rect
-    }
-
-    private static func targetScreen(for targetRect: CGRect, screens: [CGRect]) -> CGRect? {
-        let center = CGPoint(x: targetRect.midX, y: targetRect.midY)
-        if let containingScreen = screens.first(where: { $0.contains(center) }) {
-            return containingScreen
+    private static func activeScreen(in request: OverlayPlacementRequest) -> CGRect? {
+        if let cursor = request.cursor,
+           cursor.x.isFinite,
+           cursor.y.isFinite,
+           let hit = request.screens.first(where: { $0.contains(cursor) }) {
+            return hit
         }
-
-        let intersections = screens.map { screen in
-            (screen: screen, area: screen.intersection(targetRect).area)
+        if let mainScreen = request.mainScreen,
+           let matching = request.screens.first(where: { $0 == mainScreen }) {
+            return matching
         }
-        if let best = intersections.max(by: { lhs, rhs in
-            if lhs.area == rhs.area {
-                return stableScreenOrder(lhs.screen, rhs.screen)
-            }
-            return lhs.area < rhs.area
-        }), best.area > 0 {
-            return best.screen
-        }
-
-        return nil
-    }
-
-    private static func fallbackScreen(in screens: [CGRect], preferred fallbackScreen: CGRect?) -> CGRect? {
-        if let fallbackScreen,
-           let matchingScreen = screens.first(where: { $0 == fallbackScreen }) {
-            return matchingScreen
-        }
-
-        return screens.sorted(by: stableScreenOrder).first
+        return request.screens.sorted(by: stableScreenOrder).first
     }
 
     private static func stableScreenOrder(_ lhs: CGRect, _ rhs: CGRect) -> Bool {
@@ -151,13 +112,6 @@ enum OverlayPlacementResolver {
     }
 }
 
-private extension CGRect {
-    var area: CGFloat {
-        guard !isNull, !isEmpty else { return 0 }
-        return width * height
-    }
-}
-
 @MainActor
 final class Overlay {
     // .canJoinAllSpaces and .moveToActiveSpace are mutually exclusive; macOS 26
@@ -165,15 +119,30 @@ final class Overlay {
     // the overlay panel on first creation and froze launch at "Preparing".
     // The pill must appear on whatever space the user is on, including
     // fullscreen apps, so keep canJoinAllSpaces + fullScreenAuxiliary.
+    // `.fullScreenAuxiliary` only offers the pill to *our own* fullscreen window
+    // (NSWindow.h: "can be shown with the fullscreen window"). Following ANOTHER
+    // app into its fullscreen Space — a fullscreen editor, say — is what
+    // `.canJoinAllApplications` is for: "able to join all applications, allowing
+    // it to join other apps' sets and full screen spaces… commonly used for
+    // floating windows and system overlays" (macOS 13+; we target 14).
+    //
+    // It sits in the Primary/Auxiliary/CanJoinAllApplications exclusivity group,
+    // NOT the canJoinAllSpaces/moveToActiveSpace one — so it cannot resurrect the
+    // illegal pair that crashed panel creation and froze launch at "Preparing".
     nonisolated static let panelCollectionBehavior: NSWindow.CollectionBehavior = [
         .canJoinAllSpaces,
         .fullScreenAuxiliary,
+        .canJoinAllApplications,
     ]
 
     private var panel: NSPanel?
     private var bars: [CALayer] = []
     private var timer: DispatchSourceTimer?
-    private var mode: OverlayMode = .recording
+    /// Nil once hidden. Every watchdog in the app asks "is the panel still in
+    /// mode X?" via `currentMode`; a mode that outlived `hide()` answered yes
+    /// for a panel already on its way out, which let a stale check re-show it
+    /// mid-fade and strand it on screen.
+    private var mode: OverlayMode?
     private var smoothLevels: [Float] = Array(repeating: 0, count: 32)
     private var tick: Int = 0
     private var progressTrackLayer: CALayer?
@@ -182,7 +151,7 @@ final class Overlay {
     private var errorTextLayer: CATextLayer?
     private var generation: Int = 0
     var isVisible: Bool { panel?.isVisible ?? false }
-    var currentMode: OverlayMode { mode }
+    var currentMode: OverlayMode? { mode }
     private var timerTextLayer: CATextLayer?
     private var recordingStartTime: Date?
     private var segmentProgressLayer: CATextLayer?
@@ -190,6 +159,12 @@ final class Overlay {
     /// Brief warning shown via timer text during recording (e.g. "10s remaining")
     private var recordingWarningExpiry: Date?
     nonisolated(unsafe) private var screenObserver: NSObjectProtocol?
+    nonisolated(unsafe) private var activeSpaceObserver: NSObjectProtocol?
+
+    /// Screen the pill was last placed on. Guards the 5 Hz reposition check so
+    /// setFrame only runs when the user actually moved to another display —
+    /// within one screen the pill never moves.
+    private var placedScreenFrame: CGRect?
 
     // Audio level updated from background audio thread - nonisolated access via lock
     private let levelLock = NSLock()
@@ -235,16 +210,38 @@ final class Overlay {
                 self?.repositionToTargetSurface()
             }
         }
+        // Must be NSWorkspace's own centre — this notification is not posted to
+        // NotificationCenter.default.
+        activeSpaceObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.activeSpaceDidChangeNotification,
+            object: nil, queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in
+                self?.repositionToTargetSurface()
+            }
+        }
     }
 
     deinit {
         if let obs = screenObserver { NotificationCenter.default.removeObserver(obs) }
+        if let obs = activeSpaceObserver {
+            NSWorkspace.shared.notificationCenter.removeObserver(obs)
+        }
     }
 
-    /// Reposition overlay to the currently focused user surface.
+    /// Move the pill to the screen the user is on, if that is not where it
+    /// already is.
+    ///
+    /// Cheap enough to call at 5 Hz from the animation tick, which is the only
+    /// trigger that catches the case the owner actually hit: walking the cursor
+    /// to another display posts no notification at all.
     private func repositionToTargetSurface() {
         guard let p = panel, p.isVisible else { return }
-        applyPlacement(to: p)
+        guard let placement = resolvePlacement() else { return }
+        guard placement.screenFrame != placedScreenFrame else { return }
+        placedScreenFrame = placement.screenFrame
+        p.setFrame(placement.frame, display: false)
+        refreshContentsScale()
     }
 
     func show(mode: OverlayMode) {
@@ -461,6 +458,10 @@ final class Overlay {
 
     func hide() {
         guard let p = panel else { return }
+        // Clear the mode up front, not in the completion handler: the fade
+        // leaves `isVisible == true` for 0.3 s, and any watchdog that reads a
+        // stale mode in that gap would act on a panel that is already leaving.
+        mode = nil
         generation += 1
         let capturedGeneration = generation
 
@@ -602,7 +603,13 @@ final class Overlay {
             backing: .buffered,
             defer: false
         )
-        p.level = .floating
+        // `.floating` (3) loses to legacy fullscreen content, which is shown at
+        // NSFullScreenModeWindowLevel — the pill vanished behind fullscreen video
+        // and games. `.statusBar` (25) is the conventional level for a system
+        // overlay. Not cosmetic: with Managed/Transient/Stationary unspecified,
+        // NSWindow derives Space and exposé behaviour from the window level, so
+        // this belongs with `.canJoinAllApplications` above, not apart from it.
+        p.level = .statusBar
         p.isOpaque = false
         p.backgroundColor = .clear
         p.hasShadow = true
@@ -654,6 +661,7 @@ final class Overlay {
 
     private func applyPlacement(to panel: NSPanel) {
         guard let placement = resolvePlacement() else { return }
+        placedScreenFrame = placement.screenFrame
         panel.setFrame(placement.frame, display: false)
         refreshContentsScale()
     }
@@ -662,9 +670,8 @@ final class Overlay {
         OverlayPlacementResolver.resolve(
             OverlayPlacementRequest(
                 screens: NSScreen.screens.map(\.frame),
-                focusedElementRect: focusedElementRect(),
-                focusedWindowRect: focusedWindowRect(),
-                fallbackScreen: NSScreen.main?.frame,
+                cursor: NSEvent.mouseLocation,
+                mainScreen: NSScreen.main?.frame,
                 panelSize: CGSize(width: pillWidth, height: pillHeight)
             )
         )
@@ -676,82 +683,6 @@ final class Overlay {
         segmentProgressLayer?.contentsScale = scale
         progressTextLayer?.contentsScale = scale
         errorTextLayer?.contentsScale = scale
-    }
-
-    // AXUIElementCopyAttributeValue is a synchronous cross-process call to the
-    // focused app's accessibility server. Without a messaging timeout it blocks
-    // the main thread until that app replies — an unresponsive or slow-to-answer
-    // frontmost app (some Electron/heavy apps) froze Voicely at launch when the
-    // overlay tried to place itself. Cap every AX query so it fails fast and the
-    // overlay falls back to the main screen instead of hanging.
-    private static let axMessagingTimeout: Float = 0.25
-
-    private func systemWideElementWithTimeout() -> AXUIElement {
-        let systemWide = AXUIElementCreateSystemWide()
-        AXUIElementSetMessagingTimeout(systemWide, Self.axMessagingTimeout)
-        return systemWide
-    }
-
-    private func focusedElementRect() -> CGRect? {
-        let systemWide = systemWideElementWithTimeout()
-        guard let focusedElement = axElement(from: systemWide, attribute: kAXFocusedUIElementAttribute as CFString) else {
-            return nil
-        }
-        AXUIElementSetMessagingTimeout(focusedElement, Self.axMessagingTimeout)
-        return axFrame(of: focusedElement)
-    }
-
-    private func focusedWindowRect() -> CGRect? {
-        let systemWide = systemWideElementWithTimeout()
-        guard let focusedApplication = axElement(from: systemWide, attribute: kAXFocusedApplicationAttribute as CFString) else {
-            return nil
-        }
-        AXUIElementSetMessagingTimeout(focusedApplication, Self.axMessagingTimeout)
-        guard let focusedWindow = axElement(from: focusedApplication, attribute: kAXFocusedWindowAttribute as CFString) else {
-            return nil
-        }
-        AXUIElementSetMessagingTimeout(focusedWindow, Self.axMessagingTimeout)
-        return axFrame(of: focusedWindow)
-    }
-
-    private func axElement(from element: AXUIElement, attribute: CFString) -> AXUIElement? {
-        var rawValue: AnyObject?
-        guard AXUIElementCopyAttributeValue(element, attribute, &rawValue) == .success,
-              let rawValue,
-              CFGetTypeID(rawValue) == AXUIElementGetTypeID() else { return nil }
-        return unsafeDowncast(rawValue, to: AXUIElement.self)
-    }
-
-    private func axFrame(of element: AXUIElement) -> CGRect? {
-        guard let origin = axPoint(from: element, attribute: kAXPositionAttribute as CFString),
-              let size = axSize(from: element, attribute: kAXSizeAttribute as CFString),
-              size.width > 0,
-              size.height > 0 else { return nil }
-        return CGRect(origin: origin, size: size)
-    }
-
-    private func axPoint(from element: AXUIElement, attribute: CFString) -> CGPoint? {
-        var rawValue: AnyObject?
-        guard AXUIElementCopyAttributeValue(element, attribute, &rawValue) == .success,
-              let rawValue,
-              CFGetTypeID(rawValue) == AXValueGetTypeID() else { return nil }
-        let axValue = unsafeDowncast(rawValue, to: AXValue.self)
-        guard AXValueGetType(axValue) == .cgPoint else { return nil }
-        var point = CGPoint.zero
-        guard AXValueGetValue(axValue, .cgPoint, &point) else { return nil }
-        return point
-    }
-
-    private func axSize(from element: AXUIElement, attribute: CFString) -> CGSize? {
-        var rawValue: AnyObject?
-        guard AXUIElementCopyAttributeValue(element, attribute, &rawValue) == .success,
-              let rawValue,
-              CFGetTypeID(rawValue) == AXValueGetTypeID() else { return nil }
-        let axValue = unsafeDowncast(rawValue, to: AXValue.self)
-        guard AXValueGetType(axValue) == .cgSize else { return nil }
-        var size = CGSize.zero
-        guard AXValueGetValue(axValue, .cgSize, &size) else { return nil }
-        return size
     }
 
     private func startAnimation() {
@@ -777,6 +708,10 @@ final class Overlay {
 
     private func animationTick() {
         tick += 1
+        // Walking the cursor to another display posts no notification, so the
+        // only way to follow the user there is to look. 5 Hz, and it costs
+        // nothing unless the screen actually changed.
+        if tick % 6 == 0 { repositionToTargetSurface() }
         // Update recording timer (skip during warning period)
         if mode == .recording, let start = recordingStartTime, let layer = timerTextLayer {
             if let expiry = recordingWarningExpiry {
@@ -816,6 +751,10 @@ final class Overlay {
             case .downloading:
                 target = 0 // unreachable due to early return above
             case .error, .fileQueue, .fileQueuePaused:
+                target = 0
+            case nil:
+                // Hidden: the animation timer is torn down with the panel, so
+                // this only lands on a frame already in flight. Settle the bars.
                 target = 0
             }
 

@@ -1,175 +1,132 @@
 import XCTest
 @testable import Voicely
 
+/// Dictation inserts wherever the caret is at commit time — it is a stand-in for
+/// typing, and typing lands where the caret is.
+///
+/// These replace the capture-at-start pinning tests. Those were not worthless:
+/// they were the executable spec of a design that pinned the target captured
+/// when dictation began. That spec was retired deliberately — its failure mode
+/// was that one stray AX timeout downgraded every healthy target to "changed",
+/// so nothing pasted anywhere, in any app. Live-caret's failure mode is "text
+/// goes where you were looking", which the user sees and can undo.
 final class InjectorStateTests: XCTestCase {
-    private func target(
-        pid: pid_t = 100,
-        role: String? = "AXTextArea",
-        subrole: String? = "AXStandardTextArea",
-        identifier: String? = "editor",
-        domIdentifier: String? = nil,
-        isSecure: Bool = false
-    ) -> InjectionTargetIdentity {
-        InjectionTargetIdentity(
-            pid: pid,
-            role: role,
-            subrole: subrole,
-            identifier: identifier,
-            domIdentifier: domIdentifier,
-            isSecure: isSecure
+
+    // MARK: - The three rules
+
+    func testCaretPresentInserts() {
+        XCTAssertEqual(
+            CaretPolicy.decide(
+                startedSecure: false,
+                currentSecure: false,
+                secureEventInputAtCommit: false,
+                caretPresent: true
+            ),
+            .insert
         )
     }
 
-    func testChangedFocusedTargetRequiresManualCopy() {
-        let original = target(pid: 101, identifier: "editor-A")
-        let current = target(pid: 202, identifier: "editor-B")
-
-        let validation = InjectionTargetPolicy.validate(
-            original: original,
-            current: current,
-            sameAXElement: false
-        )
-
-        XCTAssertEqual(validation, .targetChanged)
+    /// No caret blinking anywhere ⇒ clipboard, never a silent write.
+    func testNoCaretAnywhereCopiesInstead() {
         XCTAssertEqual(
-            InjectionTargetPolicy.fallback(for: validation),
+            CaretPolicy.decide(
+                startedSecure: false,
+                currentSecure: false,
+                secureEventInputAtCommit: false,
+                caretPresent: false
+            ),
             .copyOnly
         )
     }
 
-    func testSameFocusedTargetUsesOnlyAXDirectInsertion() {
-        let original = target()
+    // MARK: - Secure beats everything
 
-        let validation = InjectionTargetPolicy.validate(
-            original: original,
-            current: original,
-            sameAXElement: true
-        )
-
-        XCTAssertEqual(validation, .sameTarget)
+    /// The one bit kept from capture-at-start. Without it, dictating a password
+    /// and then clicking away sees a harmless target at commit and writes the
+    /// password to the general pasteboard.
+    func testSecureAtStartNeverReachesTheClipboardEvenIfFocusMovedSomewhereSafe() {
         XCTAssertEqual(
-            InjectionTargetPolicy.fallback(for: validation),
-            .directInsert
-        )
-    }
-
-    func testMatchingAXObjectWithChangedMetadataIsRejected() {
-        let original = target(identifier: "editor-A")
-        let current = target(identifier: "editor-B")
-
-        XCTAssertEqual(
-            InjectionTargetPolicy.validate(
-                original: original,
-                current: current,
-                sameAXElement: true
+            CaretPolicy.decide(
+                startedSecure: true,
+                currentSecure: false,
+                secureEventInputAtCommit: false,
+                caretPresent: true
             ),
-            .targetChanged
+            .saveOnly,
+            "a password dictated at start must never be pasted or copied later"
         )
     }
 
-    func testSecureOriginalTargetAllowsSaveOnly() {
-        let original = target(isSecure: true)
-
-        let validation = InjectionTargetPolicy.validate(
-            original: original,
-            current: original,
-            sameAXElement: true
-        )
-
-        XCTAssertEqual(validation, .originalSecure)
+    func testSecureTargetAtCommitIsRefused() {
         XCTAssertEqual(
-            InjectionTargetPolicy.fallback(for: validation),
-            .saveOnly
-        )
-    }
-
-    func testSecureCurrentTargetAllowsSaveOnly() {
-        let original = target()
-        let current = target(
-            pid: 202,
-            role: "AXSecureTextField",
-            subrole: nil,
-            identifier: "password",
-            isSecure: true
-        )
-
-        let validation = InjectionTargetPolicy.validate(
-            original: original,
-            current: current,
-            sameAXElement: false
-        )
-
-        XCTAssertEqual(validation, .currentSecure)
-        XCTAssertEqual(
-            InjectionTargetPolicy.fallback(for: validation),
-            .saveOnly
-        )
-    }
-
-    func testSecureEventInputAtCaptureAllowsSaveOnly() {
-        let original = target()
-
-        XCTAssertEqual(
-            InjectionTargetPolicy.validate(
-                original: original,
-                current: original,
-                sameAXElement: true,
-                originalSecureEventInputEnabled: true
+            CaretPolicy.decide(
+                startedSecure: false,
+                currentSecure: true,
+                secureEventInputAtCommit: false,
+                caretPresent: true
             ),
-            .originalSecure
-        )
-    }
-
-    func testSecureEventInputAtCommitAllowsSaveOnly() {
-        let original = target()
-
-        let validation = InjectionTargetPolicy.validate(
-            original: original,
-            current: original,
-            sameAXElement: true,
-            currentSecureEventInputEnabled: true
-        )
-
-        XCTAssertEqual(validation, .currentSecure)
-        XCTAssertEqual(
-            InjectionTargetPolicy.fallback(for: validation),
             .saveOnly
         )
     }
 
-    func testMissingTargetRequiresManualCopy() {
-        let validation = InjectionTargetPolicy.validate(
-            original: target(),
-            current: nil,
-            sameAXElement: false
-        )
-
-        XCTAssertEqual(validation, .invalid)
+    func testSecureEventInputAtCommitIsRefused() {
         XCTAssertEqual(
-            InjectionTargetPolicy.fallback(for: validation),
-            .copyOnly
+            CaretPolicy.decide(
+                startedSecure: false,
+                currentSecure: false,
+                secureEventInputAtCommit: true,
+                caretPresent: true
+            ),
+            .saveOnly
         )
     }
+
+    /// Secure must win over every combination, including "no caret" — otherwise
+    /// a password would fall through to the clipboard branch.
+    func testSecureWinsOverEveryOtherInput() {
+        for currentSecure in [true, false] {
+            for sei in [true, false] {
+                for caret in [true, false] {
+                    XCTAssertEqual(
+                        CaretPolicy.decide(
+                            startedSecure: true,
+                            currentSecure: currentSecure,
+                            secureEventInputAtCommit: sei,
+                            caretPresent: caret
+                        ),
+                        .saveOnly,
+                        "startedSecure must dominate (current:\(currentSecure) sei:\(sei) caret:\(caret))"
+                    )
+                }
+            }
+        }
+    }
+
+    // MARK: - Secure detection
 
     func testSecureAXTargetIsDetectedByRoleOrSubrole() {
-        XCTAssertTrue(AXTargetSecurity.isSecure(
-            role: "AXSecureTextField",
-            subrole: nil
-        ))
-        XCTAssertTrue(AXTargetSecurity.isSecure(
-            role: "AXTextField",
-            subrole: "AXSecureTextField"
-        ))
-        XCTAssertFalse(AXTargetSecurity.isSecure(
-            role: "AXTextField",
-            subrole: "AXStandardTextField"
-        ))
-        XCTAssertFalse(AXTargetSecurity.isSecure(role: nil, subrole: nil))
-        XCTAssertTrue(AXTargetSecurity.isSecure(
-            role: "AXTextField",
-            subrole: nil,
-            secureEventInputEnabled: true
-        ))
-        XCTAssertNotEqual(InjectionResult.blockedSecureTarget, .failed)
+        XCTAssertTrue(AXTargetSecurity.isSecure(role: "AXSecureTextField", subrole: nil))
+        XCTAssertTrue(AXTargetSecurity.isSecure(role: "AXTextField", subrole: "AXSecureTextField"))
+        XCTAssertTrue(
+            AXTargetSecurity.isSecure(role: "AXTextArea", subrole: nil, secureEventInputEnabled: true)
+        )
+        XCTAssertFalse(AXTargetSecurity.isSecure(role: "AXTextArea", subrole: nil))
+    }
+
+    /// The secure predicate is pure, so it passes whether or not anything calls
+    /// it — deleting its wiring would leave this suite green while passwords
+    /// leak. This pins the DECISION, not the predicate.
+    func testSecureDetectionIsActuallyWiredIntoTheDecision() {
+        let secureRole = AXTargetSecurity.isSecure(role: "AXSecureTextField", subrole: nil)
+        XCTAssertEqual(
+            CaretPolicy.decide(
+                startedSecure: false,
+                currentSecure: secureRole,
+                secureEventInputAtCommit: false,
+                caretPresent: true
+            ),
+            .saveOnly,
+            "a secure role must reach a refusal, not merely evaluate to true in isolation"
+        )
     }
 }

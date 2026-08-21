@@ -8,80 +8,36 @@ enum InjectionResult: Equatable, Sendable {
     case failed
 }
 
-enum AXInsertionAttempt: Equatable {
-    case inserted
-    case secureTarget
-    case targetChanged
-    case failed
-}
-
-struct InjectionTargetIdentity: Equatable, Sendable {
-    let pid: pid_t
-    let role: String?
-    let subrole: String?
-    let identifier: String?
-    let domIdentifier: String?
-    let isSecure: Bool
-}
-
-enum InjectionTargetValidation: Equatable, Sendable {
-    case sameTarget
-    case targetChanged
-    case originalSecure
-    case currentSecure
-    case invalid
-}
-
-enum InjectionTargetFallback: Equatable, Sendable {
-    case directInsert
+/// What to do with a finished transcript.
+///
+/// Text goes wherever the caret is at commit time — dictation is a stand-in for
+/// typing, and typing lands where the caret is. The previous design pinned the
+/// target captured at dictation start and refused to write anywhere else; that
+/// pin is what turned a single stray AX timeout into "nothing pastes, anywhere",
+/// because one false negative downgraded every healthy target to "changed".
+enum InjectionDecision: Equatable, Sendable {
+    case insert
     case copyOnly
     case saveOnly
 }
 
-enum InjectionTargetPolicy {
-    static func validate(
-        original: InjectionTargetIdentity?,
-        current: InjectionTargetIdentity?,
-        sameAXElement: Bool,
-        originalSecureEventInputEnabled: Bool = false,
-        currentSecureEventInputEnabled: Bool = false
-    ) -> InjectionTargetValidation {
-        if originalSecureEventInputEnabled || original?.isSecure == true {
-            return .originalSecure
-        }
-        if currentSecureEventInputEnabled || current?.isSecure == true {
-            return .currentSecure
-        }
-        guard let original,
-              let current,
-              original.pid > 0,
-              current.pid > 0,
-              original.role != nil,
-              current.role != nil else {
-            return .invalid
-        }
-        guard sameAXElement,
-              original.pid == current.pid,
-              original.role == current.role,
-              original.subrole == current.subrole,
-              original.identifier == current.identifier,
-              original.domIdentifier == current.domIdentifier else {
-            return .targetChanged
-        }
-        return .sameTarget
-    }
-
-    static func fallback(
-        for validation: InjectionTargetValidation
-    ) -> InjectionTargetFallback {
-        switch validation {
-        case .sameTarget:
-            return .directInsert
-        case .targetChanged, .invalid:
-            return .copyOnly
-        case .originalSecure, .currentSecure:
+enum CaretPolicy {
+    /// Secure beats everything; otherwise the caret decides.
+    ///
+    /// `startedSecure` is the one thing worth remembering from dictation start:
+    /// without it, dictating into a password field and then clicking away would
+    /// see a non-secure target at commit and copy the password to the general
+    /// pasteboard.
+    static func decide(
+        startedSecure: Bool,
+        currentSecure: Bool,
+        secureEventInputAtCommit: Bool,
+        caretPresent: Bool
+    ) -> InjectionDecision {
+        if startedSecure || currentSecure || secureEventInputAtCommit {
             return .saveOnly
         }
+        return caretPresent ? .insert : .copyOnly
     }
 }
 
@@ -97,140 +53,219 @@ enum AXTargetSecurity {
     }
 }
 
+/// The only thing carried over from dictation start. See `CaretPolicy.decide`:
+/// it exists so a password dictated into a secure field cannot reach the
+/// pasteboard after the user clicks away.
 struct InjectionTargetToken {
-    fileprivate let element: AXUIElement?
-    let identity: InjectionTargetIdentity?
-    let secureEventInputEnabled: Bool
+    let startedSecure: Bool
 }
 
 @MainActor
 final class Injector {
-    /// Capture the exact focused AX target at dictation start. A missing target
-    /// is still represented by a token so commit fails closed to copy-only.
+    /// Was the focus secure when dictation started?
     func captureTarget() -> InjectionTargetToken {
         let secureEventInputEnabled = IsSecureEventInputEnabled()
-        let snapshot = focusedTargetSnapshot(
-            secureEventInputEnabled: secureEventInputEnabled
-        )
+        guard let element = focusedElement() else {
+            return InjectionTargetToken(startedSecure: secureEventInputEnabled)
+        }
         return InjectionTargetToken(
-            element: snapshot?.element,
-            identity: snapshot?.identity,
-            secureEventInputEnabled: secureEventInputEnabled
+            startedSecure: AXTargetSecurity.isSecure(
+                role: stringAttribute(kAXRoleAttribute as CFString, from: element),
+                subrole: stringAttribute(kAXSubroleAttribute as CFString, from: element),
+                secureEventInputEnabled: secureEventInputEnabled
+            )
         )
     }
 
-    /// Inject text only into the target captured when dictation started.
+    /// Insert into whatever holds the caret right now; clipboard only when
+    /// nothing does.
     @discardableResult
     func inject(
         text: String,
         target: InjectionTargetToken?
     ) -> InjectionResult {
-        let initialValidation = resolve(target).validation
-        switch InjectionTargetPolicy.fallback(for: initialValidation) {
+        let startedSecure = target?.startedSecure ?? false
+        let probe = probeCaret()
+
+        let decision = CaretPolicy.decide(
+            startedSecure: startedSecure,
+            currentSecure: probe.isSecure,
+            secureEventInputAtCommit: IsSecureEventInputEnabled(),
+            caretPresent: probe.caret != nil
+        )
+
+        switch decision {
         case .saveOnly:
-            AppDelegate.debugLog("Injector: original or current target is secure")
+            AppDelegate.debugLog("Injector: secure target; saved to disk only")
             return .blockedSecureTarget
         case .copyOnly:
-            return copyOnly(text, target: target)
-        case .directInsert:
+            // A terminal is a text surface with no writable caret: its
+            // scrollback is read-only, so AX has nothing to insert into, but it
+            // takes a real Cmd+V. Only do this for a text surface — pressing
+            // Cmd+V blind would paste into whatever else has focus (a Finder
+            // window would happily paste a file).
+            let copied = copyOnly(text, startedSecure: startedSecure, currentSecure: probe.isSecure)
+            guard copied == .copiedOnly, probe.isTextSurface else {
+                if !probe.isTextSurface {
+                    AppDelegate.debugLog("Injector: no caret and not a text surface; clipboard only")
+                }
+                return copied
+            }
+            if postPaste() {
+                AppDelegate.debugLog("Injector: pasted into text surface via Cmd+V")
+                return .directInsert
+            }
+            return copied
+        case .insert:
             break
         }
 
-        // 1. Try AX insert on the captured target.
-        switch tryAXInsert(text, target: target) {
-        case .inserted:
-            AppDelegate.debugLog("Injector: AX insert succeeded")
-            return .directInsert
-        case .secureTarget:
-            AppDelegate.debugLog("Injector: secure AX target; clipboard fallback blocked")
-            return .blockedSecureTarget
-        case .targetChanged:
-            return copyOnly(text, target: target)
-        case .failed:
-            AppDelegate.debugLog("Injector: AX insert unavailable; copying for manual paste")
-            return copyOnly(text, target: target)
+        guard let caret = probe.caret else {
+            return copyOnly(text, startedSecure: startedSecure, currentSecure: probe.isSecure)
         }
+        // Re-check in the same run-loop turn as the write: the reads above can
+        // run target-side code, and secure state must not be stale.
+        guard !IsSecureEventInputEnabled() else { return .blockedSecureTarget }
+
+        let wrote = AXUIElementSetAttributeValue(
+            caret.element,
+            kAXSelectedTextAttribute as CFString,
+            text as CFString
+        )
+        guard wrote == .success else {
+            AppDelegate.debugLog("Injector: AX write refused; copying for manual paste")
+            return copyOnly(text, startedSecure: startedSecure, currentSecure: probe.isSecure)
+        }
+
+        // Chrome reports the attribute settable, returns .success, and discards
+        // the text (measured 6/6); Terminal.app's read-only scrollback lies the
+        // same way. Believe the write only if the selection actually moved.
+        //
+        // Deliberately asymmetric: ONLY "nothing moved at all" counts as
+        // discarded. An app that inserts but repositions the caret its own way
+        // (autocorrect, IME, length caps) still counts as inserted — a stale
+        // clipboard is visible and recoverable, silent text loss is not.
+        if let after = selectedTextRange(of: caret.element),
+           after.location == caret.range.location,
+           after.length == caret.range.length {
+            AppDelegate.debugLog("Injector: target swallowed the write; copying for manual paste")
+            return copyOnly(text, startedSecure: startedSecure, currentSecure: probe.isSecure)
+        }
+        AppDelegate.debugLog("Injector: AX insert succeeded")
+        return .directInsert
     }
 
     // MARK: - Accessibility API
 
-    private func tryAXInsert(
-        _ text: String,
-        target: InjectionTargetToken?
-    ) -> AXInsertionAttempt {
-        let initial = resolve(target)
-        switch initial.validation {
-        case .originalSecure, .currentSecure:
-            return .secureTarget
-        case .targetChanged, .invalid:
-            return .targetChanged
-        case .sameTarget:
-            break
+    private struct Caret {
+        let element: AXUIElement
+        let range: CFRange
+    }
+
+    private struct CaretProbe {
+        let caret: Caret?
+        let isSecure: Bool
+        /// Focus is a text surface that refuses AX writes — a terminal. Its
+        /// scrollback is read-only, so there is no caret to write into, but it
+        /// takes a real Cmd+V. Measured: Terminal.app accepts a synthetic
+        /// paste; VS Code's xterm.js swallows it (canvas inside Electron).
+        let isTextSurface: Bool
+    }
+
+    /// Is there a caret blinking somewhere right now?
+    ///
+    /// `kAXSelectedText` settability is the test, and it is measured, not
+    /// assumed: an editable NSTextView reports it settable, a non-editable one
+    /// does not. `kAXSelectedTextRange` is NOT a caret test — it is settable on
+    /// read-only text too (you can select it), so it would call Terminal
+    /// scrollback a caret. It serves only to verify the write afterwards.
+    private func probeCaret() -> CaretProbe {
+        guard let element = focusedElement() else {
+            return CaretProbe(caret: nil, isSecure: false, isTextSurface: false)
         }
-        guard let element = initial.element else { return .targetChanged }
+
+        let role = stringAttribute(kAXRoleAttribute as CFString, from: element)
+        let subrole = stringAttribute(kAXSubroleAttribute as CFString, from: element)
+        if AXTargetSecurity.isSecure(role: role, subrole: subrole) {
+            return CaretProbe(caret: nil, isSecure: true, isTextSurface: false)
+        }
+
+        let isTextSurface = role == "AXTextArea" || role == "AXTextField"
+
         var settable: DarwinBoolean = false
         AXUIElementIsAttributeSettable(element, kAXSelectedTextAttribute as CFString, &settable)
-        guard settable.boolValue else { return .failed }
-
-        // AX queries above can run arbitrary target-side code. Resolve again at
-        // the commit boundary and write only to that revalidated element.
-        let commit = resolve(target)
-        switch commit.validation {
-        case .originalSecure, .currentSecure:
-            return .secureTarget
-        case .targetChanged, .invalid:
-            return .targetChanged
-        case .sameTarget:
-            break
+        guard settable.boolValue else {
+            return CaretProbe(caret: nil, isSecure: false, isTextSurface: isTextSurface)
         }
-        guard let commitElement = commit.element else { return .targetChanged }
-        guard !IsSecureEventInputEnabled() else { return .secureTarget }
-        let result = AXUIElementSetAttributeValue(
-            commitElement,
-            kAXSelectedTextAttribute as CFString,
-            text as CFString
-        )
-        return result == .success ? .inserted : .failed
-    }
-
-    private struct FocusedTargetSnapshot {
-        let element: AXUIElement
-        let identity: InjectionTargetIdentity
-    }
-
-    private struct ResolvedTarget {
-        let validation: InjectionTargetValidation
-        let element: AXUIElement?
-    }
-
-    private func resolve(_ target: InjectionTargetToken?) -> ResolvedTarget {
-        let secureEventInputEnabled = IsSecureEventInputEnabled()
-        let current = focusedTargetSnapshot(
-            secureEventInputEnabled: secureEventInputEnabled
-        )
-        let sameElement: Bool
-        if let originalElement = target?.element,
-           let currentElement = current?.element {
-            sameElement = CFEqual(originalElement, currentElement)
-        } else {
-            sameElement = false
+        // No readable range means no way to tell an insert from a swallow, so
+        // there is no verifiable contract — treat it as no caret.
+        guard let range = selectedTextRange(of: element) else {
+            return CaretProbe(caret: nil, isSecure: false, isTextSurface: isTextSurface)
         }
-        let validation = InjectionTargetPolicy.validate(
-            original: target?.identity,
-            current: current?.identity,
-            sameAXElement: sameElement,
-            originalSecureEventInputEnabled: target?.secureEventInputEnabled ?? false,
-            currentSecureEventInputEnabled: secureEventInputEnabled
-        )
-        return ResolvedTarget(
-            validation: validation,
-            element: validation == .sameTarget ? current?.element : nil
+        return CaretProbe(
+            caret: Caret(element: element, range: range),
+            isSecure: false,
+            isTextSurface: isTextSurface
         )
     }
 
-    private func focusedTargetSnapshot(
-        secureEventInputEnabled: Bool
-    ) -> FocusedTargetSnapshot? {
+    /// Key that means "paste".
+    ///
+    /// Resolved against the ASCII-capable layout, not the user's current one,
+    /// because that is how macOS itself matches Cmd-shortcuts. Measured: on a
+    /// Russian layout `vk 9` produces "м", yet Cmd+V still pastes — so testing
+    /// the current layout would switch this off for layouts where it works
+    /// perfectly. Falls back to 9 (V on ANSI) when a layout exposes no data,
+    /// which is the case for IMEs.
+    private static func pasteKeyCode() -> CGKeyCode {
+        let ansiV: CGKeyCode = 9
+        guard let source = TISCopyCurrentASCIICapableKeyboardLayoutInputSource()?
+                .takeRetainedValue(),
+              let dataPtr = TISGetInputSourceProperty(source, kTISPropertyUnicodeKeyLayoutData)
+        else { return ansiV }
+        let data = Unmanaged<CFData>.fromOpaque(dataPtr).takeUnretainedValue() as Data
+
+        for code in CGKeyCode(0)...CGKeyCode(127) {
+            var deadKeyState: UInt32 = 0
+            var chars = [UniChar](repeating: 0, count: 4)
+            var length = 0
+            let status = data.withUnsafeBytes { raw -> OSStatus in
+                guard let layout = raw.baseAddress?
+                    .assumingMemoryBound(to: UCKeyboardLayout.self) else { return -1 }
+                return UCKeyTranslate(
+                    layout, UInt16(code), UInt16(kUCKeyActionDown), 0,
+                    UInt32(LMGetKbdType()), OptionBits(kUCKeyTranslateNoDeadKeysBit),
+                    &deadKeyState, 4, &length, &chars
+                )
+            }
+            if status == noErr, length == 1, chars[0] == UniChar(UInt8(ascii: "v")) {
+                return code
+            }
+        }
+        return ansiV
+    }
+
+    /// Press Cmd+V at whatever is focused. Only ever called with the transcript
+    /// already verified onto the clipboard.
+    private func postPaste() -> Bool {
+        guard CGPreflightPostEventAccess() else {
+            AppDelegate.debugLog("Injector: no post-event access; leaving text on the clipboard")
+            return false
+        }
+        guard !IsSecureEventInputEnabled() else { return false }
+        let key = Self.pasteKeyCode()
+        guard let source = CGEventSource(stateID: .combinedSessionState),
+              let down = CGEvent(keyboardEventSource: source, virtualKey: key, keyDown: true),
+              let up = CGEvent(keyboardEventSource: source, virtualKey: key, keyDown: false)
+        else { return false }
+        down.flags = .maskCommand
+        up.flags = .maskCommand
+        down.post(tap: .cghidEventTap)
+        up.post(tap: .cghidEventTap)
+        return true
+    }
+
+    private func focusedElement() -> AXUIElement? {
         let systemWide = AXUIElementCreateSystemWide()
         var focusedRef: AnyObject?
         guard AXUIElementCopyAttributeValue(
@@ -239,27 +274,20 @@ final class Injector {
             &focusedRef
         ) == .success,
         let focusedRef else { return nil }
-        let element = focusedRef as! AXUIElement
+        return (focusedRef as! AXUIElement)
+    }
 
-        var pid: pid_t = 0
-        guard AXUIElementGetPid(element, &pid) == .success else { return nil }
-        let role = stringAttribute(kAXRoleAttribute as CFString, from: element)
-        let subrole = stringAttribute(kAXSubroleAttribute as CFString, from: element)
-        let identity = InjectionTargetIdentity(
-            pid: pid,
-            role: role,
-            subrole: subrole,
-            identifier: stringAttribute(kAXIdentifierAttribute as CFString, from: element),
-            // AXWebConstants.h defines this stable attribute name, but older
-            // Xcode SDKs do not import the kAXDOMIdentifierAttribute symbol.
-            domIdentifier: stringAttribute("AXDOMIdentifier" as CFString, from: element),
-            isSecure: AXTargetSecurity.isSecure(
-                role: role,
-                subrole: subrole,
-                secureEventInputEnabled: secureEventInputEnabled
-            )
-        )
-        return FocusedTargetSnapshot(element: element, identity: identity)
+    private func selectedTextRange(of element: AXUIElement) -> CFRange? {
+        var value: AnyObject?
+        guard AXUIElementCopyAttributeValue(
+            element,
+            kAXSelectedTextRangeAttribute as CFString,
+            &value
+        ) == .success,
+        let value else { return nil }
+        var range = CFRange()
+        guard AXValueGetValue(value as! AXValue, .cfRange, &range) else { return nil }
+        return range
     }
 
     private func stringAttribute(
@@ -277,19 +305,19 @@ final class Injector {
 
     // MARK: - Manual clipboard fallback
 
+    /// `startedSecure` and `currentSecure` come from the caller's probe rather
+    /// than a second AX round-trip; the SEI check is repeated here because this
+    /// is the only clipboard mutation and it must fail closed.
     private func copyOnly(
         _ text: String,
-        target: InjectionTargetToken?
+        startedSecure: Bool,
+        currentSecure: Bool
     ) -> InjectionResult {
         let pasteboard = NSPasteboard.general
 
-        // Re-resolve immediately before the only clipboard mutation. Secure
-        // targets and Secure Event Input always fail closed to save-only.
-        switch InjectionTargetPolicy.fallback(for: resolve(target).validation) {
-        case .saveOnly:
+        guard !startedSecure, !currentSecure else {
+            AppDelegate.debugLog("Injector: secure target; refusing clipboard write")
             return .blockedSecureTarget
-        case .directInsert, .copyOnly:
-            break
         }
 
         guard !IsSecureEventInputEnabled() else {

@@ -70,6 +70,22 @@ private enum GigaAMCTCConstants {
     /// A tail shorter than one mel window (20 ms) yields no frames; feeding it
     /// to the front-end would abort the whole transcription instead.
     static let minTailSamples = 320
+    /// One 30 s window decodes in well under a second on any supported Mac.
+    /// 90 s matches the WhisperKit path and only ever fires on a wedged call.
+    static let inferenceDeadlineSeconds: UInt64 = 90
+}
+
+/// Carries a CoreML call across the `withDeadline` boundary. `MLModel` and its
+/// feature providers predate Sendable; the pair is only ever touched by the one
+/// task that builds it, so the unchecked conformance is confined to here rather
+/// than weakened for the whole CoreML import.
+private struct GigaAMInferenceInput: @unchecked Sendable {
+    let provider: MLFeatureProvider
+    let model: MLModel
+
+    func run() async throws -> MLFeatureProvider {
+        try await model.prediction(from: provider)
+    }
 }
 
 final class GigaAMCTCEngine: @unchecked Sendable, TranscriberEngine, SampleTranscribing, PreloadableTranscriberEngine, CancelableTranscriberEngine, DownloadReportingTranscriberEngine, LanguageSessionResettable {
@@ -253,10 +269,27 @@ final class GigaAMCTCEngine: @unchecked Sendable, TranscriberEngine, SampleTrans
         )
         try checkCancellation(cancellationToken)
 
-        let output = try await runtime.model.prediction(from: MLDictionaryFeatureProvider(dictionary: [
-            "features": features,
-            "length": try GigaAMDSP.makeInt32Array(shape: [1], values: [Int32(trueFrames)])
-        ]))
+        // Deadline the inference, mirroring the WhisperKit path. A wedged ANE
+        // call used to hold the coordinator lease forever, so every later
+        // dictation blocked in `acquire()` behind it with no way out but a
+        // restart. The model load above is deliberately left unbounded —
+        // compiling CoreML legitimately takes minutes on a first run.
+        let input = try GigaAMInferenceInput(
+            provider: MLDictionaryFeatureProvider(dictionary: [
+                "features": features,
+                "length": try GigaAMDSP.makeInt32Array(shape: [1], values: [Int32(trueFrames)])
+            ]),
+            model: runtime.model
+        )
+        let output: MLFeatureProvider
+        do {
+            output = try await withDeadline(seconds: GigaAMCTCConstants.inferenceDeadlineSeconds) {
+                try await input.run()
+            }
+        } catch is DeadlineExceeded {
+            vlog("GigaAM CTC: inference exceeded \(GigaAMCTCConstants.inferenceDeadlineSeconds)s deadline")
+            throw TranscriberError.whisperKitFailed("Transcription timed out. Try again.")
+        }
         guard let logProbs = output.featureValue(for: "log_probs")?.multiArrayValue else {
             throw TranscriberError.whisperKitFailed("GigaAM CTC output missing")
         }
@@ -333,10 +366,13 @@ final class GigaAMCTCEngine: @unchecked Sendable, TranscriberEngine, SampleTrans
                 } onCancel: {
                     task.cancel()
                 }
+                // Publish before the epoch check: the runtime is good even if
+                // this request has since been cancelled, and the next dictation
+                // must not pay for the load a second time.
+                finishLoading(runtime)
                 try checkCancellation(cancellationToken)
-                finishLoading(runtime, cancellationToken: cancellationToken)
             } catch {
-                finishLoading(nil, cancellationToken: cancellationToken)
+                finishLoading(nil)
                 throw error
             }
         } else {
@@ -393,13 +429,20 @@ final class GigaAMCTCEngine: @unchecked Sendable, TranscriberEngine, SampleTrans
         if !requestCancellation.isCurrent(cancellationToken) { task.cancel() }
     }
 
-    private func finishLoading(
-        _ runtime: GigaAMCTCRuntime?,
-        cancellationToken: GigaAMRequestCancellation.Token
-    ) {
-        let mayPublish = requestCancellation.isCurrent(cancellationToken)
+    /// Publish a loaded runtime regardless of which epoch asked for it.
+    ///
+    /// A cancelled epoch means "the request that started this no longer wants a
+    /// transcript" — it does not mean the runtime is invalid. The runtime belongs
+    /// to the engine, and the engine is dropped wholesale when the model changes,
+    /// so there is no stale-model hazard here.
+    ///
+    /// Discarding it was a real hang: pressing the hotkey within the 3-second
+    /// discard window bumps the epoch, the compiled 440 MB model was thrown away,
+    /// `modelState` stayed `.ready`, and the next dictation paid the entire load
+    /// again — inside the coordinator lease, behind an overlay with no watchdog.
+    private func finishLoading(_ runtime: GigaAMCTCRuntime?) {
         stateLock.lock()
-        if mayPublish {
+        if let runtime {
             self.runtime = runtime
         }
         isLoading = false

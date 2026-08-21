@@ -50,9 +50,9 @@ final class WhisperModelCatalogTests: XCTestCase {
             XCTFail("expected GigaAM v3 model in WhisperModel.all")
             return
         }
-        XCTAssertEqual(model.ramRequirementLabel, "8 GB RAM")
         let label = model.userFacingLabel(isRecommended: false)
-        XCTAssertTrue(label.contains("Russian, punctuated"))
+        XCTAssertTrue(label.contains("Best in Russian"), label)
+        XCTAssertTrue(label.contains("RU only"), "must state it speaks nothing else: \(label)")
     }
 
     func testModelCapabilitiesMatchActualBackends() throws {
@@ -93,16 +93,38 @@ final class WhisperModelCatalogTests: XCTestCase {
         let model = try XCTUnwrap(
             WhisperModel.all.first { $0.variant == "gigaam-multilingual-ctc" }
         )
-        XCTAssertEqual(model.ramRequirementLabel, "8 GB RAM")
         let label = model.userFacingLabel(isRecommended: false)
-        XCTAssertTrue(label.contains("RU/EN/KK/KY/UZ"))
-        XCTAssertTrue(label.contains("punctuated"))
+        XCTAssertTrue(label.contains("Best in Russian"), label)
+        XCTAssertTrue(label.contains("RU/EN/KK/KY/UZ"), label)
     }
 
-    func testWhisperKitModelsAreLabeledUniversal() throws {
+    func testWhisperKitModelsAreLabeledForAnyLanguage() throws {
         let model = try XCTUnwrap(
             WhisperModel.all.first { $0.backend == .whisperKit }
         )
-        XCTAssertTrue(model.userFacingLabel(isRecommended: false).contains("Universal, punctuated"))
+        XCTAssertTrue(model.userFacingLabel(isRecommended: false).contains("Any language"))
+    }
+
+    /// Every model punctuates and `available()` already filters by RAM, so
+    /// neither fact distinguishes anything — they only cost the reader a scan.
+    func testLabelsCarryNoFactTrueOfEveryModel() {
+        for model in WhisperModel.all {
+            let label = model.userFacingLabel(isRecommended: false)
+            XCTAssertFalse(label.contains("punctuated"), label)
+            XCTAssertFalse(label.contains("RAM"), label)
+        }
+    }
+
+    /// The two GigaAM models sit at the same size and both lead in Russian;
+    /// coverage is the only thing that tells them apart, so it must be visible.
+    func testTheTwoGigaAMModelsAreToldApartByCoverage() throws {
+        let ru = try XCTUnwrap(WhisperModel.all.first { $0.backend == .gigaAMV3E2ERNNT })
+        let multi = try XCTUnwrap(WhisperModel.all.first { $0.backend == .gigaAMMultilingualCTC })
+
+        XCTAssertNotEqual(
+            ru.userFacingLabel(isRecommended: false),
+            multi.userFacingLabel(isRecommended: false)
+        )
+        XCTAssertNotEqual(ru.onboardingHint, multi.onboardingHint)
     }
 }

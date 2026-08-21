@@ -177,24 +177,32 @@ public struct WhisperModel: Sendable, Equatable {
         return "\(minRAMGB) GB RAM"
     }
 
+    /// What sets this model apart from the others on offer. Anything true of
+    /// every model is noise the reader has to look past to find the difference:
+    /// they all punctuate, and `available()` already filters by RAM, so a model
+    /// the Mac cannot run is never shown in the first place.
+    ///
+    /// The two GigaAM models are not ranked against each other — we have no
+    /// measurement saying which is sharper in Russian — so they differ by
+    /// coverage, not by claim.
     public var onboardingHint: String? {
         switch backend {
         case .gigaAMV3E2ERNNT:
-            return "Russian, punctuated"
+            return "Best in Russian · RU only"
         case .gigaAMMultilingualCTC:
-            return "RU/EN/KK/KY/UZ · punctuated"
+            return "Best in Russian · RU/EN/KK/KY/UZ"
         case .whisperKit:
-            return "Universal, punctuated"
+            return "Any language"
         }
     }
 
     public func userFacingLabel(isRecommended: Bool) -> String {
-        var label = "\(displayName) (\(sizeLabel)), needs \(ramRequirementLabel)"
+        var label = "\(displayName) · \(sizeLabel)"
         if let hint = onboardingHint {
-            label += " — \(hint)"
+            label += " · \(hint)"
         }
         if isRecommended {
-            label += "  - Recommended"
+            label += " · Recommended"
         }
         return label
     }
@@ -588,10 +596,14 @@ public final class Transcriber {
     }
 
     /// Cancel download and clean up partial files. Resets engine so next attempt starts fresh.
-    public func cancelAndCleanup() {
+    ///
+    /// `model` is explicit because the selection can move on while a cancel is
+    /// still draining: reading `selectedModel` here would delete whichever model
+    /// the user picked next, not the one they cancelled.
+    public func cancelAndCleanup(model: WhisperModel) {
         cancelCurrentTask()
         // Delete partial model files
-        let dir = selectedModel.modelDirectory
+        let dir = model.modelDirectory
         if FileManager.default.fileExists(atPath: dir.path) {
             vlog("Deleting partial model directory: \(dir.path)")
             try? FileManager.default.removeItem(at: dir)
@@ -1162,7 +1174,7 @@ final class AppleSpeechEngine: TranscriberEngine {
 // MARK: - Deadline Helper
 
 /// Sentinel error for timeout detection.
-private struct DeadlineExceeded: Error {}
+struct DeadlineExceeded: Error {}
 
 private final class SpeechRecognitionCompletionState: @unchecked Sendable {
     private let lock = NSLock()
@@ -1212,7 +1224,11 @@ private final class DeadlineFlag: @unchecked Sendable {
 
 /// Run an async operation with a deadline. If the operation doesn't complete in time,
 /// throws `DeadlineExceeded`. Uses `withCheckedThrowingContinuation` to avoid Sendable constraints.
-private func withDeadline<T>(
+///
+/// Note the deadline frees the *caller* — it cannot abort an in-flight CoreML/ANE
+/// call. That is exactly what is needed here: the coordinator lease is released on
+/// unwind, so one wedged inference stops holding every later request hostage.
+func withDeadline<T>(
     seconds: UInt64,
     operation: @Sendable @escaping () async throws -> T
 ) async throws -> T {
@@ -1263,9 +1279,6 @@ final class WhisperKitEngine: @unchecked Sendable, SessionTranscriberEngine, Ses
 
     /// Whether a model download is currently in progress.
     private var isDownloadInProgress = false
-
-    /// Reference to polling task so it can be cancelled.
-    private var pollingTask: Task<Void, Never>?
 
     /// Lock-protected getter for pipe (#17: avoid data race on pipe read).
     private func getPipe() -> WhisperKit? {
@@ -1455,14 +1468,15 @@ final class WhisperKitEngine: @unchecked Sendable, SessionTranscriberEngine, Ses
     }
 
     /// Cancel any in-progress download, model load, or transcription.
+    ///
+    /// This only latches the flag `checkCancellation` reads between phases. The
+    /// download itself stops because `preloadTask.cancel()` propagates into the
+    /// installer's transport — this engine holds no handle on that transfer.
     func cancel() {
         pipeLock.lock()
         cancelled = true
-        let polling = pollingTask
-        pollingTask = nil
         isDownloadInProgress = false
         pipeLock.unlock()
-        polling?.cancel()
         vlog("WhisperKit: cancel requested")
     }
 
@@ -1504,7 +1518,6 @@ final class WhisperKitEngine: @unchecked Sendable, SessionTranscriberEngine, Ses
         }
         isLoading = false
         isDownloadInProgress = false
-        pollingTask = nil
         pipeLock.unlock()
     }
 
@@ -1527,12 +1540,6 @@ final class WhisperKitEngine: @unchecked Sendable, SessionTranscriberEngine, Ses
     private func setDownloading(_ value: Bool) {
         pipeLock.lock()
         isDownloadInProgress = value
-        pipeLock.unlock()
-    }
-
-    func setPollingTask(_ task: Task<Void, Never>?) {
-        pipeLock.lock()
-        pollingTask = task
         pipeLock.unlock()
     }
 
@@ -1942,121 +1949,58 @@ final class WhisperKitEngine: @unchecked Sendable, SessionTranscriberEngine, Ses
     ) async throws -> WhisperKit {
         vlog("WhisperKit: loading model '\(model.variant)'...")
 
-        // Track download progress by polling the specific model folder size
         let cacheRoot = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("Documents/huggingface/models/argmaxinc/whisperkit-coreml")
-        let modelDir = cacheRoot.appendingPathComponent("openai_whisper-\(model.variant)")
-        let cacheDir = cacheRoot.appendingPathComponent(".cache")
+        let folder = cacheRoot.appendingPathComponent("openai_whisper-\(model.variant)")
 
-        // #1 + #7: If model directory exists but previous load failed, it may be corrupted.
-        // Validate by checking if directory size is reasonable vs expected.
-        if FileManager.default.fileExists(atPath: modelDir.path) {
-            let currentSize = directorySize(modelDir)
-            let expectedSize = model.sizeBytes
-            // If directory exists but is less than 50% of expected size, likely corrupted/partial.
-            // 50% avoids deleting a nearly-complete download on resume (#104).
-            if currentSize > 0 && currentSize < (expectedSize * 50 / 100) {
-                vlog("WhisperKit: model directory looks incomplete (\(currentSize) bytes vs \(expectedSize) expected), deleting for clean retry")
-                try? FileManager.default.removeItem(at: modelDir)
-            }
+        guard let assets = WhisperKitAssetCatalog.assets(forVariant: model.variant) else {
+            throw TranscriberError.modelDownloadFailed("No pinned assets for \(model.variant)")
         }
-
-        // Fix 1.2 (offline start, BLOCKER): if the model is already fully on
-        // disk, do NOT call WhisperKit.download — it hits the network and a
-        // fully-downloaded model would fail to start with no connection. The
-        // incomplete (<50%) directory was just deleted above, so a directory
-        // that still exists with size ≥ 50% of expected is complete enough to
-        // load directly. Skip the download branch and load from modelDir.
-        let modelIsOnDisk: Bool = {
-            guard FileManager.default.fileExists(atPath: modelDir.path) else { return false }
-            let size = directorySize(modelDir)
-            return size >= (model.sizeBytes * 50 / 100)
-        }()
 
         try engine.checkCancellation()
 
-        let folder: URL
-        if modelIsOnDisk {
-            // Fix 1.2: model already present — load it straight from disk, no
-            // network. (The WhisperKit(config) path below sets download=false.)
-            vlog("WhisperKit: model already on disk at \(modelDir.path), skipping download")
-            folder = modelDir
-        } else {
-            // Check disk space before starting download. WhisperKit stages the model in
-            // .cache/huggingface/download/.../weight.bin.<sha>.incomplete then moves into
-            // place, and CoreML then compiles the model for local hardware. That pipeline
-            // needs ~2.5x the model size; anything less gives the cryptic
-            // NSCocoaErrorDomain Code=4 "couldn't be moved to weights" failure.
-            // Use volumeAvailableCapacityForImportantUsage so we count purgeable space.
-            let requiredBytes = UInt64(Double(model.sizeBytes) * Self.diskHeadroomMultiplier)
-            let available: UInt64
-            do {
-                available = try Self.availableDiskSpace(at: modelDir)
-            } catch {
-                // Optimistic fallback: if we can't introspect the volume (unusual
-                // sandbox, missing ancestor, network volume with broken URL keys),
-                // skip the precheck and rely on classifyDownloadError to translate
-                // the eventual POSIX/Cocoa out-of-space error to a clear message.
-                // Losing the early warning is preferable to blocking a download
-                // that could otherwise succeed.
-                vlog("WhisperKit: availableDiskSpace failed for \(modelDir.path): \(error) — skipping precheck")
-                available = UInt64.max
-            }
-            if available < requiredBytes {
-                vlog("WhisperKit: insufficient disk space at \(modelDir.path): need \(requiredBytes), have \(available)")
-                throw TranscriberError.insufficientDiskSpace(
-                    needed: requiredBytes, available: available)
-            }
+        // CoreML compiles the model for local hardware after install, and that
+        // pipeline needs headroom beyond the assets themselves; anything less
+        // gives the cryptic NSCocoaErrorDomain Code=4 "couldn't be moved to
+        // weights" failure. The installer already counts the bytes it is about
+        // to fetch, so only the surplus is declared here.
+        let compileHeadroom = Int64(Double(model.sizeBytes) * (Self.diskHeadroomMultiplier - 1))
 
-            let expectedBytes = model.sizeBytes
-            engine.setDownloading(true)
-
-            let polling: Task<Void, Never>? = Task.detached { [weak engine] in
-                while !Task.isCancelled {
-                    guard let engine, !engine.isCancelled() else { break }
-                    let modelBytes = Self.directorySize(modelDir)
-                    let cacheBytes = Self.directorySize(cacheDir)
-                    // #40: Cap at 95% so progress bar doesn't look stuck during model load phase
-                    let progress = min(0.95, Double(modelBytes + cacheBytes) / Double(expectedBytes))
+        // Fix 1.2 (offline start, BLOCKER): `install` returns without touching
+        // the network once every pinned asset is present and intact, so a
+        // fully-downloaded model still starts with no connection.
+        engine.setDownloading(true)
+        do {
+            try await WhisperKitAssetInstaller.install(
+                variant: model.variant,
+                sourceRoot: folder,
+                assets: assets,
+                revision: WhisperKitAssetCatalog.revision,
+                additionalRequiredBytes: compileHeadroom,
+                onBytes: { written, expected in
+                    guard expected > 0 else { return }
+                    // #40: Cap at 95% so the bar doesn't look stuck during the load phase
+                    let progress = min(0.95, Double(written) / Double(expected))
                     onProgress?(.downloadingModel(progress: progress))
-                    try? await Task.sleep(for: .seconds(1))
                 }
-            }
-            engine.setPollingTask(polling)
-
-            // #2: Download with 5-minute timeout
-            do {
-                let timeoutSeconds = min(7200, max(600, UInt64(Double(model.sizeBytes) / 500_000)))
-                folder = try await withDeadline(seconds: timeoutSeconds) {
-                    try await WhisperKit.download(variant: model.variant)
-                }
-            } catch is DeadlineExceeded {
-                polling?.cancel()
-                engine.setDownloading(false)
-                // Clean up partial download so next retry starts fresh
-                let dir = model.modelDirectory
-                if FileManager.default.fileExists(atPath: dir.path) {
-                    vlog("WhisperKit: deleting partial model directory: \(dir.path)")
-                    try? FileManager.default.removeItem(at: dir)
-                }
-                vlog("WhisperKit: download timed out")
-                throw TranscriberError.modelDownloadFailed("Download timed out")
-            } catch let error as TranscriberError {
-                polling?.cancel()
-                engine.setDownloading(false)
-                vlog("WhisperKit: download failed: \(error)")
-                throw error
-            } catch {
-                polling?.cancel()
-                engine.setDownloading(false)
-                vlog("WhisperKit: download failed: \(error)")
-                // #9 + #10: Classify the error
-                throw classifyDownloadError(error)
-            }
-
-            polling?.cancel()
+            )
             engine.setDownloading(false)
-            vlog("WhisperKit: model downloaded to \(folder.path)")
+        } catch {
+            engine.setDownloading(false)
+            vlog("WhisperKit: install failed: \(error)")
+            throw classifyInstallError(error)
+        }
+
+        try engine.checkCancellation()
+
+        // HubApi staged downloads here and kept a .metadata tree per file. The
+        // installer replaced it, so this is dead weight — ~490 MB for medium.
+        let staleHubCache = cacheRoot
+            .appendingPathComponent(".cache/huggingface/download")
+            .appendingPathComponent("openai_whisper-\(model.variant)")
+        if FileManager.default.fileExists(atPath: staleHubCache.path) {
+            vlog("WhisperKit: removing stale HubApi cache at \(staleHubCache.path)")
+            try? FileManager.default.removeItem(at: staleHubCache)
         }
 
         onProgress?(.loadingModel)
@@ -2125,6 +2069,36 @@ final class WhisperKitEngine: @unchecked Sendable, SessionTranscriberEngine, Ses
     }
 
     // MARK: - Error Classification (#9, #10)
+
+    /// Translate an installer failure for the user. Cancellation and disk-space
+    /// errors carry meaning the generic network classifier would flatten, so
+    /// they are mapped first; everything else is a transport failure.
+    private static func classifyInstallError(_ error: Error) -> Error {
+        if error is CancellationError { return error }
+        if let assetError = error as? GigaAMAssetDownloadError {
+            switch assetError {
+            case let .insufficientDiskSpace(requiredBytes, availableBytes):
+                return TranscriberError.insufficientDiskSpace(
+                    needed: UInt64(max(0, requiredBytes)),
+                    available: UInt64(max(0, availableBytes))
+                )
+            case .sizeMismatch, .checksumMismatch:
+                return TranscriberError.modelDownloadFailed(
+                    "Downloaded model failed its integrity check. Try again."
+                )
+            case .assetUnavailable:
+                return TranscriberError.modelDownloadFailed(
+                    "Check your internet connection and try again."
+                )
+            default:
+                return TranscriberError.modelDownloadFailed(
+                    assetError.errorDescription ?? "Model install failed"
+                )
+            }
+        }
+        if let transcriberError = error as? TranscriberError { return transcriberError }
+        return classifyDownloadError(error)
+    }
 
     /// Classify download errors into specific user-facing messages.
     private static func classifyDownloadError(_ error: Error, depth: Int = 0) -> TranscriberError {
@@ -2208,56 +2182,6 @@ final class WhisperKitEngine: @unchecked Sendable, SessionTranscriberEngine, Ses
             i = end
         }
         return peak
-    }
-
-    /// Return the volume's available capacity in bytes, using the APFS-aware
-    /// `volumeAvailableCapacityForImportantUsageKey` which accounts for
-    /// purgeable space the kernel can free on demand.
-    ///
-    /// Side-effect-free: walks up the path to the first existing ancestor
-    /// instead of creating directories. The caller passes a model-cache URL
-    /// under `~/Documents/...` and that ancestor is guaranteed to exist on
-    /// macOS, so the walk stops quickly and the resource-value query hits
-    /// the correct volume.
-    private static func availableDiskSpace(at url: URL) throws -> UInt64 {
-        let fm = FileManager.default
-        var candidate = url
-        while !fm.fileExists(atPath: candidate.path) {
-            // Safety: stop at the filesystem root so we never loop forever
-            // if every component in the path is somehow missing.
-            if candidate.path == "/" { break }
-            candidate = candidate.deletingLastPathComponent()
-        }
-        let values = try candidate.resourceValues(
-            forKeys: [.volumeAvailableCapacityForImportantUsageKey])
-        guard let capacity = values.volumeAvailableCapacityForImportantUsage else {
-            throw TranscriberError.whisperKitFailed(
-                "Could not read disk space at \(candidate.path)")
-        }
-        return UInt64(capacity)
-    }
-
-    #if DEBUG
-    /// Test-only wrapper exposing the private disk-space helper.
-    static func testAvailableDiskSpace(at url: URL) throws -> UInt64 {
-        return try availableDiskSpace(at: url)
-    }
-    #endif
-
-    /// Calculate total size of a directory in bytes.
-    private static func directorySize(_ url: URL) -> UInt64 {
-        let fm = FileManager.default
-        guard let enumerator = fm.enumerator(
-            at: url, includingPropertiesForKeys: [.fileSizeKey],
-            options: []
-        ) else { return 0 }
-        var total: UInt64 = 0
-        for case let fileURL as URL in enumerator {
-            if let size = try? fileURL.resourceValues(forKeys: [.fileSizeKey]).fileSize {
-                total += UInt64(size)
-            }
-        }
-        return total
     }
 
     // MARK: - Resampling
