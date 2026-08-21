@@ -66,13 +66,22 @@ final class AppDelegateRuntimePolicyTests: XCTestCase {
         ))
     }
 
+    /// GigaAM and Whisper left the shipped catalog (owner's call, 2026-08-19);
+    /// the capability plumbing they exercise stays, pinned here on fixtures.
+    private func fixture(_ backend: WhisperModel.Backend, variant: String) -> WhisperModel {
+        WhisperModel(
+            variant: variant,
+            displayName: variant,
+            sizeLabel: "~1 MB",
+            sizeBytes: 1_000_000,
+            minRAMGB: 8,
+            backend: backend
+        )
+    }
+
     func testGigaAMAvailabilityAndLanguageModesMatchCapabilities() throws {
-        let giga = try XCTUnwrap(
-            WhisperModel.all.first { $0.backend == .gigaAMV3E2ERNNT }
-        )
-        let whisper = try XCTUnwrap(
-            WhisperModel.all.first { $0.backend == .whisperKit }
-        )
+        let giga = fixture(.gigaAMV3E2ERNNT, variant: "gigaam-v3-e2e-rnnt")
+        let whisper = fixture(.whisperKit, variant: "large-v3_turbo")
         let macOS14 = OperatingSystemVersion(
             majorVersion: 14,
             minorVersion: 7,
@@ -114,9 +123,7 @@ final class AppDelegateRuntimePolicyTests: XCTestCase {
     }
 
     func testMultilingualCTCLanguageModesFollowCapabilities() throws {
-        let multilingual = try XCTUnwrap(
-            WhisperModel.all.first { $0.backend == .gigaAMMultilingualCTC }
-        )
+        let multilingual = fixture(.gigaAMMultilingualCTC, variant: "gigaam-multilingual-ctc")
         XCTAssertFalse(multilingual.isSupported(on: OperatingSystemVersion(
             majorVersion: 14, minorVersion: 7, patchVersion: 0
         )))
@@ -137,9 +144,7 @@ final class AppDelegateRuntimePolicyTests: XCTestCase {
     func testFileQueueProductionWiringUsesRawEngineAndSharedCoordinator() throws {
         let coordinator = TranscriptionCoordinator()
         let engine = RuntimePolicyEngine()
-        let model = try XCTUnwrap(
-            WhisperModel.all.first { $0.backend == .whisperKit }
-        )
+        let model = fixture(.whisperKit, variant: "large-v3_turbo")
         let transcriber = Transcriber(
             coordinator: coordinator,
             selectedModel: model,
@@ -165,9 +170,7 @@ final class AppDelegateRuntimePolicyTests: XCTestCase {
         let suite = "AppDelegateRuntimePolicyTests.\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
         defer { defaults.removePersistentDomain(forName: suite) }
-        let model = try XCTUnwrap(
-            WhisperModel.all.first { $0.backend == .whisperKit }
-        )
+        let model = try XCTUnwrap(WhisperModel.all.first)
         defaults.set(model.variant, forKey: "whisperModel")
 
         XCTAssertEqual(

@@ -323,6 +323,18 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var hotkeyMenuItem: NSMenuItem!
     private var modelMenuItem: NSMenuItem!
     private var languageMenuItem: NSMenuItem!
+    private var outputMenuItem: NSMenuItem!
+
+    /// Menu-controlled destination for finished dictations. Unknown stored
+    /// values read as `.atCursor`, so a downgrade never strands the setting.
+    private var dictationDestination: DictationDestination {
+        get {
+            DictationDestination(
+                rawValue: UserDefaults.standard.string(forKey: "dictationDestination") ?? ""
+            ) ?? .atCursor
+        }
+        set { UserDefaults.standard.set(newValue.rawValue, forKey: "dictationDestination") }
+    }
     private var accessibilityTimer: Timer?
     private var hotkeyRuntimeState: HotkeyRuntimeState?
     private var lastDictationToggle: Date = .distantPast
@@ -450,6 +462,20 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         rebuildModelSubmenu()
 
         menu.addItem(NSMenuItem.separator())
+        // Dictation output submenu: where a finished dictation lands.
+        let restoredDestination = dictationDestination
+        let outputMenu = NSMenu()
+        for destination in DictationDestination.allCases {
+            let item = NSMenuItem(title: destination.menuTitle, action: #selector(selectDictationOutput(_:)), keyEquivalent: "")
+            item.representedObject = destination.rawValue
+            item.state = (destination == restoredDestination) ? .on : .off
+            outputMenu.addItem(item)
+        }
+        let outputItem = NSMenuItem(title: "Output: \(restoredDestination.menuTitle)", action: nil, keyEquivalent: "")
+        outputItem.submenu = outputMenu
+        menu.addItem(outputItem)
+        self.outputMenuItem = outputItem
+
         // Language submenu
         let restoredLanguageMode = LanguageMode.restored()
         let langMenu = NSMenu()
@@ -1129,7 +1155,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                         AppDelegate.debugLog("Injecting text...")
                         let result = self.injector.inject(
                             text: text,
-                            target: injectionTarget
+                            target: injectionTarget,
+                            destination: self.dictationDestination
                         )
                         switch result {
                         case .blockedSecureTarget:
@@ -1139,8 +1166,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                             messageShown = true
                         case .copiedOnly:
                             self.overlay.showInfo(saved == nil
-                                ? "Copied for manual paste; save failed"
-                                : "Copied for manual paste & saved")
+                                ? "Copied to clipboard; save failed"
+                                : "Copied to clipboard & saved")
                             messageShown = true
                         case .failed:
                             self.overlay.showError(saved == nil
@@ -2154,6 +2181,18 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             .credits: credits,
             NSApplication.AboutPanelOptionKey(rawValue: "Copyright"): "Voicely — free forever.",
         ])
+    }
+
+    @objc func selectDictationOutput(_ sender: NSMenuItem) {
+        guard let raw = sender.representedObject as? String,
+              let destination = DictationDestination(rawValue: raw) else { return }
+        dictationDestination = destination
+        if let submenu = outputMenuItem?.submenu {
+            for item in submenu.items {
+                item.state = ((item.representedObject as? String) == raw) ? .on : .off
+            }
+        }
+        outputMenuItem?.title = "Output: \(destination.menuTitle)"
     }
 
     @objc func selectLanguage(_ sender: NSMenuItem) {

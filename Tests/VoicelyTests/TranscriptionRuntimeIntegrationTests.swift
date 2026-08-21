@@ -177,6 +177,21 @@ private final class IntegrationFakeEngine: SessionTranscriberEngine,
 
 @MainActor
 final class TranscriptionRuntimeIntegrationTests: XCTestCase {
+
+    /// Whisper left the shipped catalog (owner's call, 2026-08-19); these
+    /// integration tests exercise the runtime with fake engines, so the model
+    /// is only a settings carrier — pinned here as a fixture.
+    static func whisperFixture(variant: String) -> WhisperModel {
+        WhisperModel(
+            variant: variant,
+            displayName: variant,
+            sizeLabel: "~1 MB",
+            sizeBytes: 1_000_000,
+            minRAMGB: 8,
+            backend: .whisperKit
+        )
+    }
+
     private func waitUntil(
         _ message: String,
         condition: @escaping @Sendable () async -> Bool
@@ -213,7 +228,7 @@ final class TranscriptionRuntimeIntegrationTests: XCTestCase {
             gate: gate,
             blocksFirstCallOnly: true
         )
-        let model = WhisperModel.all.first { $0.backend == .whisperKit }!
+        let model = Self.whisperFixture(variant: "large-v3_turbo")
         let transcriber = makeTranscriber(
             coordinator: coordinator,
             model: model,
@@ -265,7 +280,7 @@ final class TranscriptionRuntimeIntegrationTests: XCTestCase {
         )
         let probe = RuntimeProbe()
         let engine = IntegrationFakeEngine(label: "priority", probe: probe)
-        let model = WhisperModel.all.first { $0.backend == .whisperKit }!
+        let model = Self.whisperFixture(variant: "large-v3_turbo")
         let transcriber = makeTranscriber(
             coordinator: coordinator,
             model: model,
@@ -333,9 +348,8 @@ final class TranscriptionRuntimeIntegrationTests: XCTestCase {
         let probeB = RuntimeProbe()
         let engineA = IntegrationFakeEngine(label: "A", probe: probeA)
         let engineB = IntegrationFakeEngine(label: "B", probe: probeB)
-        let models = WhisperModel.all.filter { $0.backend == .whisperKit }
-        let modelA = models[0]
-        let modelB = models[1]
+        let modelA = Self.whisperFixture(variant: "large-v3_turbo")
+        let modelB = Self.whisperFixture(variant: "medium")
         let transcriber = Transcriber(
             coordinator: coordinator,
             selectedModel: modelA,
@@ -381,7 +395,7 @@ final class TranscriptionRuntimeIntegrationTests: XCTestCase {
         let coordinator = TranscriptionCoordinator()
         let probe = RuntimeProbe()
         let engine = IntegrationFakeEngine(label: "language", probe: probe)
-        let model = WhisperModel.all.first { $0.backend == .whisperKit }!
+        let model = Self.whisperFixture(variant: "large-v3_turbo")
         let transcriber = makeTranscriber(
             coordinator: coordinator,
             model: model,
@@ -413,7 +427,7 @@ final class TranscriptionRuntimeIntegrationTests: XCTestCase {
             gate: gate,
             blocksFirstCallOnly: true
         )
-        let model = WhisperModel.all.first { $0.backend == .whisperKit }!
+        let model = Self.whisperFixture(variant: "large-v3_turbo")
         let transcriber = makeTranscriber(
             coordinator: coordinator,
             model: model,
@@ -501,7 +515,7 @@ final class TranscriptionRuntimeIntegrationTests: XCTestCase {
             await gate.arrivals() == 1
         }) else { return }
 
-        let model = WhisperModel.all.first { $0.backend == .whisperKit }!
+        let model = Self.whisperFixture(variant: "large-v3_turbo")
         let transcriber = makeTranscriber(
             coordinator: coordinator,
             model: model,

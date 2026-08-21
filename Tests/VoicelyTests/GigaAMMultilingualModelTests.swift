@@ -26,8 +26,15 @@ final class GigaAMMultilingualModelTests: XCTestCase {
     }
 
     func testModelDirectoryIsUserLocalAndVariantScoped() throws {
-        let model = try XCTUnwrap(
-            WhisperModel.all.first { $0.variant == "gigaam-multilingual-ctc" }
+        // Fixture: the variant left the shipped catalog (owner's call,
+        // 2026-08-19) but its storage mechanics stay pinned.
+        let model = WhisperModel(
+            variant: "gigaam-multilingual-ctc",
+            displayName: "GigaAM Multilingual",
+            sizeLabel: "~421 MB",
+            sizeBytes: 442_100_000,
+            minRAMGB: 8,
+            backend: .gigaAMMultilingualCTC
         )
         let path = model.modelDirectory.path
         XCTAssertTrue(path.contains("Documents/voicely/models/gigaam-multilingual-ctc"))

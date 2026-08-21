@@ -162,7 +162,7 @@ public struct WhisperModel: Sendable, Equatable {
     ) -> String? {
         let capabilities = capabilities
         if translateToEnglish, !capabilities.supportsTranslationToEnglish {
-            return "\(displayName) cannot translate to English. Select a Whisper model or use Russian transcription."
+            return "\(displayName) cannot translate to English; it transcribes in the spoken language."
         }
         if let language,
            let supported = capabilities.supportedLanguages,
@@ -172,13 +172,12 @@ public struct WhisperModel: Sendable, Equatable {
         return nil
     }
 
+    /// The whole line-up is one model — the owner's call (2026-08-19) after
+    /// living with Parakeet: "оставим только её". Engines for the retired
+    /// models stay in the codebase as data-less code until a separate removal
+    /// pass; re-adding a model is a data change here, not a code change.
     public static let all: [WhisperModel] = [
         WhisperModel(variant: "parakeet-tdt-0.6b-v3", displayName: "Parakeet V3", sizeLabel: "~470 MB", sizeBytes: 500_000_000, minRAMGB: 8, backend: .parakeetTDTV3),
-        WhisperModel(variant: "gigaam-v3-e2e-rnnt", displayName: "GigaAM V3 RU", sizeLabel: "~426 MB", sizeBytes: 430_000_000, minRAMGB: 8, backend: .gigaAMV3E2ERNNT),
-        WhisperModel(variant: "gigaam-multilingual-ctc", displayName: "GigaAM Multilingual", sizeLabel: "~421 MB", sizeBytes: 442_100_000, minRAMGB: 8, backend: .gigaAMMultilingualCTC),
-        WhisperModel(variant: "large-v3-v20240930_turbo_632MB", displayName: "Large V3 Turbo Q", sizeLabel: "~632 MB", sizeBytes: 650_000_000, minRAMGB: 8, backend: .whisperKit),
-        WhisperModel(variant: "large-v3_turbo", displayName: "Large V3 Turbo", sizeLabel: "~3 GB", sizeBytes: 3_200_000_000, minRAMGB: 24, backend: .whisperKit),
-        WhisperModel(variant: "medium", displayName: "Medium", sizeLabel: "~1.5 GB", sizeBytes: 1_500_000_000, minRAMGB: 16, backend: .whisperKit),
     ]
 
     public static var systemRAMGB: UInt64 {
@@ -252,29 +251,9 @@ public struct WhisperModel: Sendable, Equatable {
         forSystemRAMGB ram: UInt64,
         availableDiskBytes disk: UInt64?
     ) -> WhisperModel {
-        let preferredVariants: [String]
-        if ram >= 24 {
-            preferredVariants = [
-                "parakeet-tdt-0.6b-v3",
-                "large-v3_turbo",
-                "medium",
-                "large-v3-v20240930_turbo_632MB",
-                "gigaam-v3-e2e-rnnt",
-            ]
-        } else if ram >= 16 {
-            preferredVariants = [
-                "parakeet-tdt-0.6b-v3",
-                "medium",
-                "large-v3-v20240930_turbo_632MB",
-                "gigaam-v3-e2e-rnnt",
-            ]
-        } else {
-            preferredVariants = [
-                "parakeet-tdt-0.6b-v3",
-                "large-v3-v20240930_turbo_632MB",
-                "gigaam-v3-e2e-rnnt",
-            ]
-        }
+        let preferredVariants: [String] = [
+            "parakeet-tdt-0.6b-v3",
+        ]
 
         let candidates = preferredVariants.compactMap { variant in
             all.first(where: { $0.variant == variant && $0.minRAMGB <= ram })

@@ -8,6 +8,21 @@ enum InjectionResult: Equatable, Sendable {
     case failed
 }
 
+/// Where a finished dictation lands — the user's menu choice.
+enum DictationDestination: String, CaseIterable, Sendable {
+    /// Insert at the caret; clipboard only when nothing can take the text.
+    case atCursor = "cursor"
+    /// Never touch the focused app: always place the text on the clipboard.
+    case clipboardOnly = "clipboard"
+
+    var menuTitle: String {
+        switch self {
+        case .atCursor: return "Insert at Cursor"
+        case .clipboardOnly: return "Copy to Clipboard"
+        }
+    }
+}
+
 /// What to do with a finished transcript.
 ///
 /// Text goes wherever the caret is at commit time — dictation is a stand-in for
@@ -78,14 +93,22 @@ final class Injector {
     }
 
     /// Insert into whatever holds the caret right now; clipboard only when
-    /// nothing does.
+    /// nothing does — or always, when the user chose the clipboard destination.
     @discardableResult
     func inject(
         text: String,
-        target: InjectionTargetToken?
+        target: InjectionTargetToken?,
+        destination: DictationDestination = .atCursor
     ) -> InjectionResult {
         let startedSecure = target?.startedSecure ?? false
         let probe = probeCaret()
+
+        // The user's explicit choice: never touch the focused app. The secure
+        // gates still apply — a dictation that started in a password field must
+        // not reach the general pasteboard.
+        if destination == .clipboardOnly {
+            return copyOnly(text, startedSecure: startedSecure, currentSecure: probe.isSecure)
+        }
 
         let decision = CaretPolicy.decide(
             startedSecure: startedSecure,
@@ -101,9 +124,9 @@ final class Injector {
         case .copyOnly:
             // A terminal is a text surface with no writable caret: its
             // scrollback is read-only, so AX has nothing to insert into, but it
-            // takes a real Cmd+V. Only do this for a text surface — pressing
-            // Cmd+V blind would paste into whatever else has focus (a Finder
-            // window would happily paste a file).
+            // accepts synthetic typing. Only type into a text surface — typing
+            // blind would spray keystrokes into whatever else has focus (a
+            // Finder window would start a rename or a search).
             let copied = copyOnly(text, startedSecure: startedSecure, currentSecure: probe.isSecure)
             guard copied == .copiedOnly, probe.isTextSurface else {
                 if !probe.isTextSurface {
@@ -111,8 +134,8 @@ final class Injector {
                 }
                 return copied
             }
-            if postPaste() {
-                AppDelegate.debugLog("Injector: pasted into text surface via Cmd+V")
+            if typeUnicode(text) {
+                AppDelegate.debugLog("Injector: typed into text surface via unicode key events")
                 return .directInsert
             }
             return copied
@@ -167,8 +190,9 @@ final class Injector {
         let isSecure: Bool
         /// Focus is a text surface that refuses AX writes — a terminal. Its
         /// scrollback is read-only, so there is no caret to write into, but it
-        /// takes a real Cmd+V. Measured: Terminal.app accepts a synthetic
-        /// paste; VS Code's xterm.js swallows it (canvas inside Electron).
+        /// accepts synthetic typing. Measured: VS Code's xterm.js (canvas
+        /// inside Electron) swallows a synthetic Cmd+V, which is why typing
+        /// unicode key events is the transport here.
         let isTextSurface: Bool
     }
 
@@ -209,60 +233,49 @@ final class Injector {
         )
     }
 
-    /// Key that means "paste".
-    ///
-    /// Resolved against the ASCII-capable layout, not the user's current one,
-    /// because that is how macOS itself matches Cmd-shortcuts. Measured: on a
-    /// Russian layout `vk 9` produces "м", yet Cmd+V still pastes — so testing
-    /// the current layout would switch this off for layouts where it works
-    /// perfectly. Falls back to 9 (V on ANSI) when a layout exposes no data,
-    /// which is the case for IMEs.
-    private static func pasteKeyCode() -> CGKeyCode {
-        let ansiV: CGKeyCode = 9
-        guard let source = TISCopyCurrentASCIICapableKeyboardLayoutInputSource()?
-                .takeRetainedValue(),
-              let dataPtr = TISGetInputSourceProperty(source, kTISPropertyUnicodeKeyLayoutData)
-        else { return ansiV }
-        let data = Unmanaged<CFData>.fromOpaque(dataPtr).takeUnretainedValue() as Data
-
-        for code in CGKeyCode(0)...CGKeyCode(127) {
-            var deadKeyState: UInt32 = 0
-            var chars = [UniChar](repeating: 0, count: 4)
-            var length = 0
-            let status = data.withUnsafeBytes { raw -> OSStatus in
-                guard let layout = raw.baseAddress?
-                    .assumingMemoryBound(to: UCKeyboardLayout.self) else { return -1 }
-                return UCKeyTranslate(
-                    layout, UInt16(code), UInt16(kUCKeyActionDown), 0,
-                    UInt32(LMGetKbdType()), OptionBits(kUCKeyTranslateNoDeadKeysBit),
-                    &deadKeyState, 4, &length, &chars
-                )
-            }
-            if status == noErr, length == 1, chars[0] == UniChar(UInt8(ascii: "v")) {
-                return code
-            }
-        }
-        return ansiV
-    }
-
-    /// Press Cmd+V at whatever is focused. Only ever called with the transcript
-    /// already verified onto the clipboard.
-    private func postPaste() -> Bool {
+    /// Type `text` at the focused element as synthetic unicode keyboard
+    /// events. This is the transport for text surfaces with no writable AX
+    /// caret: terminals accept typed input by nature, and it replaced the
+    /// synthetic Cmd+V because canvas surfaces (VS Code's xterm.js) swallow
+    /// that Cmd+V while still accepting typed events. Only ever called with
+    /// the transcript already verified onto the clipboard, so a failure here
+    /// still leaves the user one manual paste away.
+    private func typeUnicode(_ text: String) -> Bool {
         guard CGPreflightPostEventAccess() else {
             AppDelegate.debugLog("Injector: no post-event access; leaving text on the clipboard")
             return false
         }
         guard !IsSecureEventInputEnabled() else { return false }
-        let key = Self.pasteKeyCode()
-        guard let source = CGEventSource(stateID: .combinedSessionState),
-              let down = CGEvent(keyboardEventSource: source, virtualKey: key, keyDown: true),
-              let up = CGEvent(keyboardEventSource: source, virtualKey: key, keyDown: false)
-        else { return false }
-        down.flags = .maskCommand
-        up.flags = .maskCommand
-        down.post(tap: .cghidEventTap)
-        up.post(tap: .cghidEventTap)
+        guard let source = CGEventSource(stateID: .combinedSessionState) else { return false }
+        for var chunk in Self.utf16Chunks(of: text, maxLength: 20) {
+            guard let down = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: true),
+                  let up = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: false)
+            else { return false }
+            down.keyboardSetUnicodeString(stringLength: chunk.count, unicodeString: &chunk)
+            up.keyboardSetUnicodeString(stringLength: chunk.count, unicodeString: &chunk)
+            down.post(tap: .cghidEventTap)
+            up.post(tap: .cghidEventTap)
+        }
         return true
+    }
+
+    /// UTF-16 chunks that never split a surrogate pair: when the boundary
+    /// lands right after a high surrogate, the low surrogate is pulled into
+    /// the same chunk, so a chunk may run one unit over `maxLength`.
+    nonisolated static func utf16Chunks(of text: String, maxLength: Int) -> [[UInt16]] {
+        let units = Array(text.utf16)
+        guard !units.isEmpty, maxLength > 0 else { return units.isEmpty ? [] : [units] }
+        var chunks: [[UInt16]] = []
+        var start = 0
+        while start < units.count {
+            var end = min(start + maxLength, units.count)
+            if end < units.count, (0xD800...0xDBFF).contains(units[end - 1]) {
+                end += 1
+            }
+            chunks.append(Array(units[start..<end]))
+            start = end
+        }
+        return chunks
     }
 
     private func focusedElement() -> AXUIElement? {

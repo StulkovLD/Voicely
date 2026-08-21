@@ -290,10 +290,11 @@ final class WhisperKitAssetInstallerTests: XCTestCase {
     // MARK: - Catalog
 
     /// Every `.whisperKit` model must resolve to pinned assets, or its download
-    /// path fails at runtime with "No pinned assets".
+    /// path fails at runtime with "No pinned assets". The shipped catalog
+    /// carries no `.whisperKit` model since 2026-08-19 (owner's call), so this
+    /// holds vacuously until one returns — then it bites again.
     func testEveryWhisperKitModelIsPinned() {
         let whisperModels = WhisperModel.all.filter { $0.backend == .whisperKit }
-        XCTAssertFalse(whisperModels.isEmpty, "fixture guard: expected .whisperKit models")
 
         for model in whisperModels {
             XCTAssertNotNil(

@@ -4,7 +4,12 @@ import XCTest
 @testable import VoicelyCore
 
 final class StatusSnapshotTests: XCTestCase {
-    func testStatusSnapshotReportsSavedModelSeparatelyFromRecommendedModel() {
+    /// The catalog shrank to Parakeet only (owner's call, 2026-08-19). A user
+    /// upgrading from an older release still has a retired variant persisted;
+    /// it must read as "no selection" so the app falls back to the
+    /// recommendation instead of resurrecting a model the catalog no longer
+    /// carries.
+    func testStaleSavedVariantReadsAsNoSelection() {
         let defaults = UserDefaults(suiteName: #function)!
         defaults.removePersistentDomain(forName: #function)
         defer {
@@ -12,7 +17,7 @@ final class StatusSnapshotTests: XCTestCase {
         }
         defaults.set("gigaam-v3-e2e-rnnt", forKey: "whisperModel")
 
-        let recommended = WhisperModel.all.first(where: { $0.variant == "medium" })!
+        let recommended = WhisperModel.all[0]
         let snapshot = StatusSnapshot.gather(
             version: "test",
             defaults: defaults,
@@ -28,21 +33,9 @@ final class StatusSnapshotTests: XCTestCase {
             }
         )
 
-        XCTAssertEqual(snapshot.selectedModel?.variant, "gigaam-v3-e2e-rnnt")
-        XCTAssertEqual(snapshot.selectedModelDownloaded, true)
-        XCTAssertEqual(snapshot.recommendedModel.variant, "medium")
-        XCTAssertEqual(snapshot.recommendedModelDownloaded, false)
-        XCTAssertTrue(snapshot.textLines.contains { $0.contains("Selected model:     GigaAM V3 RU") })
-        XCTAssertTrue(snapshot.textLines.contains { $0.contains("Selected downloaded: yes") })
-        XCTAssertTrue(snapshot.textLines.contains { $0.contains("Recommended model:  Medium") })
-        XCTAssertTrue(snapshot.textLines.contains { $0.contains("Recommended downloaded: no") })
-
-        let json = snapshot.jsonObject
-        XCTAssertEqual(json["selectedModel"] as? String, "gigaam-v3-e2e-rnnt")
-        XCTAssertEqual(json["recommendedModel"] as? String, "medium")
-        XCTAssertEqual(json["selectedModelDownloaded"] as? Bool, true)
-        XCTAssertEqual(json["recommendedModelDownloaded"] as? Bool, false)
-        XCTAssertEqual(json["modelDownloaded"] as? Bool, true)
+        XCTAssertNil(snapshot.selectedModel)
+        XCTAssertEqual(snapshot.recommendedModel.variant, "parakeet-tdt-0.6b-v3")
+        XCTAssertTrue(snapshot.jsonObject["selectedModel"] is NSNull)
     }
 
     func testStatusSnapshotExplainsWhenNoModelIsSavedYet() {
@@ -52,7 +45,7 @@ final class StatusSnapshotTests: XCTestCase {
             defaults.removePersistentDomain(forName: #function)
         }
 
-        let recommended = WhisperModel.all.first(where: { $0.variant == "large-v3-v20240930_turbo_632MB" })!
+        let recommended = WhisperModel.all[0]
         let snapshot = StatusSnapshot.gather(
             version: "test",
             defaults: defaults,

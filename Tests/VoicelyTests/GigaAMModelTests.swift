@@ -2,19 +2,21 @@ import XCTest
 @testable import VoicelyCore
 
 final class GigaAMModelTests: XCTestCase {
-
-    func testAllModelsIncludesGigaAMV3Option() {
-        XCTAssertTrue(
-            WhisperModel.all.contains(where: { $0.variant == "gigaam-v3-e2e-rnnt" }),
-            "WhisperModel.all must expose GigaAM v3 as a selectable model option"
+    /// GigaAM left the shipped catalog (owner's call, 2026-08-19) but its
+    /// engine and storage mechanics stay in the codebase; these tests pin the
+    /// mechanics on a fixture so re-adding the model is a data change.
+    private var model: WhisperModel {
+        WhisperModel(
+            variant: "gigaam-v3-e2e-rnnt",
+            displayName: "GigaAM V3 RU",
+            sizeLabel: "~426 MB",
+            sizeBytes: 430_000_000,
+            minRAMGB: 8,
+            backend: .gigaAMV3E2ERNNT
         )
     }
 
     func testGigaAMModelUsesDedicatedHuggingFaceCacheDirectory() {
-        guard let model = WhisperModel.all.first(where: { $0.variant == "gigaam-v3-e2e-rnnt" }) else {
-            XCTFail("expected GigaAM v3 model in WhisperModel.all")
-            return
-        }
         XCTAssertTrue(
             model.resolvedModelDirectory(environment: [:]).path
                 .contains("Documents/huggingface/models/smkrv/gigaam-v3-e2e-rnnt-coreml"),
@@ -23,10 +25,6 @@ final class GigaAMModelTests: XCTestCase {
     }
 
     func testGigaAMModelUsesRepoLocalDirectoryOnlyForExplicitVerifiedDebugOverride() throws {
-        guard let model = WhisperModel.all.first(where: { $0.variant == "gigaam-v3-e2e-rnnt" }) else {
-            XCTFail("expected GigaAM v3 model in WhisperModel.all")
-            return
-        }
         let repoRoot = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try makeRepositoryFixture(at: repoRoot)
         defer { try? FileManager.default.removeItem(at: repoRoot) }
@@ -41,10 +39,6 @@ final class GigaAMModelTests: XCTestCase {
     }
 
     func testGigaAMModelRejectsGenericPackageAsDevelopmentOverride() throws {
-        guard let model = WhisperModel.all.first(where: { $0.variant == "gigaam-v3-e2e-rnnt" }) else {
-            XCTFail("expected GigaAM v3 model in WhisperModel.all")
-            return
-        }
         let fakeRoot = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: fakeRoot.appendingPathComponent("Sources"), withIntermediateDirectories: true)
         FileManager.default.createFile(
@@ -63,10 +57,6 @@ final class GigaAMModelTests: XCTestCase {
     }
 
     func testGigaAMModelRejectsSymlinkedDevelopmentRoot() throws {
-        guard let model = WhisperModel.all.first(where: { $0.variant == "gigaam-v3-e2e-rnnt" }) else {
-            XCTFail("expected GigaAM v3 model in WhisperModel.all")
-            return
-        }
         let parent = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         let repoRoot = parent.appendingPathComponent("repo")
         let link = parent.appendingPathComponent("repo-link")
