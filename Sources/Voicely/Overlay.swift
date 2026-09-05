@@ -154,8 +154,25 @@ final class Overlay {
     var currentMode: OverlayMode? { mode }
     /// The session pill a live toast will put back when it expires; nil when
     /// the toast is terminal. Read by tests: a terminal toast that still names
-    /// a resume mode is the "pill loads forever" bug.
+    /// a resume mode is the "pill loads forever" bug. Read LIVE at expiry, so a
+    /// `dismissSession` during the toast keeps the pill gone.
     private(set) var toastResumeMode: OverlayMode?
+    /// The recording epoch that comes back with `toastResumeMode`; inherited
+    /// toast-over-toast so the clock does not restart or die at 0:00.
+    private var toastResumeStart: Date?
+    /// Opaque identity of the session whose pill is live or waiting behind a
+    /// toast. Watchdogs dismiss BY TOKEN: `.loading` is shared by model setup,
+    /// dictation and call finalization, and a stale watchdog matching on mode
+    /// tore down the next owner's pill.
+    struct SessionToken: Equatable, Sendable {
+        fileprivate let id = UUID()
+    }
+    private(set) var session: SessionToken?
+    /// Toast expiry scheduling; tests replace it to fire the expiry by hand.
+    var toastScheduler: @MainActor (TimeInterval, DispatchWorkItem) -> Void = { delay, work in
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
+    }
+    var currentRecordingStart: Date? { recordingStartTime }
     private var timerTextLayer: CATextLayer?
     private var recordingStartTime: Date?
     private var segmentProgressLayer: CATextLayer?
@@ -252,12 +269,34 @@ final class Overlay {
         refreshContentsScale()
     }
 
-    func show(mode: OverlayMode) {
+    /// Put a session pill up. Starts a NEW session and returns its token; the
+    /// owner keeps the token to switch modes (`show(mode:in:)`) or to dismiss
+    /// it from a watchdog without touching whoever came after.
+    @discardableResult
+    func show(mode: OverlayMode) -> SessionToken {
+        let token = SessionToken()
+        session = token
+        present(mode: mode)
+        return token
+    }
+
+    /// Switch the pill of an EXISTING session. Returns false and shows nothing
+    /// when that session is already gone — lived: model progress re-raised
+    /// `.loading` inside the toast that was ending the setup pill.
+    @discardableResult
+    func show(mode: OverlayMode, in token: SessionToken) -> Bool {
+        guard session == token else { return false }
+        present(mode: mode)
+        return true
+    }
+
+    private func present(mode: OverlayMode) {
         self.mode = mode
         generation += 1
         pendingHide?.cancel()
         pendingHide = nil
         toastResumeMode = nil
+        toastResumeStart = nil
         createPanelIfNeeded()
         guard let p = panel else { return }
 
@@ -472,7 +511,9 @@ final class Overlay {
         // leaves `isVisible == true` for 0.3 s, and any watchdog that reads a
         // stale mode in that gap would act on a panel that is already leaving.
         mode = nil
+        session = nil
         toastResumeMode = nil
+        toastResumeStart = nil
         pendingHide?.cancel()
         pendingHide = nil
         generation += 1
@@ -546,9 +587,12 @@ final class Overlay {
     /// the toast finishes on its own and nothing comes back after it. Lived: a
     /// toast over `.downloading` at the 10 s mark made the one-shot watchdog
     /// see `.error`, stay silent, and the pill lived on until the model loaded.
-    func dismissSession() {
+    func dismissSession(_ token: SessionToken) {
+        guard session == token else { return }
         if mode == .error {
+            session = nil
             toastResumeMode = nil
+            toastResumeStart = nil
         } else {
             hide()
         }
@@ -585,16 +629,20 @@ final class Overlay {
         // A toast replacing a toast inherits its resume target: the second
         // "Hotkey active" over a recording must not decide the recording is over.
         let resumeMode: OverlayMode?
+        let resumeStart: Date?
         switch mode {
         case .recording, .loading, .downloading, .fileQueue, .fileQueuePaused:
             resumeMode = mode
+            resumeStart = recordingStartTime
         case .error:
             resumeMode = toastResumeMode
+            resumeStart = toastResumeStart
         case nil:
             resumeMode = nil
+            resumeStart = nil
         }
-        let resumeStart = recordingStartTime
         toastResumeMode = resumeMode
+        toastResumeStart = resumeStart
 
         self.mode = .error
         // A `hide()` may still be fading out; its completion is gated on
@@ -637,12 +685,14 @@ final class Overlay {
         let work = DispatchWorkItem { [weak self] in
             guard let self, self.mode == .error else { return }
             self.removeErrorLayer()
-            // Read the live target: a dismissSession() during the toast
-            // clears it, and the session must then stay gone.
+            // Read the live pair: a dismissSession() during the toast clears
+            // it, and the session must then stay gone.
             let resumeMode = self.toastResumeMode
+            let resumeStart = self.toastResumeStart
             self.toastResumeMode = nil
+            self.toastResumeStart = nil
             if let resumeMode {
-                self.show(mode: resumeMode)
+                self.present(mode: resumeMode)
                 self.recordingStartTime = resumeStart
             } else {
                 self.hide()
@@ -651,10 +701,7 @@ final class Overlay {
         pendingHide = work
         // Toasts over an active session return to it quickly; terminal toasts
         // stay the full 5 s the reading owner asked for.
-        DispatchQueue.main.asyncAfter(
-            deadline: .now() + (resumeMode == nil ? 5 : 2.5),
-            execute: work
-        )
+        toastScheduler(resumeMode == nil ? 5 : 2.5, work)
     }
 
     private func removeErrorLayer() {

@@ -140,25 +140,99 @@ final class OverlayModeLifecycleTests: XCTestCase {
         XCTAssertEqual(overlay.toastResumeMode, .recording, "the recording is still on and must come back")
     }
 
+    /// Captures the toast expiry instead of scheduling it, so a test fires it
+    /// by hand.
+    private func overlayWithManualToasts() -> (Overlay, () -> Void) {
+        let overlay = Overlay()
+        var pending: DispatchWorkItem?
+        overlay.toastScheduler = { _, work in pending = work }
+        return (overlay, { pending?.perform() })
+    }
+
     /// A watchdog firing while a toast is up must not kill the toast, and the
     /// session pill behind it must not come back when the toast expires.
-    func testDismissSessionDuringToastDropsTheResumeTarget() {
-        let overlay = Overlay()
-        overlay.show(mode: .downloading)
+    func testToastExpiryAfterDismissSessionLeavesNothingOnScreen() {
+        let (overlay, expireToast) = overlayWithManualToasts()
+        let token = overlay.show(mode: .downloading)
         overlay.showInfo("Preparing model...")
         XCTAssertEqual(overlay.toastResumeMode, .downloading)
 
-        overlay.dismissSession()
-
+        overlay.dismissSession(token)
         XCTAssertEqual(overlay.currentMode, .error, "the toast stays up")
-        XCTAssertNil(overlay.toastResumeMode, "and the pill will not return after it")
+
+        expireToast()
+        XCTAssertNil(overlay.currentMode, "and nothing comes back after it")
+        XCTAssertNil(overlay.session)
+    }
+
+    func testToastExpiryWithoutDismissResumesTheSession() {
+        let (overlay, expireToast) = overlayWithManualToasts()
+        let token = overlay.show(mode: .downloading)
+        overlay.showInfo("Preparing model...")
+
+        expireToast()
+        XCTAssertEqual(overlay.currentMode, .downloading)
+        XCTAssertEqual(overlay.session, token, "the same session, not a new one")
     }
 
     func testDismissSessionWithoutToastHidesNow() {
         let overlay = Overlay()
-        overlay.show(mode: .loading)
-        overlay.dismissSession()
+        let token = overlay.show(mode: .loading)
+        overlay.dismissSession(token)
         XCTAssertNil(overlay.currentMode)
+    }
+
+    /// `.loading` is shared by model setup, dictation and call finalization.
+    /// A stale watchdog holding the previous owner's token must not tear down
+    /// the next owner's pill.
+    func testStaleWatchdogTokenCannotDismissTheNextSession() {
+        let overlay = Overlay()
+        let callToken = overlay.show(mode: .loading)
+        overlay.finish(.error("No audio captured"))
+        let dictationToken = overlay.show(mode: .loading)
+
+        overlay.dismissSession(callToken)
+
+        XCTAssertEqual(overlay.currentMode, .loading, "the dictation pill is not the call's to dismiss")
+        XCTAssertEqual(overlay.session, dictationToken)
+    }
+
+    /// Model progress switching the setup pill to `.loading` after the watchdog
+    /// dismissed it must show nothing — that switch used to resurrect the pill
+    /// inside the ending toast.
+    func testModeSwitchInADismissedSessionShowsNothing() {
+        let (overlay, expireToast) = overlayWithManualToasts()
+        let token = overlay.show(mode: .downloading)
+        overlay.showInfo("Model loading...")
+        overlay.dismissSession(token)
+
+        XCTAssertFalse(overlay.show(mode: .loading, in: token))
+        XCTAssertEqual(overlay.currentMode, .error)
+        expireToast()
+        XCTAssertNil(overlay.currentMode)
+    }
+
+    func testModeSwitchInALiveSessionKeepsTheToken() {
+        let overlay = Overlay()
+        let token = overlay.show(mode: .downloading)
+        XCTAssertTrue(overlay.show(mode: .loading, in: token))
+        XCTAssertEqual(overlay.currentMode, .loading)
+        XCTAssertEqual(overlay.session, token)
+    }
+
+    /// Toast over toast over a recording: the clock must come back with the
+    /// session's epoch, not restart and not die at 0:00.
+    func testSecondToastKeepsTheRecordingEpoch() {
+        let (overlay, expireToast) = overlayWithManualToasts()
+        overlay.show(mode: .recording)
+        let epoch = overlay.currentRecordingStart
+        XCTAssertNotNil(epoch)
+        overlay.showInfo("Hotkey active")
+        overlay.showError("Accessibility permission lost")
+
+        expireToast()
+        XCTAssertEqual(overlay.currentMode, .recording)
+        XCTAssertEqual(overlay.currentRecordingStart, epoch)
     }
 
     func testShowAfterHideRepublishesMode() {

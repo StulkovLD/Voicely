@@ -368,6 +368,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var dictationChunkSessionID: UUID?
     /// Windows the chunk loop handed to ASR this session; tells a drained tail apart from a mic that never delivered.
     private var dictationChunksDecoded = 0
+    /// Token of the model-setup pill; its watchdog and the progress callback
+    /// address that session only, never whatever pill came after it.
+    private var modelSetupOverlaySession: Overlay.SessionToken?
     /// The chunk loop that keeps decoding its last window after stop; discard
     /// cancels it, a normal stop lets it finish.
     private var finishingChunkTask: Task<DictationDecodeOutcome, Never>?
@@ -610,8 +613,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                     let wasDownloading: Bool
                     if case .downloading = self.modelState { wasDownloading = true } else { wasDownloading = false }
                     self.modelState = .preparing(model)
-                    if wasDownloading && self.overlay.isVisible {
-                        self.overlay.show(mode: .loading)
+                    if wasDownloading, let token = self.modelSetupOverlaySession {
+                        // No-op once the watchdog dismissed that session.
+                        self.overlay.show(mode: .loading, in: token)
                     }
                 case .processing, .finalizing:
                     break
@@ -674,14 +678,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
             if needsDownload {
                 self.modelState = .downloading(model, 0)
-                self.overlay.show(mode: .downloading)
+                let setupSession = self.overlay.show(mode: .downloading)
+                self.modelSetupOverlaySession = setupSession
                 self.overlay.updateProgress(0, status: "Voice model...")
                 // Auto-hide overlay after 10s - progress continues in menu bar
                 DispatchQueue.main.asyncAfter(deadline: .now() + 10) { [weak self] in
-                    guard let self,
-                          Self.isModelSetupOverlay(self.overlay.currentMode)
-                            || Self.isModelSetupOverlay(self.overlay.toastResumeMode) else { return }
-                    self.overlay.dismissSession()
+                    self?.overlay.dismissSession(setupSession)
                 }
             } else {
                 self.modelState = .preparing(model)
@@ -923,25 +925,67 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: - Dictation
 
+    /// What one hotkey press means in the current position. Pure: the gate is
+    /// judged here and pinned by DictationToggleDecisionTests.
+    enum DictationToggleDecision: Equatable, Sendable {
+        case start
+        case stop
+        case transcribingPress
+        case callSessionPress
+        /// A bounce of a start or a discard within the debounce window.
+        case dropped
+        case refused(String)
+    }
+
+    nonisolated static let dictationToggleDebounce: TimeInterval = 0.3
+
+    nonisolated static func dictationToggleDecision(
+        state: AppState,
+        modelReady: Bool,
+        hasModel: Bool,
+        sinceLastToggle: TimeInterval
+    ) -> DictationToggleDecision {
+        // A stop right after a start is the owner's intent ("tap and release"),
+        // not a bounce: it is never debounced and never needs the model.
+        if state == .recording { return .stop }
+        guard sinceLastToggle > dictationToggleDebounce else { return .dropped }
+        switch state {
+        case .idle:
+            guard modelReady else {
+                return .refused(hasModel ? "Model loading..." : "Select a model")
+            }
+            return .start
+        case .transcribing:
+            return .transcribingPress
+        case .recording:
+            return .stop
+        case .callStarting, .callRecording, .callTranscribing:
+            return .callSessionPress
+        }
+    }
+
     @objc func toggleDictation() {
         let now = Date()
-        // The debounce dedups a start or a discard; a stop right after a start
-        // is the owner's intent ("tap and release"), not a bounce.
-        guard state == .recording || now.timeIntervalSince(lastDictationToggle) > 0.3 else { return }
+        var hasModel = true
+        if case .noModel = modelState { hasModel = false }
+        switch Self.dictationToggleDecision(
+            state: state,
+            modelReady: modelReady,
+            hasModel: hasModel,
+            sinceLastToggle: now.timeIntervalSince(lastDictationToggle)
+        ) {
+        case .dropped:
+            return
+        case .refused(let message):
+            overlay.showInfo(message)
+            return
+        case .start, .stop, .transcribingPress, .callSessionPress:
+            break
+        }
         lastDictationToggle = now
 
         switch state {
         case .idle:
-            // Only a START needs the model; stopping or cancelling a session
-            // must always be reachable.
-            guard modelReady else {
-                if case .noModel = modelState {
-                    overlay.showInfo("Select a model")
-                } else {
-                    overlay.showInfo("Model loading...")
-                }
-                return
-            }
             guard ensureCaptureConfiguration() else { return }
             AppDelegate.debugLog("toggleDictation: idle -> recording")
             // Check mic permission before starting
@@ -2030,17 +2074,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func beginCallFinalization() {
         state = .callTranscribing
-        overlay.show(mode: .loading)
+        let callSession = overlay.show(mode: .loading)
         updateCallTranscriptionProgress(.preparing)
         // Cap the pill at ~3 s. The transcribe+diarize pass runs in the
         // background and must NOT keep the overlay up for the full duration.
         // Hide on a timer, decoupled from the task; the `.loading` guard keeps
         // a later "Call saved"/error flash from being torn down early.
         let overlayCapHide = DispatchWorkItem { [weak self] in
-            guard let self,
-                  self.overlay.currentMode == .loading
-                    || self.overlay.toastResumeMode == .loading else { return }
-            self.overlay.dismissSession()
+            self?.overlay.dismissSession(callSession)
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 3, execute: overlayCapHide)
         callMenuItem.isEnabled = false
@@ -2099,17 +2140,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// Whether the model-setup overlay is still up, in either of the two modes
     /// it passes through.
     ///
-    /// A download watchdog that only recognised `.downloading` disarmed itself
-    /// the moment progress reached `.loadingModel` and the overlay switched to
-    /// `.loading` — a mode with no auto-hide. The pill then stayed on screen
-    /// forever. Both modes belong to the same "setting up a model" pill, so the
-    /// watchdog must accept either.
-    nonisolated static func isModelSetupOverlay(_ mode: OverlayMode?) -> Bool {
-        switch mode {
-        case .downloading, .loading: return true
-        default: return false
-        }
-    }
 
     nonisolated static func canStartFileTranscription(
         modelReady: Bool,
@@ -2375,7 +2405,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             case .recording:
                 // Reuse the normal stop transaction: close the chunk producer,
                 // await its one ASR-owned chunk, decode the tail, and save.
-                self.lastDictationToggle = .distantPast
                 self.toggleDictation()
                 await self.transcriptionTask?.value
                 if self.activeDictationRecovery != nil {
@@ -2443,6 +2472,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 self.dictationChunkSessionID = nil
                 self.chunkTask?.cancel()
                 self.chunkTask = nil
+                self.finishingChunkTask?.cancel()
+                self.finishingChunkTask = nil
                 self.transcriptionTask?.cancel()
                 self.transcriber.cancelCurrentTask()
                 self.stopAndPreserveDictationForTermination(
@@ -2505,6 +2536,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         chunkTask?.cancel()
         chunkTask = nil
+        finishingChunkTask?.cancel()
+        finishingChunkTask = nil
         dictationChunkSessionID = nil
         dictationSessionOwner = nil
         dictationInjectionTarget = nil
@@ -2706,13 +2739,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         transcriber.selectModel(model)
         normalizeLanguageModeForSelectedModel(persist: true, announce: true)
         modelState = .downloading(model, 0)
-        overlay.show(mode: .downloading)
+        let setupSession = overlay.show(mode: .downloading)
+        modelSetupOverlaySession = setupSession
         overlay.updateProgress(0, status: "Voice model...")
         DispatchQueue.main.asyncAfter(deadline: .now() + 10) { [weak self] in
-            guard let self,
-                  Self.isModelSetupOverlay(self.overlay.currentMode)
-                    || Self.isModelSetupOverlay(self.overlay.toastResumeMode) else { return }
-            self.overlay.dismissSession()
+            self?.overlay.dismissSession(setupSession)
         }
 
         preloadTask?.cancel()
