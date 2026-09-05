@@ -541,6 +541,19 @@ final class Overlay {
         }
     }
 
+    /// A watchdog's way to end a session pill without killing a toast that may
+    /// be up at that moment: the pill goes now, or — if a toast is showing —
+    /// the toast finishes on its own and nothing comes back after it. Lived: a
+    /// toast over `.downloading` at the 10 s mark made the one-shot watchdog
+    /// see `.error`, stay silent, and the pill lived on until the model loaded.
+    func dismissSession() {
+        if mode == .error {
+            toastResumeMode = nil
+        } else {
+            hide()
+        }
+    }
+
     /// Width that actually fits `message` at the toast font, clamped so short
     /// toasts keep the familiar pill and long ones stop before absurd.
     nonisolated static func messagePillWidth(for message: String) -> CGFloat {
@@ -624,6 +637,9 @@ final class Overlay {
         let work = DispatchWorkItem { [weak self] in
             guard let self, self.mode == .error else { return }
             self.removeErrorLayer()
+            // Read the live target: a dismissSession() during the toast
+            // clears it, and the session must then stay gone.
+            let resumeMode = self.toastResumeMode
             self.toastResumeMode = nil
             if let resumeMode {
                 self.show(mode: resumeMode)

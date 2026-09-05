@@ -140,6 +140,27 @@ final class OverlayModeLifecycleTests: XCTestCase {
         XCTAssertEqual(overlay.toastResumeMode, .recording, "the recording is still on and must come back")
     }
 
+    /// A watchdog firing while a toast is up must not kill the toast, and the
+    /// session pill behind it must not come back when the toast expires.
+    func testDismissSessionDuringToastDropsTheResumeTarget() {
+        let overlay = Overlay()
+        overlay.show(mode: .downloading)
+        overlay.showInfo("Preparing model...")
+        XCTAssertEqual(overlay.toastResumeMode, .downloading)
+
+        overlay.dismissSession()
+
+        XCTAssertEqual(overlay.currentMode, .error, "the toast stays up")
+        XCTAssertNil(overlay.toastResumeMode, "and the pill will not return after it")
+    }
+
+    func testDismissSessionWithoutToastHidesNow() {
+        let overlay = Overlay()
+        overlay.show(mode: .loading)
+        overlay.dismissSession()
+        XCTAssertNil(overlay.currentMode)
+    }
+
     func testShowAfterHideRepublishesMode() {
         let overlay = Overlay()
         overlay.show(mode: .recording)

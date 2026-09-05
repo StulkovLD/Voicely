@@ -368,6 +368,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var dictationChunkSessionID: UUID?
     /// Windows the chunk loop handed to ASR this session; tells a drained tail apart from a mic that never delivered.
     private var dictationChunksDecoded = 0
+    /// The chunk loop that keeps decoding its last window after stop; discard
+    /// cancels it, a normal stop lets it finish.
+    private var finishingChunkTask: Task<DictationDecodeOutcome, Never>?
     private var dictationSessionOwner: UUID?
     // Speaker diarization (file-grade call pipeline + file queue). One
     // shared actor; lazily downloads/loads its CoreML models on first call.
@@ -676,8 +679,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 // Auto-hide overlay after 10s - progress continues in menu bar
                 DispatchQueue.main.asyncAfter(deadline: .now() + 10) { [weak self] in
                     guard let self,
-                          Self.isModelSetupOverlay(self.overlay.currentMode) else { return }
-                    self.overlay.hide()
+                          Self.isModelSetupOverlay(self.overlay.currentMode)
+                            || Self.isModelSetupOverlay(self.overlay.toastResumeMode) else { return }
+                    self.overlay.dismissSession()
                 }
             } else {
                 self.modelState = .preparing(model)
@@ -921,20 +925,23 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc func toggleDictation() {
         let now = Date()
-        guard now.timeIntervalSince(lastDictationToggle) > 0.3 else { return }
+        // The debounce dedups a start or a discard; a stop right after a start
+        // is the owner's intent ("tap and release"), not a bounce.
+        guard state == .recording || now.timeIntervalSince(lastDictationToggle) > 0.3 else { return }
         lastDictationToggle = now
-
-        guard modelReady else {
-            if case .noModel = modelState {
-                overlay.showInfo("Select a model")
-            } else {
-                overlay.showInfo("Model loading...")
-            }
-            return
-        }
 
         switch state {
         case .idle:
+            // Only a START needs the model; stopping or cancelling a session
+            // must always be reachable.
+            guard modelReady else {
+                if case .noModel = modelState {
+                    overlay.showInfo("Select a model")
+                } else {
+                    overlay.showInfo("Model loading...")
+                }
+                return
+            }
             guard ensureCaptureConfiguration() else { return }
             AppDelegate.debugLog("toggleDictation: idle -> recording")
             // Check mic permission before starting
@@ -1027,6 +1034,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             // that already owns an extracted chunk. The task returns its local
             // committed results after that decode finishes.
             let pendingChunkTask = chunkTask
+            finishingChunkTask = pendingChunkTask
             let finishingSessionOwner = dictationSessionOwner ?? UUID()
             dictationSessionOwner = finishingSessionOwner
             chunkTask = nil
@@ -1066,13 +1074,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
             // #12: Store transcription task so it can be cancelled for discard
             transcriptionTask = Task {
-                // If a file queue is running, wait for it to actually reach
-                // the paused state (engine idle) before we call transcribe.
-                // For short dictations the natural chunk-sleep buffer isn't
-                // enough to avoid trySetTranscribing collisions.
-                if let queue = self.fileQueue {
-                    _ = await queue.awaitPaused()
-                }
                 // Wait for any in-progress chunk transcription to complete
                 let rawCompletedChunkOutcome = await pendingChunkTask?.value
                     ?? DictationDecodeOutcome.completeEmpty()
@@ -1118,6 +1119,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 // one short segment and loses most content.
                 var tailOutcome = DictationDecodeOutcome.completeEmpty()
                 if let audio = audio {
+                    // If a file queue is running, wait for it to actually reach
+                    // the paused state (engine idle) before we call transcribe.
+                    // For short dictations the natural chunk-sleep buffer isn't
+                    // enough to avoid trySetTranscribing collisions. A dictation
+                    // with no tail has nothing to decode and does not wait.
+                    if let queue = self.fileQueue {
+                        _ = await queue.awaitPaused()
+                    }
                     let remDuration = Double(audio.frameLength) / audio.format.sampleRate
                     AppDelegate.debugLog("dict remainder: \(audio.frameLength) frames (\(String(format: "%.1f", remDuration))s at \(audio.format.sampleRate)Hz), windowing...")
                     tailOutcome = await AppDelegate.transcribeWindowed(
@@ -1217,6 +1226,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 transcriptionTask = nil
                 chunkTask?.cancel()
                 chunkTask = nil
+                finishingChunkTask?.cancel()
+                finishingChunkTask = nil
                 dictationChunkSessionID = nil
                 dictationSessionOwner = nil
                 dictationInjectionTarget = nil
@@ -2026,8 +2037,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // Hide on a timer, decoupled from the task; the `.loading` guard keeps
         // a later "Call saved"/error flash from being torn down early.
         let overlayCapHide = DispatchWorkItem { [weak self] in
-            guard let self, self.overlay.currentMode == .loading else { return }
-            self.overlay.hide()
+            guard let self,
+                  self.overlay.currentMode == .loading
+                    || self.overlay.toastResumeMode == .loading else { return }
+            self.overlay.dismissSession()
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 3, execute: overlayCapHide)
         callMenuItem.isEnabled = false
@@ -2697,8 +2710,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         overlay.updateProgress(0, status: "Voice model...")
         DispatchQueue.main.asyncAfter(deadline: .now() + 10) { [weak self] in
             guard let self,
-                  Self.isModelSetupOverlay(self.overlay.currentMode) else { return }
-            self.overlay.hide()
+                  Self.isModelSetupOverlay(self.overlay.currentMode)
+                    || Self.isModelSetupOverlay(self.overlay.toastResumeMode) else { return }
+            self.overlay.dismissSession()
         }
 
         preloadTask?.cancel()
@@ -2898,6 +2912,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         ) else { return }
         dictationSessionOwner = nil
         dictationInjectionTarget = nil
+        finishingChunkTask = nil
         state = .idle
         discardWindow = nil
         transcribeEscapeArmed = false
