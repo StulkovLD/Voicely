@@ -287,6 +287,7 @@ final class Overlay {
     func show(mode: OverlayMode) -> SessionToken {
         let token = SessionToken()
         session = token
+        lastProgress = nil
         present(mode: mode)
         return token
     }
@@ -299,8 +300,10 @@ final class Overlay {
         guard session == token else { return false }
         if self.mode == .error {
             // A toast is up: let it be read; it will come back to the new mode.
+            // A recording that starts behind a toast starts its clock now, as
+            // `present` would.
             toastResumeMode = mode
-            if mode != .recording { toastResumeStart = nil }
+            toastResumeStart = mode == .recording ? Date() : nil
             return true
         }
         present(mode: mode)
@@ -625,6 +628,7 @@ final class Overlay {
             session = nil
             toastResumeMode = nil
             toastResumeStart = nil
+            lastProgress = nil
             // The toast is terminal now: give it the rest of the terminal 5 s.
             let shown = toastShownAt ?? Date()
             let remaining = max(0, Self.terminalToastSeconds - Date().timeIntervalSince(shown))

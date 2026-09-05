@@ -369,8 +369,20 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// Windows the chunk loop handed to ASR this session; tells a drained tail apart from a mic that never delivered.
     private var dictationChunksDecoded = 0
     /// Token of the model-setup pill; its watchdog and the progress callback
-    /// address that session only, never whatever pill came after it.
+    /// address that session only, never whatever pill came after it. Written
+    /// by `beginModelSetupPill` only.
     private var modelSetupOverlaySession: Overlay.SessionToken?
+
+    /// The model-setup pill: download, preparation or retry. One writer for
+    /// the token, one 10 s watchdog — progress continues in the menu bar.
+    private func beginModelSetupPill(mode: OverlayMode, status: String?) {
+        let setupSession = overlay.show(mode: mode)
+        modelSetupOverlaySession = setupSession
+        if let status { overlay.updateProgress(0, status: status) }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 10) { [weak self] in
+            self?.overlay.dismissSession(setupSession)
+        }
+    }
     /// Token of the dictation pill (`.recording`, then `.loading` on stop):
     /// one press of the owner, one session, one last word.
     private var dictationOverlaySession: Overlay.SessionToken?
@@ -684,16 +696,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
             if needsDownload {
                 self.modelState = .downloading(model, 0)
-                let setupSession = self.overlay.show(mode: .downloading)
-                self.modelSetupOverlaySession = setupSession
-                self.overlay.updateProgress(0, status: "Voice model...")
-                // Auto-hide overlay after 10s - progress continues in menu bar
-                DispatchQueue.main.asyncAfter(deadline: .now() + 10) { [weak self] in
-                    self?.overlay.dismissSession(setupSession)
-                }
+                self.beginModelSetupPill(mode: .downloading, status: "Voice model...")
             } else {
                 self.modelState = .preparing(model)
-                self.overlay.showInfo("Preparing model...")
+                // A session, not a toast: readiness takes it down (a toast
+                // outlived the ready model by up to 5 s).
+                self.beginModelSetupPill(mode: .loading, status: nil)
             }
 
             do {
@@ -1099,9 +1107,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             let recoverySession = recorder.takeDictationRecoverySession()
             activeDictationRecovery = recoverySession
             AppDelegate.debugLog("Recorder result: \(result)")
-            // Same session as the recording pill; a new one only if that pill
-            // is somehow already gone.
+            // Same session as the recording pill. Nobody may end it before the
+            // stop; a dead token here is an ownership bug, not a case to cover.
             if dictationOverlaySession.map({ overlay.show(mode: .loading, in: $0) }) != true {
+                assertionFailure("dictation pill ended before its stop")
+                AppDelegate.debugLog("dictation pill ended before its stop — reopening")
                 dictationOverlaySession = overlay.show(mode: .loading)
             }
             state = .transcribing
@@ -2757,12 +2767,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         transcriber.selectModel(model)
         normalizeLanguageModeForSelectedModel(persist: true, announce: true)
         modelState = .downloading(model, 0)
-        let setupSession = overlay.show(mode: .downloading)
-        modelSetupOverlaySession = setupSession
-        overlay.updateProgress(0, status: "Voice model...")
-        DispatchQueue.main.asyncAfter(deadline: .now() + 10) { [weak self] in
-            self?.overlay.dismissSession(setupSession)
-        }
+        beginModelSetupPill(mode: .downloading, status: "Voice model...")
 
         preloadTask?.cancel()
         let preloadOwner = UUID()
@@ -2857,8 +2862,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                     )
                 }
                 let model = transcriber.selectedModel
-                overlay.showInfo("Retrying model...")
                 modelState = .preparing(model)
+                // The retry's last word ends this session; the toast rides on top.
+                beginModelSetupPill(mode: .loading, status: nil)
+                overlay.showInfo("Retrying model...")
                 let preloadOwner = UUID()
                 preloadTaskOwner = preloadOwner
                 preloadTask = Task {
@@ -3803,16 +3810,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             // The queue never owns the session pill (it reports through toasts),
             // so its last word is a toast too: a dictation or call that started
             // while the last file was finishing keeps its pill.
-            if jobs.isEmpty || cancelled == jobs.count {
-                // Nothing to report or everything was user-cancelled; only an
-                // enqueue toast of our own may still be up.
-                // Nothing to say; an enqueue toast of ours ends on its own.
-            } else if failed == 0 && cancelled == 0 {
-                overlay.showInfo("Transcribed \(jobs.count) files")
-            } else if failed > 0 {
-                overlay.showError("Transcribed \(completed) of \(jobs.count) - \(failed) failed")
-            } else {
-                overlay.showInfo("Transcribed \(completed) of \(jobs.count)")
+            // Nothing to report or everything user-cancelled: no last word;
+            // an enqueue toast of ours ends on its own.
+            if !jobs.isEmpty, cancelled < jobs.count {
+                if failed == 0 && cancelled == 0 {
+                    overlay.showInfo("Transcribed \(jobs.count) files")
+                } else if failed > 0 {
+                    overlay.showError("Transcribed \(completed) of \(jobs.count) - \(failed) failed")
+                } else {
+                    overlay.showInfo("Transcribed \(completed) of \(jobs.count)")
+                }
             }
         case .processing:
             fileWorkActive = true
