@@ -152,6 +152,10 @@ final class Overlay {
     private var generation: Int = 0
     var isVisible: Bool { panel?.isVisible ?? false }
     var currentMode: OverlayMode? { mode }
+    /// The session pill a live toast will put back when it expires; nil when
+    /// the toast is terminal. Read by tests: a terminal toast that still names
+    /// a resume mode is the "pill loads forever" bug.
+    private(set) var toastResumeMode: OverlayMode?
     private var timerTextLayer: CATextLayer?
     private var recordingStartTime: Date?
     private var segmentProgressLayer: CATextLayer?
@@ -253,6 +257,7 @@ final class Overlay {
         generation += 1
         pendingHide?.cancel()
         pendingHide = nil
+        toastResumeMode = nil
         createPanelIfNeeded()
         guard let p = panel else { return }
 
@@ -467,6 +472,7 @@ final class Overlay {
         // leaves `isVisible == true` for 0.3 s, and any watchdog that reads a
         // stale mode in that gap would act on a panel that is already leaving.
         mode = nil
+        toastResumeMode = nil
         generation += 1
         let capturedGeneration = generation
 
@@ -506,6 +512,23 @@ final class Overlay {
         )
     }
 
+    /// End the session on screen and flash its outcome. `showInfo`/`showError`
+    /// over a live pill are toasts: they put the pill back when they expire.
+    /// A session's last word must not do that. Lived: a tap-and-release
+    /// dictation flashed "No speech detected" over `.loading`, the toast expired,
+    /// and `.loading` came back with nothing left to hide it — the pill sat on
+    /// screen forever.
+    func finish(info message: String) {
+        hide()
+        showInfo(message)
+    }
+
+    /// Terminal counterpart of `showError` — see `finish(info:)`.
+    func finish(error message: String) {
+        hide()
+        showError(message)
+    }
+
     /// Width that actually fits `message` at the toast font, clamped so short
     /// toasts keep the familiar pill and long ones stop before absurd.
     nonisolated static func messagePillWidth(for message: String) -> CGFloat {
@@ -534,14 +557,19 @@ final class Overlay {
         // A toast must not kill an active session's pill: remember what was on
         // screen and put it back when the toast expires. The recording clock
         // keeps its epoch — the session did not restart.
+        // A toast replacing a toast inherits its resume target: the second
+        // "Hotkey active" over a recording must not decide the recording is over.
         let resumeMode: OverlayMode?
         switch mode {
         case .recording, .loading, .downloading, .fileQueue, .fileQueuePaused:
             resumeMode = mode
-        case .error, nil:
+        case .error:
+            resumeMode = toastResumeMode
+        case nil:
             resumeMode = nil
         }
         let resumeStart = recordingStartTime
+        toastResumeMode = resumeMode
 
         self.mode = .error
         // A `hide()` may still be fading out; its completion is gated on
@@ -582,6 +610,7 @@ final class Overlay {
         let work = DispatchWorkItem { [weak self] in
             guard let self, self.mode == .error else { return }
             self.removeErrorLayer()
+            self.toastResumeMode = nil
             if let resumeMode {
                 self.show(mode: resumeMode)
                 self.recordingStartTime = resumeStart
@@ -819,7 +848,9 @@ final class Overlay {
 
             CATransaction.begin()
             CATransaction.setDisableActions(true)
-            bars[i].opacity = 1
+            // Text modes hide the bars in show(); a tick must not bring them back
+            // under the status line.
+            bars[i].opacity = (mode == .recording || mode == .loading) ? 1 : 0
             bars[i].frame = CGRect(x: bx, y: by, width: barWidth, height: h)
             let alpha = 0.4 + 0.5 * CGFloat(smoothLevels[i])
             bars[i].backgroundColor = NSColor(white: 0.25, alpha: alpha).cgColor

@@ -48,6 +48,66 @@ final class OverlayModeLifecycleTests: XCTestCase {
         XCTAssertFalse(watchdogWouldFire, "a hidden panel must not answer to the downloading watchdog")
     }
 
+    /// A toast over a live session is a toast: when it expires the session pill
+    /// comes back. "Transcribing… press again to cancel" over `.loading` relies
+    /// on this.
+    func testToastOverLiveSessionResumesIt() {
+        let overlay = Overlay()
+        overlay.show(mode: .loading)
+        overlay.showInfo("Transcribing… press again to cancel")
+
+        XCTAssertEqual(overlay.currentMode, .error, "the toast owns the pill while it is up")
+        XCTAssertEqual(overlay.toastResumeMode, .loading, "and hands it back to the session when it expires")
+    }
+
+    /// The bug the owner hit: tap the hotkey, release at once, nothing captured.
+    /// The pill was `.loading`; "No speech detected" went up as a plain toast,
+    /// expired 2.5 s later and put `.loading` back — with the session already
+    /// over, nothing was left to hide it. A session's last word must not name a
+    /// pill to come back to.
+    func testFinishToastDoesNotResurrectTheSessionPill() {
+        let overlay = Overlay()
+        overlay.show(mode: .loading)
+        overlay.finish(info: "No speech detected")
+
+        XCTAssertEqual(overlay.currentMode, .error, "the outcome is on screen")
+        XCTAssertNil(overlay.toastResumeMode, "and nothing comes back after it")
+    }
+
+    func testFinishErrorToastDoesNotResurrectTheSessionPill() {
+        let overlay = Overlay()
+        overlay.show(mode: .loading)
+        overlay.finish(error: "No audio captured")
+
+        XCTAssertEqual(overlay.currentMode, .error)
+        XCTAssertNil(overlay.toastResumeMode)
+    }
+
+    /// A fresh session started while a terminal toast is still up must not be
+    /// captured as that toast's resume target either way round.
+    func testShowClearsAnyPendingResume() {
+        let overlay = Overlay()
+        overlay.show(mode: .recording)
+        overlay.showInfo("Hotkey active")
+        XCTAssertEqual(overlay.toastResumeMode, .recording)
+
+        overlay.show(mode: .loading)
+        XCTAssertNil(overlay.toastResumeMode)
+        XCTAssertEqual(overlay.currentMode, .loading)
+    }
+
+    /// Two toasts in a row over a recording: the second one saw `.error`, took
+    /// that as "no session", and when it expired the pill left mid-recording.
+    /// A toast replacing a toast inherits its resume target.
+    func testSecondToastKeepsTheSessionOfTheFirst() {
+        let overlay = Overlay()
+        overlay.show(mode: .recording)
+        overlay.showInfo("Hotkey active")
+        overlay.showError("Accessibility permission lost")
+
+        XCTAssertEqual(overlay.toastResumeMode, .recording, "the recording is still on and must come back")
+    }
+
     func testShowAfterHideRepublishesMode() {
         let overlay = Overlay()
         overlay.show(mode: .recording)
