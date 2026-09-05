@@ -68,16 +68,48 @@ final class OverlayModeLifecycleTests: XCTestCase {
     func testFinishToastDoesNotResurrectTheSessionPill() {
         let overlay = Overlay()
         overlay.show(mode: .loading)
-        overlay.finish(info: "No speech detected")
+        overlay.finish(.info("No speech detected"))
 
         XCTAssertEqual(overlay.currentMode, .error, "the outcome is on screen")
         XCTAssertNil(overlay.toastResumeMode, "and nothing comes back after it")
     }
 
+    /// The regression the first patch introduced: the file queue's "Transcribed
+    /// 1 files" is a toast from a non-owner. Over a running dictation it must
+    /// bring `.recording` back, not end it.
+    func testNonOwnerToastOverLiveRecordingResumesIt() {
+        let overlay = Overlay()
+        overlay.show(mode: .recording)
+        overlay.showInfo("Transcribed 1 files")
+
+        XCTAssertEqual(overlay.toastResumeMode, .recording)
+    }
+
+    func testFinishSilentJustHidesTheSessionPill() {
+        let overlay = Overlay()
+        overlay.show(mode: .loading)
+        overlay.finish(.silent)
+
+        XCTAssertNil(overlay.currentMode)
+        XCTAssertNil(overlay.toastResumeMode)
+    }
+
+    /// `hide()` means nothing is pending: a toast's delayed work item must not
+    /// outlive it and act on whatever is on screen by then.
+    func testHideCancelsAPendingToastExpiry() {
+        let overlay = Overlay()
+        overlay.show(mode: .recording)
+        overlay.showInfo("Hotkey active")
+        overlay.hide()
+
+        XCTAssertNil(overlay.toastResumeMode)
+        XCTAssertNil(overlay.currentMode)
+    }
+
     func testFinishErrorToastDoesNotResurrectTheSessionPill() {
         let overlay = Overlay()
         overlay.show(mode: .loading)
-        overlay.finish(error: "No audio captured")
+        overlay.finish(.error("No audio captured"))
 
         XCTAssertEqual(overlay.currentMode, .error)
         XCTAssertNil(overlay.toastResumeMode)

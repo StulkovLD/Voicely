@@ -473,6 +473,8 @@ final class Overlay {
         // stale mode in that gap would act on a panel that is already leaving.
         mode = nil
         toastResumeMode = nil
+        pendingHide?.cancel()
+        pendingHide = nil
         generation += 1
         let capturedGeneration = generation
 
@@ -512,21 +514,31 @@ final class Overlay {
         )
     }
 
-    /// End the session on screen and flash its outcome. `showInfo`/`showError`
-    /// over a live pill are toasts: they put the pill back when they expire.
-    /// A session's last word must not do that. Lived: a tap-and-release
-    /// dictation flashed "No speech detected" over `.loading`, the toast expired,
-    /// and `.loading` came back with nothing left to hide it — the pill sat on
-    /// screen forever.
-    func finish(info message: String) {
-        hide()
-        showInfo(message)
+    /// How a session leaves the screen. `.silent` — the pill just goes;
+    /// `.info`/`.error` — the pill goes and the outcome flashes for 5 s.
+    enum SessionEnd: Equatable, Sendable {
+        case silent
+        case info(String)
+        case error(String)
     }
 
-    /// Terminal counterpart of `showError` — see `finish(info:)`.
-    func finish(error message: String) {
+    /// End the session on screen. Only the owner that put the session pill up
+    /// may call this — a toast from anyone else over a live pill stays a
+    /// `showInfo`/`showError`, which brings the pill back when it expires
+    /// (lived: a file-queue "Transcribed 1 files" over a running dictation).
+    /// A session's own last word must NOT bring the pill back: a tap-and-release
+    /// dictation flashed "No speech detected" over `.loading`, the toast expired,
+    /// `.loading` returned and nothing was left to hide it.
+    func finish(_ end: SessionEnd) {
         hide()
-        showError(message)
+        switch end {
+        case .silent:
+            break
+        case .info(let message):
+            showInfo(message)
+        case .error(let message):
+            showError(message)
+        }
     }
 
     /// Width that actually fits `message` at the toast font, clamped so short
@@ -579,6 +591,8 @@ final class Overlay {
         generation += 1
         stopAnimation()
         removeProgressBar()
+        removeTimerDisplay()
+        removeSegmentProgress()
         removeErrorLayer()
         for bar in bars { bar.opacity = 0 }
 

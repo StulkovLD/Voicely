@@ -687,19 +687,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             do {
                 try await transcriber.preloadModel()
                 self.modelState = .ready(model)
-                self.overlay.hide()
-
+                self.overlay.finish(needsDownload ? .info("Ready") : .silent)
                 if needsDownload {
-                    self.overlay.showInfo("Ready")
                     self.showReadyNotification()
                 }
                 print("[Voicely] Ready. Press \(hotkey.combo.displayName) to dictate.")
             } catch {
                 guard !Task.isCancelled else { return }
                 print("[Voicely] Model preload failed: \(error)")
-                self.overlay.hide()
                 let msg = Self.classifyModelError(error)
-                self.overlay.showError(msg)
+                self.overlay.finish(.error(msg))
                 self.modelState = .failed(model, msg)
             }
         }
@@ -1100,7 +1097,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                    rawCompletedChunkOutcome.fragments.isEmpty,
                    audio == nil {
                     print("[Voicely] Recorder error: \(recorderStopError.localizedDescription)")
-                    self.overlay.finish(error: recorderStopError.localizedDescription)
+                    self.overlay.finish(.error(recorderStopError.localizedDescription))
                     self.preserveActiveDictationRecovery(
                         reason: "recorder_stop_failed: \(recorderStopError.localizedDescription)"
                     )
@@ -1156,10 +1153,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                         + "(\(decodeOutcome.fragments.count) fragments, "
                         + "incomplete=\(decodeOutcome.requiresRecovery))"
                 )
-                var messageShown = false
-                if !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                let hasText = !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                var saved: URL?
+                var injection: InjectionResult?
+                if hasText {
                     let currentApp = NSWorkspace.shared.frontmostApplication?.localizedName
-                    let saved = self.storage.saveDictation(
+                    saved = self.storage.saveDictation(
                         text: text,
                         sourceApp: sourceApp ?? currentApp
                     )
@@ -1170,71 +1169,33 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                             target: injectionTarget,
                             destination: self.dictationDestination
                         )
-                        switch result {
-                        case .blockedSecureTarget:
-                            self.overlay.finish(error: saved == nil
-                                ? "Secure field blocked. Save failed"
-                                : "Secure field blocked. Saved")
-                            messageShown = true
-                        case .copiedOnly:
-                            self.overlay.finish(info: saved == nil
-                                ? "Copied to clipboard; save failed"
-                                : "Copied to clipboard & saved")
-                            messageShown = true
-                        case .failed:
-                            self.overlay.finish(error: saved == nil
-                                ? "Copy failed. Save failed"
-                                : "Copy failed. Saved")
-                            messageShown = true
-                        case .directInsert:
-                            if saved == nil {
-                                self.overlay.finish(error: "Inserted. Save failed")
-                                messageShown = true
-                            }
-                        }
+                        injection = result
                         AppDelegate.debugLog("Text result=\(result), saved=\(saved?.lastPathComponent ?? "nil")")
-                    }
-
-                    self.applyDictationRecoveryDisposition(
-                        Self.dictationRecoveryDisposition(
-                            for: decodeOutcome,
-                            transcriptSaveSucceeded: saved != nil,
-                            terminationInProgress: self.dictationTerminationInProgress
-                        ),
-                        transcriptURL: saved
-                    )
-                    if decodeOutcome.requiresRecovery,
-                       !self.dictationTerminationInProgress {
-                        self.overlay.finish(error: saved == nil
-                            ? "Transcription incomplete. Audio preserved; save failed"
-                            : "Transcription incomplete. Audio preserved")
-                        messageShown = true
                     }
                 } else {
                     AppDelegate.debugLog(
                         "Empty transcription result - incomplete="
                             + "\(decodeOutcome.requiresRecovery)"
                     )
-                    if decodeOutcome.requiresRecovery {
-                        self.overlay.finish(error: "Transcription incomplete. Audio preserved")
-                    } else {
-                        self.overlay.finish(info: "No speech detected")
-                    }
-                    messageShown = true
-                    self.applyDictationRecoveryDisposition(
-                        Self.dictationRecoveryDisposition(
-                            for: decodeOutcome,
-                            transcriptSaveSucceeded: nil,
-                            terminationInProgress: self.dictationTerminationInProgress
-                        ),
-                        transcriptURL: nil
+                }
+                self.applyDictationRecoveryDisposition(
+                    Self.dictationRecoveryDisposition(
+                        for: decodeOutcome,
+                        transcriptSaveSucceeded: hasText ? saved != nil : nil,
+                        terminationInProgress: self.dictationTerminationInProgress
+                    ),
+                    transcriptURL: saved
+                )
+                // The session put the pill up; its last word takes it down.
+                self.overlay.finish(
+                    Self.dictationEndPresentation(
+                        hasText: hasText,
+                        injection: injection,
+                        saved: saved != nil,
+                        requiresRecovery: decodeOutcome.requiresRecovery,
+                        terminationInProgress: self.dictationTerminationInProgress
                     )
-                }
-                // A finish(...) toast already took the pill down; a silent
-                // success must take it down here.
-                if !messageShown {
-                    self.overlay.hide()
-                }
+                )
                 self.finishDictationSessionIfOwned(finishingSessionOwner)
             }
 
@@ -1262,8 +1223,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 commitActiveDictationRecovery(transcriptURL: nil)
                 discardWindow = nil
                 transcribeEscapeArmed = false
-                overlay.hide()
-                overlay.showInfo("Discarded")
+                overlay.finish(.info("Discarded"))
                 state = .idle
                 fileQueue?.resume()
                 resetMenubar()
@@ -1512,7 +1472,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             interruptionReason: audio.captureTruth.interruptionReason
         )
         guard audio.micFileURL != nil || audio.systemFileURL != nil else {
-            self.overlay.finish(error: "No audio captured")
+            self.overlay.finish(.error("No audio captured"))
             return
         }
 
@@ -1716,7 +1676,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let speakerCount = CallTranscriptMerger.detectedSpeakerIDs(in: transcript).count
         if saveResult.isFullyFinalized {
             updateCallTranscriptionProgress(.finished)
-            self.overlay.finish(info: captureMetadata.isPartial ? "Call saved (partial capture)" : "Call saved")
+            self.overlay.finish(.info(captureMetadata.isPartial ? "Call saved (partial capture)" : "Call saved"))
             if captureMetadata.isPartial {
                 NSLog("[Voicely] Call saved as partial capture: %@ (%d segments, %d remote speakers)",
                       captureMetadata.partialReason ?? "unknown",
@@ -1728,15 +1688,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             }
         } else if saveResult.isComplete {
             updateCallTranscriptionProgress(.finished)
-            self.overlay.finish(error: "Call saved; recovery cleanup pending")
+            self.overlay.finish(.error("Call saved; recovery cleanup pending"))
             NSLog("[Voicely] Call artifacts are durable but source cleanup failed: %@",
                   String(describing: saveResult.sourceCleanup))
         } else {
             let failedArtifacts = saveResult.failedArtifactNames.joined(separator: ", ")
             if saveResult.transcriptWasSaved {
-                self.overlay.finish(error: "Call partial: \(failedArtifacts)")
+                self.overlay.finish(.error("Call partial: \(failedArtifacts)"))
             } else {
-                self.overlay.finish(error: "Call save failed: \(failedArtifacts)")
+                self.overlay.finish(.error("Call save failed: \(failedArtifacts)"))
             }
             NSLog("[Voicely] Call artifact set incomplete; failed=%@ transcript_saved=%@ segments=%d remote_speakers=%d",
                   failedArtifacts,
@@ -2048,7 +2008,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         throw lastError ?? CallRecorderError.noAudio
     }
 
-    private func finishCallRecording(hideOverlay: Bool = true) {
+    private func finishCallRecording(hideOverlay: Bool) {
         if hideOverlay { overlay.hide() }
         state = .idle
         fileQueue?.resume()
@@ -2085,7 +2045,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         guard let audio,
               audio.micFileURL != nil || audio.systemFileURL != nil else {
             NSLog("[Voicely] No call audio captured")
-            overlay.finish(error: "No audio captured")
+            overlay.finish(.error("No audio captured"))
             return
         }
         await processCallRecording(audio: audio, sourceApp: sourceApp)
@@ -2753,9 +2713,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 self.showReadyNotification()
             } catch {
                 guard !Task.isCancelled else { return }
-                self.overlay.hide()
                 let msg = Self.classifyModelError(error)
-                self.overlay.showError(msg)
+                self.overlay.finish(.error(msg))
                 self.modelState = .failed(model, msg)
             }
         }
@@ -2845,9 +2804,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                         self.overlay.hide()
                     } catch {
                         guard !Task.isCancelled else { return }
-                        self.overlay.hide()
                         let msg = Self.classifyModelError(error)
-                        self.overlay.showError(msg)
+                        self.overlay.finish(.error(msg))
                         self.modelState = .failed(model, msg)
                     }
                 }
@@ -2906,8 +2864,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 print("[Voicely] Deleted model: \(model.displayName)")
             }
             modelState = .noModel
-            overlay.hide()
-            overlay.showInfo(completionMessage)
+            overlay.finish(.info(completionMessage))
         }
     }
 
@@ -3030,6 +2987,39 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// A drained tail is represented explicitly by `.noSamples`; it does not
     /// invalidate already-decoded chunks. Losing the engine or audio format is
     /// different: an unknown tail may be missing, so raw recovery must survive.
+    /// What the pill says when a dictation session ends. Every branch is a
+    /// session end: `.silent` or a terminal toast — never a toast that would
+    /// bring `.loading` back (lived: the pill that loaded forever).
+    nonisolated static func dictationEndPresentation(
+        hasText: Bool,
+        injection: InjectionResult?,
+        saved: Bool,
+        requiresRecovery: Bool,
+        terminationInProgress: Bool
+    ) -> Overlay.SessionEnd {
+        guard hasText else {
+            return requiresRecovery
+                ? .error("Transcription incomplete. Audio preserved")
+                : .info("No speech detected")
+        }
+        if terminationInProgress { return .silent }
+        if requiresRecovery {
+            return .error(saved
+                ? "Transcription incomplete. Audio preserved"
+                : "Transcription incomplete. Audio preserved; save failed")
+        }
+        switch injection {
+        case .blockedSecureTarget:
+            return .error(saved ? "Secure field blocked. Saved" : "Secure field blocked. Save failed")
+        case .copiedOnly:
+            return .info(saved ? "Copied to clipboard & saved" : "Copied to clipboard; save failed")
+        case .failed:
+            return .error(saved ? "Copy failed. Saved" : "Copy failed. Save failed")
+        case .directInsert, nil:
+            return saved ? .silent : .error("Inserted. Save failed")
+        }
+    }
+
     nonisolated static func dictationOutcomeAfterRecorderStop(
         _ error: RecorderError?,
         completedChunks: DictationDecodeOutcome
@@ -3740,15 +3730,19 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 default: break
                 }
             }
+            // The queue never owns the session pill (it reports through toasts),
+            // so its last word is a toast too: a dictation or call that started
+            // while the last file was finishing keeps its pill.
             if jobs.isEmpty || cancelled == jobs.count {
-                // Nothing to report or everything was user-cancelled.
-                overlay.hide()
+                // Nothing to report or everything was user-cancelled; only an
+                // enqueue toast of our own may still be up.
+                if overlay.currentMode == .error, overlay.toastResumeMode == nil { overlay.hide() }
             } else if failed == 0 && cancelled == 0 {
-                overlay.finish(info: "Transcribed \(jobs.count) files")
+                overlay.showInfo("Transcribed \(jobs.count) files")
             } else if failed > 0 {
-                overlay.finish(error: "Transcribed \(completed) of \(jobs.count) - \(failed) failed")
+                overlay.showError("Transcribed \(completed) of \(jobs.count) - \(failed) failed")
             } else {
-                overlay.finish(info: "Transcribed \(completed) of \(jobs.count)")
+                overlay.showInfo("Transcribed \(completed) of \(jobs.count)")
             }
         case .processing:
             fileWorkActive = true
