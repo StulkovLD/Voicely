@@ -371,6 +371,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// Token of the model-setup pill; its watchdog and the progress callback
     /// address that session only, never whatever pill came after it.
     private var modelSetupOverlaySession: Overlay.SessionToken?
+    /// Token of the dictation pill (`.recording`, then `.loading` on stop):
+    /// one press of the owner, one session, one last word.
+    private var dictationOverlaySession: Overlay.SessionToken?
+    /// Token of the call-finalization pill; the 3 s cap and the call's last
+    /// word address that session only.
+    private var callOverlaySession: Overlay.SessionToken?
     /// The chunk loop that keeps decoding its last window after stop; discard
     /// cancels it, a normal stop lets it finish.
     private var finishingChunkTask: Task<DictationDecodeOutcome, Never>?
@@ -693,7 +699,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             do {
                 try await transcriber.preloadModel()
                 self.modelState = .ready(model)
-                self.overlay.finish(needsDownload ? .info("Ready") : .silent)
+                self.overlay.finish(needsDownload ? .info("Ready") : .silent, of: self.modelSetupOverlaySession)
+                self.modelSetupOverlaySession = nil
                 if needsDownload {
                     self.showReadyNotification()
                 }
@@ -702,7 +709,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 guard !Task.isCancelled else { return }
                 print("[Voicely] Model preload failed: \(error)")
                 let msg = Self.classifyModelError(error)
-                self.overlay.finish(.error(msg))
+                self.overlay.finish(.error(msg), of: self.modelSetupOverlaySession)
+                self.modelSetupOverlaySession = nil
                 self.modelState = .failed(model, msg)
             }
         }
@@ -977,6 +985,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         case .dropped:
             return
         case .refused(let message):
+            // A refusal arms the debounce too: a bounce must not redraw the
+            // toast and re-announce it.
+            lastDictationToggle = now
             overlay.showInfo(message)
             return
         case .start, .stop, .transcribingPress, .callSessionPress:
@@ -1017,7 +1028,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             }
             // Pause file-transcription queue so WhisperKit is free for dictation.
             fileQueue?.pause()
-            overlay.show(mode: .recording)
+            dictationOverlaySession = overlay.show(mode: .recording)
             state = .recording
 
             // Start chunked transcription. The loop is driven by buffered audio:
@@ -1088,7 +1099,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             let recoverySession = recorder.takeDictationRecoverySession()
             activeDictationRecovery = recoverySession
             AppDelegate.debugLog("Recorder result: \(result)")
-            overlay.show(mode: .loading)
+            // Same session as the recording pill; a new one only if that pill
+            // is somehow already gone.
+            if dictationOverlaySession.map({ overlay.show(mode: .loading, in: $0) }) != true {
+                dictationOverlaySession = overlay.show(mode: .loading)
+            }
             state = .transcribing
 
             // #12: Set discard window - hotkey within 2s will cancel transcription
@@ -1142,7 +1157,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                    rawCompletedChunkOutcome.fragments.isEmpty,
                    audio == nil {
                     print("[Voicely] Recorder error: \(recorderStopError.localizedDescription)")
-                    self.overlay.finish(.error(recorderStopError.localizedDescription))
+                    self.overlay.finish(.error(recorderStopError.localizedDescription), of: self.dictationOverlaySession)
                     self.preserveActiveDictationRecovery(
                         reason: "recorder_stop_failed: \(recorderStopError.localizedDescription)"
                     )
@@ -1247,7 +1262,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                         saved: saved != nil,
                         requiresRecovery: decodeOutcome.requiresRecovery,
                         terminationInProgress: self.dictationTerminationInProgress
-                    )
+                    ),
+                    of: self.dictationOverlaySession
                 )
                 self.finishDictationSessionIfOwned(finishingSessionOwner)
             }
@@ -1278,7 +1294,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 commitActiveDictationRecovery(transcriptURL: nil)
                 discardWindow = nil
                 transcribeEscapeArmed = false
-                overlay.finish(.info("Discarded"))
+                overlay.finish(.info("Discarded"), of: dictationOverlaySession)
+                dictationOverlaySession = nil
                 state = .idle
                 fileQueue?.resume()
                 resetMenubar()
@@ -1527,7 +1544,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             interruptionReason: audio.captureTruth.interruptionReason
         )
         guard audio.micFileURL != nil || audio.systemFileURL != nil else {
-            self.overlay.finish(.error("No audio captured"))
+            self.overlay.finish(.error("No audio captured"), of: self.callOverlaySession)
             return
         }
 
@@ -1731,7 +1748,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let speakerCount = CallTranscriptMerger.detectedSpeakerIDs(in: transcript).count
         if saveResult.isFullyFinalized {
             updateCallTranscriptionProgress(.finished)
-            self.overlay.finish(.info(captureMetadata.isPartial ? "Call saved (partial capture)" : "Call saved"))
+            self.overlay.finish(.info(captureMetadata.isPartial ? "Call saved (partial capture)" : "Call saved"), of: self.callOverlaySession)
             if captureMetadata.isPartial {
                 NSLog("[Voicely] Call saved as partial capture: %@ (%d segments, %d remote speakers)",
                       captureMetadata.partialReason ?? "unknown",
@@ -1743,15 +1760,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             }
         } else if saveResult.isComplete {
             updateCallTranscriptionProgress(.finished)
-            self.overlay.finish(.error("Call saved; recovery cleanup pending"))
+            self.overlay.finish(.error("Call saved; recovery cleanup pending"), of: self.callOverlaySession)
             NSLog("[Voicely] Call artifacts are durable but source cleanup failed: %@",
                   String(describing: saveResult.sourceCleanup))
         } else {
             let failedArtifacts = saveResult.failedArtifactNames.joined(separator: ", ")
             if saveResult.transcriptWasSaved {
-                self.overlay.finish(.error("Call partial: \(failedArtifacts)"))
+                self.overlay.finish(.error("Call partial: \(failedArtifacts)"), of: self.callOverlaySession)
             } else {
-                self.overlay.finish(.error("Call save failed: \(failedArtifacts)"))
+                self.overlay.finish(.error("Call save failed: \(failedArtifacts)"), of: self.callOverlaySession)
             }
             NSLog("[Voicely] Call artifact set incomplete; failed=%@ transcript_saved=%@ segments=%d remote_speakers=%d",
                   failedArtifacts,
@@ -2063,8 +2080,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         throw lastError ?? CallRecorderError.noAudio
     }
 
-    private func finishCallRecording(hideOverlay: Bool) {
-        if hideOverlay { overlay.hide() }
+    private func finishCallRecording() {
+        callOverlaySession = nil
         state = .idle
         fileQueue?.resume()
         resetMenubar()
@@ -2075,6 +2092,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private func beginCallFinalization() {
         state = .callTranscribing
         let callSession = overlay.show(mode: .loading)
+        callOverlaySession = callSession
         updateCallTranscriptionProgress(.preparing)
         // Cap the pill at ~3 s. The transcribe+diarize pass runs in the
         // background and must NOT keep the overlay up for the full duration.
@@ -2092,14 +2110,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// discovered at the recorder-to-UI handoff. `CallRecorder.stop()` owns the
     /// interruption snapshot, so both paths publish identical partial metadata.
     private func finalizeCallRecording(sourceApp: String?) async {
-        defer { finishCallRecording(hideOverlay: false) }
+        defer { finishCallRecording() }
 
         let audio = await callRecorder.stop()
         guard !Task.isCancelled else { return }
         guard let audio,
               audio.micFileURL != nil || audio.systemFileURL != nil else {
             NSLog("[Voicely] No call audio captured")
-            overlay.finish(.error("No audio captured"))
+            overlay.finish(.error("No audio captured"), of: callOverlaySession)
             return
         }
         await processCallRecording(audio: audio, sourceApp: sourceApp)
@@ -2754,12 +2772,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             do {
                 try await transcriber.preloadModel()
                 self.modelState = .ready(model)
-                self.overlay.hide()
+                self.overlay.finish(.silent, of: self.modelSetupOverlaySession)
+                self.modelSetupOverlaySession = nil
                 self.showReadyNotification()
             } catch {
                 guard !Task.isCancelled else { return }
                 let msg = Self.classifyModelError(error)
-                self.overlay.finish(.error(msg))
+                self.overlay.finish(.error(msg), of: self.modelSetupOverlaySession)
+                self.modelSetupOverlaySession = nil
                 self.modelState = .failed(model, msg)
             }
         }
@@ -2846,11 +2866,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                     do {
                         try await transcriber.preloadModel()
                         self.modelState = .ready(model)
-                        self.overlay.hide()
+                        self.overlay.finish(.silent, of: self.modelSetupOverlaySession)
+                        self.modelSetupOverlaySession = nil
                     } catch {
                         guard !Task.isCancelled else { return }
                         let msg = Self.classifyModelError(error)
-                        self.overlay.finish(.error(msg))
+                        self.overlay.finish(.error(msg), of: self.modelSetupOverlaySession)
+                        self.modelSetupOverlaySession = nil
                         self.modelState = .failed(model, msg)
                     }
                 }
@@ -2909,7 +2931,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 print("[Voicely] Deleted model: \(model.displayName)")
             }
             modelState = .noModel
-            overlay.finish(.info(completionMessage))
+            overlay.finish(.info(completionMessage), of: modelSetupOverlaySession)
+            modelSetupOverlaySession = nil
         }
     }
 
@@ -2944,6 +2967,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         dictationSessionOwner = nil
         dictationInjectionTarget = nil
         finishingChunkTask = nil
+        dictationOverlaySession = nil
         state = .idle
         discardWindow = nil
         transcribeEscapeArmed = false
@@ -3782,7 +3806,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             if jobs.isEmpty || cancelled == jobs.count {
                 // Nothing to report or everything was user-cancelled; only an
                 // enqueue toast of our own may still be up.
-                if overlay.currentMode == .error, overlay.toastResumeMode == nil { overlay.hide() }
+                // Nothing to say; an enqueue toast of ours ends on its own.
             } else if failed == 0 && cancelled == 0 {
                 overlay.showInfo("Transcribed \(jobs.count) files")
             } else if failed > 0 {

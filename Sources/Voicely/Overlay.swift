@@ -168,11 +168,17 @@ final class Overlay {
         fileprivate let id = UUID()
     }
     private(set) var session: SessionToken?
-    /// Toast expiry scheduling; tests replace it to fire the expiry by hand.
-    var toastScheduler: @MainActor (TimeInterval, DispatchWorkItem) -> Void = { delay, work in
-        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
-    }
+    /// Toast expiry scheduling; a test passes its own to fire expiry by hand.
+    private let toastScheduler: @MainActor (TimeInterval, DispatchWorkItem) -> Void
+    /// When the current toast went up — a `dismissSession` mid-toast turns it
+    /// terminal and gives it the rest of the terminal 5 s.
+    private var toastShownAt: Date?
+    /// Last download progress, put back when the `.downloading` pill returns
+    /// from behind a toast (the toast tears the bar down).
+    private var lastProgress: (value: Double, status: String)?
     var currentRecordingStart: Date? { recordingStartTime }
+    static let terminalToastSeconds: TimeInterval = 5
+    static let sessionToastSeconds: TimeInterval = 2.5
     private var timerTextLayer: CATextLayer?
     private var recordingStartTime: Date?
     private var segmentProgressLayer: CATextLayer?
@@ -221,7 +227,12 @@ final class Overlay {
         )
     }
 
-    init() {
+    init(
+        toastScheduler: @escaping @MainActor (TimeInterval, DispatchWorkItem) -> Void = { delay, work in
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
+        }
+    ) {
+        self.toastScheduler = toastScheduler
         // Task { @MainActor } instead of MainActor.assumeIsolated: the
         // notification block runs outside any Swift concurrency context, and
         // the runtime's executor check inside assumeIsolated dereferences
@@ -286,6 +297,12 @@ final class Overlay {
     @discardableResult
     func show(mode: OverlayMode, in token: SessionToken) -> Bool {
         guard session == token else { return false }
+        if self.mode == .error {
+            // A toast is up: let it be read; it will come back to the new mode.
+            toastResumeMode = mode
+            if mode != .recording { toastResumeStart = nil }
+            return true
+        }
         present(mode: mode)
         return true
     }
@@ -335,6 +352,9 @@ final class Overlay {
         // Setup progress bar if downloading mode
         if mode == .downloading {
             setupProgressBar()
+            if let lastProgress {
+                updateProgress(lastProgress.value, status: lastProgress.status)
+            }
         }
         // File queue modes render a single line of status text in the pill
         if case .fileQueue(let title, let progress) = mode {
@@ -390,6 +410,7 @@ final class Overlay {
 
     /// Update download progress 0.0-1.0
     func updateProgress(_ progress: Double, status: String) {
+        lastProgress = (progress, status)
         guard let progressLayer = progressLayer, let textLayer = progressTextLayer else { return }
         let clamped = min(1.0, max(0.0, progress))
         let trackWidth = pillWidth - 32
@@ -505,8 +526,15 @@ final class Overlay {
         segmentProgressLayer = nil
     }
 
-    func hide() {
-        guard let p = panel else { return }
+    /// Take the session pill down. Only its owner may: a token that is not the
+    /// live session's is a no-op (lived: `.loading` shared by model setup,
+    /// dictation and call finalization, and one owner's hide ended another's).
+    func hide(_ token: SessionToken) {
+        guard session == token else { return }
+        hide()
+    }
+
+    private func hide() {
         // Clear the mode up front, not in the completion handler: the fade
         // leaves `isVisible == true` for 0.3 s, and any watchdog that reads a
         // stale mode in that gap would act on a panel that is already leaving.
@@ -514,10 +542,12 @@ final class Overlay {
         session = nil
         toastResumeMode = nil
         toastResumeStart = nil
+        lastProgress = nil
         pendingHide?.cancel()
         pendingHide = nil
         generation += 1
         let capturedGeneration = generation
+        guard let p = panel else { return }
 
         // Fade out
         NSAnimationContext.runAnimationGroup({ ctx in
@@ -563,15 +593,17 @@ final class Overlay {
         case error(String)
     }
 
-    /// End the session on screen. Only the owner that put the session pill up
-    /// may call this — a toast from anyone else over a live pill stays a
-    /// `showInfo`/`showError`, which brings the pill back when it expires
-    /// (lived: a file-queue "Transcribed 1 files" over a running dictation).
-    /// A session's own last word must NOT bring the pill back: a tap-and-release
-    /// dictation flashed "No speech detected" over `.loading`, the toast expired,
-    /// `.loading` returned and nothing was left to hide it.
-    func finish(_ end: SessionEnd) {
-        hide()
+    /// End a session on screen and flash its outcome. `token` names the session
+    /// being ended: if it is not the live one (the caller never had a pill, or
+    /// someone else's pill is up now) nothing is taken down and the outcome is
+    /// a plain toast — which resumes whoever is live. A session's own last
+    /// word must not bring its pill back (lived: a tap-and-release dictation
+    /// flashed "No speech detected" over `.loading`, the toast expired,
+    /// `.loading` returned and nothing was left to hide it).
+    func finish(_ end: SessionEnd, of token: SessionToken?) {
+        if let token, session == token {
+            hide()
+        }
         switch end {
         case .silent:
             break
@@ -593,6 +625,10 @@ final class Overlay {
             session = nil
             toastResumeMode = nil
             toastResumeStart = nil
+            // The toast is terminal now: give it the rest of the terminal 5 s.
+            let shown = toastShownAt ?? Date()
+            let remaining = max(0, Self.terminalToastSeconds - Date().timeIntervalSince(shown))
+            scheduleToastExpiry(after: remaining)
         } else {
             hide()
         }
@@ -681,10 +717,18 @@ final class Overlay {
             p.animator().alphaValue = 1
         }
 
+        toastShownAt = Date()
+        // Toasts over an active session return to it quickly; terminal toasts
+        // stay the full 5 s the reading owner asked for.
+        scheduleToastExpiry(after: resumeMode == nil ? Self.terminalToastSeconds : Self.sessionToastSeconds)
+    }
+
+    private func scheduleToastExpiry(after delay: TimeInterval) {
         pendingHide?.cancel()
         let work = DispatchWorkItem { [weak self] in
             guard let self, self.mode == .error else { return }
             self.removeErrorLayer()
+            self.toastShownAt = nil
             // Read the live pair: a dismissSession() during the toast clears
             // it, and the session must then stay gone.
             let resumeMode = self.toastResumeMode
@@ -693,15 +737,13 @@ final class Overlay {
             self.toastResumeStart = nil
             if let resumeMode {
                 self.present(mode: resumeMode)
-                self.recordingStartTime = resumeStart
+                if resumeMode == .recording { self.recordingStartTime = resumeStart }
             } else {
                 self.hide()
             }
         }
         pendingHide = work
-        // Toasts over an active session return to it quickly; terminal toasts
-        // stay the full 5 s the reading owner asked for.
-        toastScheduler(resumeMode == nil ? 5 : 2.5, work)
+        toastScheduler(delay, work)
     }
 
     private func removeErrorLayer() {

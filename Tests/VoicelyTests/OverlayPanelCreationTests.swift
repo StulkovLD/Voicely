@@ -32,6 +32,7 @@ final class OverlayPanelCreationTests: XCTestCase {
     func testShowInfoCreatesPanelWithoutCrashing() {
         let overlay = Overlay()
         overlay.showInfo("Preparing model...")
-        overlay.hide()
+        let token = overlay.show(mode: .loading)
+        overlay.hide(token)
     }
 }
