@@ -47,6 +47,12 @@ final class DictationEndPresentationTests: XCTestCase {
         XCTAssertEqual(presentation(injection: .copiedOnly, saved: false), .info("Copied to clipboard; save failed"))
     }
 
+    /// Every channel certainly failed: the pill says what to do next.
+    func testFailedInsertTellsHowToPaste() {
+        XCTAssertEqual(presentation(injection: .copiedForManualPaste), .info("Not inserted. Press ⌘V to paste"))
+        XCTAssertEqual(presentation(injection: .copiedForManualPaste, saved: false), .info("Not inserted. Press ⌘V; save failed"))
+    }
+
     func testSecureFieldAndCopyFailureAreErrors() {
         XCTAssertEqual(presentation(injection: .blockedSecureTarget), .error("Secure field blocked. Saved"))
         XCTAssertEqual(presentation(injection: .blockedSecureTarget, saved: false), .error("Secure field blocked. Save failed"))

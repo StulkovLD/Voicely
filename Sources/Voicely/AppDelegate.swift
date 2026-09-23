@@ -361,6 +361,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var callCapturePreparedForTermination = false
     private var activeDictationRecovery: DictationRecoverySession?
     private var dictationTerminationInProgress = false
+    /// The transcript is saved and on its way to the caret: a hotkey press in
+    /// this window cannot discard it, and must not report "Discarded".
+    private var dictationDeliveryInProgress = false
     private var dictationPreparedForTermination = false
     private static let callTerminationGraceSeconds: TimeInterval = 5
     private static let dictationTerminationGraceSeconds: TimeInterval = 5
@@ -1265,13 +1268,19 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                     )
                     if !self.dictationTerminationInProgress {
                         AppDelegate.debugLog("Injecting text...")
-                        let result = self.injector.inject(
-                            text: text,
-                            target: injectionTarget,
-                            destination: self.dictationDestination
-                        )
+                        let destination = self.dictationDestination
+                        let injector = self.injector
+                        // Its own task: cancelling the session can never cut
+                        // short a paste that still holds the user's pasteboard.
+                        self.dictationDeliveryInProgress = true
+                        let result = await Task { @MainActor in
+                            await injector.deliver(text: text, target: injectionTarget, destination: destination)
+                        }.value
+                        self.dictationDeliveryInProgress = false
                         injection = result
                         AppDelegate.debugLog("Text result=\(result), saved=\(saved?.lastPathComponent ?? "nil")")
+                    } else {
+                        self.injector.recordSkipped(text: text, reason: "app_terminating")
                     }
                 } else {
                     AppDelegate.debugLog(
@@ -1302,6 +1311,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             }
 
         case .transcribing:
+            if dictationDeliveryInProgress { return }
             // #12/#74: Discard recording if hotkey pressed within 3s of entering transcribing state.
             // Past that window the hotkey used to be swallowed silently and there
             // was no way out of a wedged transcription short of quitting, so a
@@ -2556,6 +2566,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        // A paste still holding the user's pasteboard hands it back first.
+        injector.settleForTermination()
         if (state == .recording || state == .transcribing),
            !dictationPreparedForTermination {
             dictationTerminationInProgress = true
@@ -3107,6 +3119,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             return .error(saved ? "Secure field blocked. Saved" : "Secure field blocked. Save failed")
         case .copiedOnly:
             return .info(saved ? "Copied to clipboard & saved" : "Copied to clipboard; save failed")
+        case .copiedForManualPaste:
+            return .info(saved ? "Not inserted. Press ⌘V to paste" : "Not inserted. Press ⌘V; save failed")
         case .failed:
             return .error(saved ? "Copy failed. Saved" : "Copy failed. Save failed")
         case .directInsert, nil:

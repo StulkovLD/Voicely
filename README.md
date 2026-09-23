@@ -58,7 +58,7 @@ Voicely moves what you said to where you work. It never rewrites, summarizes or 
 
 ### Direct transport — dictation, `Option+Space`
 
-Press the hotkey, speak, press it again. A floating glass pill shows the live waveform while you talk. The text lands wherever your caret is: native fields through Accessibility, terminals and AX-silent apps (VS Code included) through synthetic typing. No caret in sight — the text goes to the clipboard and the pill says so. The **Output** menu can pin dictation to the clipboard permanently; secure fields are save-only, always. Dictations are saved to `~/Documents/Voicely/dictations/`.
+Press the hotkey, speak, press it again. A floating glass pill shows the live waveform while you talk. The text lands wherever your caret is: native Mac fields through Accessibility, checked by reading the caret back; Chrome, VS Code, Claude and every other Chromium or Electron app through the clipboard and `⌘V` — your clipboard is put back right after the app has read the text, and the transcript is marked so clipboard managers don't keep it; terminals through typed text. If no app takes the text, it waits on the clipboard and the pill says "Press ⌘V". The **Output** menu can pin dictation to the clipboard permanently; secure fields are save-only, always. Dictations are saved to `~/Documents/Voicely/dictations/`; where each one went, and how, is logged without the words in `~/Library/Logs/Voicely/insertion.jsonl`.
 
 ### Careful packaging — calls and files
 
@@ -173,7 +173,7 @@ I'll review the PR after lunch.
 
 ```
 Option+Space ──> MicRecorder ──> Parakeet V3 (CoreML, on-device) ──> CursorInjector
-                     │                                                AX insert → typed text → clipboard
+                     │                                  AX insert (native) → ⌘V, clipboard restored → typed text
                      v                                                          │
                AudioOverlay                                                     v
             (liquid glass pill)                                          TranscriptStore
