@@ -78,6 +78,8 @@ voicely connect                                            # registers the MCP s
 voicely connect claude                                     # or one by name: claude, codex, cursor, hermes, openclaw
 ```
 
+Claude Desktop and other MCPB-aware clients can install the server in one click from `voicely-<version>.mcpb` on the [latest release](https://github.com/StulkovLD/Voicely/releases/latest). Voicely is listed in the [official MCP Registry](https://registry.modelcontextprotocol.io/v0/servers?search=voicely) as `io.github.StulkovLD/voicely`.
+
 Teach the agent the whole playbook with the skill:
 
 ```bash

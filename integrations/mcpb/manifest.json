@@ -1,0 +1,41 @@
+{
+  "manifest_version": "0.2",
+  "name": "voicely",
+  "display_name": "Voicely",
+  "version": "1.4.2",
+  "description": "Offline transcription and speaker diarization on your Mac: transcribe audio/video files and read your Voicely dictations and call transcripts.",
+  "long_description": "Voicely is free, open-source, offline dictation and transcription for macOS. This bundle runs the Voicely MCP server locally over stdio. It transcribes audio and video files with NVIDIA Parakeet V3 through CoreML (25 languages, optional speaker diarization) and reads the transcripts the Voicely app saves under ~/Documents/Voicely. Nothing leaves the machine. The speech model (~470 MB) downloads once on the first transcription. For live dictation and call recording, install the app: curl -fsSL https://voicely.art/install.sh | sh. Requires macOS 14+ on Apple Silicon.",
+  "author": {
+    "name": "StulkovLD",
+    "email": "stulkovld@gmail.com",
+    "url": "https://github.com/StulkovLD"
+  },
+  "homepage": "https://voicely.art",
+  "documentation": "https://github.com/StulkovLD/Voicely#your-ai-knows-what-you-know",
+  "support": "https://github.com/StulkovLD/Voicely/issues",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/StulkovLD/Voicely"
+  },
+  "icon": "icon.png",
+  "server": {
+    "type": "binary",
+    "entry_point": "server/voicely",
+    "mcp_config": {
+      "command": "${__dirname}/server/voicely",
+      "args": ["mcp"],
+      "env": {}
+    }
+  },
+  "tools": [
+    {"name": "transcribe_file", "description": "Transcribe an audio/video file on-device, with optional speaker diarization"},
+    {"name": "list_transcripts", "description": "List saved transcripts (dictations, calls, files), newest first"},
+    {"name": "get_transcript", "description": "Read a transcript by id or alias (last, last-call, ...)"},
+    {"name": "get_last_call", "description": "Read the most recent call transcript"}
+  ],
+  "keywords": ["transcription", "speech-to-text", "dictation", "diarization", "offline", "macos", "whisper-alternative", "parakeet"],
+  "license": "MIT",
+  "compatibility": {
+    "platforms": ["darwin"]
+  }
+}

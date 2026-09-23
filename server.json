@@ -1,0 +1,22 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.StulkovLD/voicely",
+  "title": "Voicely",
+  "description": "Offline speech-to-text on macOS: transcribe audio/video files, read dictations and calls.",
+  "websiteUrl": "https://voicely.art",
+  "repository": {
+    "url": "https://github.com/StulkovLD/Voicely",
+    "source": "github"
+  },
+  "version": "1.4.2",
+  "packages": [
+    {
+      "registryType": "mcpb",
+      "identifier": "https://github.com/StulkovLD/Voicely/releases/download/v1.4.2/voicely-1.4.2.mcpb",
+      "fileSha256": "9666265c65483f0c70d542c8accef666e5386500b3ebdbea93d8cf737824ce98",
+      "transport": {
+        "type": "stdio"
+      }
+    }
+  ]
+}
