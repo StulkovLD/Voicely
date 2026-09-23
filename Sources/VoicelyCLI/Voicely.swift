@@ -31,10 +31,33 @@ struct Voicely: AsyncParsableCommand {
     )
 }
 
-/// Single source of truth for the CLI's reported version. Kept here so `voicely
-/// --version` and `voicely status` agree.
+/// The CLI's reported version (`voicely --version`, `voicely status`, and the MCP
+/// `serverInfo.version`). The product has one version source — the app's
+/// `Info.plist` (`CFBundleShortVersionString`) — and the CLI ships inside that
+/// app as `Voicely.app/Contents/Helpers/voicely`, so it reads the version from
+/// the enclosing bundle instead of carrying a second copy that can drift.
+/// A binary running outside an app bundle (a bare `swift build`) reports
+/// `unbundledVersion`.
 enum VoicelyCLIVersion {
-    static let current = "1.4.1"
+    static let unbundledVersion = "0.0.0-dev"
+
+    static let current = resolve(executablePath: Setup.currentExecutablePath())
+
+    /// `executablePath` must already have symlinks resolved (the PATH shim that
+    /// `voicely setup` installs is a symlink into the app bundle).
+    static func resolve(executablePath: String) -> String {
+        let helpersDir = URL(fileURLWithPath: executablePath).deletingLastPathComponent()
+        let contentsDir = helpersDir.deletingLastPathComponent()
+        guard contentsDir.lastPathComponent == "Contents",
+              contentsDir.deletingLastPathComponent().pathExtension == "app",
+              let data = try? Data(contentsOf: contentsDir.appendingPathComponent("Info.plist")),
+              let plist = try? PropertyListSerialization.propertyList(from: data, format: nil)
+                as? [String: Any],
+              let version = plist["CFBundleShortVersionString"] as? String,
+              !version.isEmpty
+        else { return unbundledVersion }
+        return version
+    }
 }
 
 // MARK: - stderr / stdout helpers
