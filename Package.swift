@@ -86,7 +86,14 @@ let package = Package(
             ],
             linkerSettings: [
                 .linkedFramework("AVFoundation"),
-            ]
+            ],
+            plugins: ["EmbedAppVersion"]
+        ),
+        // Build-time copy of the app version for the CLI (see the plugin).
+        .plugin(
+            name: "EmbedAppVersion",
+            capability: .buildTool(),
+            path: "Plugins/EmbedAppVersion"
         ),
         .testTarget(
             name: "VoicelyTests",

@@ -2,9 +2,10 @@ import Foundation
 import XCTest
 @testable import VoicelyCLI
 
-/// The CLI has no version of its own: it reports the version of the app bundle
-/// it ships in, so `voicely --version`, `voicely status` and the MCP
-/// `serverInfo.version` can never drift from the release.
+/// The CLI has no version literal of its own: inside Voicely.app it reports the
+/// bundle's version, elsewhere (MCPB, bare build) the version compiled in from
+/// the same Info.plist, so `voicely --version`, `voicely status` and the MCP
+/// `serverInfo.version` cannot drift from the release.
 final class CLIVersionTests: XCTestCase {
     private var root: URL!
 
@@ -31,32 +32,58 @@ final class CLIVersionTests: XCTestCase {
         return cli
     }
 
-    func testHelperInsideAppReportsTheBundleVersion() throws {
-        let cli = try makeApp(named: "Voicely.app", version: "9.8.7")
-        XCTAssertEqual(VoicelyCLIVersion.resolve(executablePath: cli.path), "9.8.7")
+    /// The version the source tree ships: the app's Info.plist.
+    private func sourceInfoPlistVersion() throws -> String {
+        let plist = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+            .appendingPathComponent("Sources/Voicely/Resources/Info.plist")
+        let data = try Data(contentsOf: plist)
+        let dict = try XCTUnwrap(
+            PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any]
+        )
+        return try XCTUnwrap(dict["CFBundleShortVersionString"] as? String)
     }
 
-    func testBinaryOutsideAnAppBundleReportsUnbundled() throws {
-        let bare = root.appendingPathComponent("debug").appendingPathComponent("VoicelyCLI")
+    func testHelperInsideAppReportsTheBundleVersion() throws {
+        let cli = try makeApp(named: "Voicely.app", version: "9.8.7")
         XCTAssertEqual(
-            VoicelyCLIVersion.resolve(executablePath: bare.path),
-            VoicelyCLIVersion.unbundledVersion
+            VoicelyCLIVersion.resolve(executablePath: cli.path, builtVersion: "1.0.0"),
+            "9.8.7"
         )
     }
 
-    func testBundleWithoutVersionKeyReportsUnbundled() throws {
+    /// The MCPB bundle runs the helper as `<bundle>/server/voicely`, outside any
+    /// .app: it must still report the release version, not a placeholder.
+    func testStandaloneBinaryReportsTheBuiltVersion() throws {
+        let standalone = root.appendingPathComponent("server").appendingPathComponent("voicely")
+        XCTAssertEqual(
+            VoicelyCLIVersion.resolve(executablePath: standalone.path, builtVersion: "9.8.7"),
+            "9.8.7"
+        )
+        XCTAssertEqual(
+            VoicelyCLIVersion.resolve(executablePath: standalone.path),
+            try sourceInfoPlistVersion()
+        )
+    }
+
+    func testBuiltVersionIsTheInfoPlistVersion() throws {
+        XCTAssertEqual(VoicelyBuildVersion.shortVersion, try sourceInfoPlistVersion())
+    }
+
+    func testBundleWithoutVersionKeyFallsBackToTheBuiltVersion() throws {
         let cli = try makeApp(named: "Voicely.app", version: nil)
         XCTAssertEqual(
-            VoicelyCLIVersion.resolve(executablePath: cli.path),
-            VoicelyCLIVersion.unbundledVersion
+            VoicelyCLIVersion.resolve(executablePath: cli.path, builtVersion: "9.8.7"),
+            "9.8.7"
         )
     }
 
     func testContentsFolderOutsideAnAppIsNotABundle() throws {
-        let cli = try makeApp(named: "NotAnApp", version: "9.8.7")
+        let cli = try makeApp(named: "NotAnApp", version: "1.2.3")
+        XCTAssertNil(VoicelyCLIVersion.bundleVersion(executablePath: cli.path))
         XCTAssertEqual(
-            VoicelyCLIVersion.resolve(executablePath: cli.path),
-            VoicelyCLIVersion.unbundledVersion
+            VoicelyCLIVersion.resolve(executablePath: cli.path, builtVersion: "9.8.7"),
+            "9.8.7"
         )
     }
 }
