@@ -39,7 +39,7 @@ jobs:
       - name: Test
         run: swift test --skip-build --disable-automatic-resolution --skip-update
 
-      - name: CLI smoke (version comes from the app bundle it ships in)
+      - name: CLI smoke (version from Info.plist, inside Voicely.app and standalone)
         run: |
           set -eu
           BIN_PATH="$(swift build --show-bin-path)"
@@ -55,4 +55,10 @@ jobs:
           # Keep stdin open briefly: the server stops on EOF, before a pending reply.
           { printf '%s\n' "$INIT"; sleep 3; } | "$APP/Contents/Helpers/voicely" mcp | head -n 1 \
             | /usr/bin/grep -F "\"version\":\"$VERSION\"" >/dev/null
+          # Standalone, as in the MCPB bundle (server/voicely, no .app around it).
+          mkdir -p "$RUNNER_TEMP/mcpb/server"
+          cp "$BIN_PATH/VoicelyCLI" "$RUNNER_TEMP/mcpb/server/voicely"
+          test "$("$RUNNER_TEMP/mcpb/server/voicely" --version)" = "$VERSION"
+          { printf '%s\n' "$INIT"; sleep 3; } | "$RUNNER_TEMP/mcpb/server/voicely" mcp | head -n 1 \
+            | /usr/bin/grep -F "\"serverInfo\":{\"name\":\"voicely\",\"version\":\"$VERSION\"}" >/dev/null
           "$BIN_PATH/VoicelyCLI" --help >/dev/null

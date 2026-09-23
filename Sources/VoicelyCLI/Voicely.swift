@@ -33,19 +33,25 @@ struct Voicely: AsyncParsableCommand {
 
 /// The CLI's reported version (`voicely --version`, `voicely status`, and the MCP
 /// `serverInfo.version`). The product has one version source — the app's
-/// `Info.plist` (`CFBundleShortVersionString`) — and the CLI ships inside that
-/// app as `Voicely.app/Contents/Helpers/voicely`, so it reads the version from
-/// the enclosing bundle instead of carrying a second copy that can drift.
-/// A binary running outside an app bundle (a bare `swift build`) reports
-/// `unbundledVersion`.
+/// `Info.plist` (`CFBundleShortVersionString`):
+/// - inside `Voicely.app/Contents/Helpers/voicely` the CLI reads it from the
+///   enclosing bundle;
+/// - anywhere else (the MCPB bundle's `server/voicely`, a bare `swift build`) it
+///   reports `VoicelyBuildVersion.shortVersion`, which the `EmbedAppVersion`
+///   build plugin generates from the same `Info.plist`.
 enum VoicelyCLIVersion {
-    static let unbundledVersion = "0.0.0-dev"
-
     static let current = resolve(executablePath: Setup.currentExecutablePath())
 
     /// `executablePath` must already have symlinks resolved (the PATH shim that
     /// `voicely setup` installs is a symlink into the app bundle).
-    static func resolve(executablePath: String) -> String {
+    static func resolve(
+        executablePath: String,
+        builtVersion: String = VoicelyBuildVersion.shortVersion
+    ) -> String {
+        bundleVersion(executablePath: executablePath) ?? builtVersion
+    }
+
+    static func bundleVersion(executablePath: String) -> String? {
         let helpersDir = URL(fileURLWithPath: executablePath).deletingLastPathComponent()
         let contentsDir = helpersDir.deletingLastPathComponent()
         guard contentsDir.lastPathComponent == "Contents",
@@ -55,7 +61,7 @@ enum VoicelyCLIVersion {
                 as? [String: Any],
               let version = plist["CFBundleShortVersionString"] as? String,
               !version.isEmpty
-        else { return unbundledVersion }
+        else { return nil }
         return version
     }
 }
