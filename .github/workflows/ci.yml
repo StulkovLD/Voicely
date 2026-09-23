@@ -53,12 +53,15 @@ jobs:
           test "$("$RUNNER_TEMP/voicely" --version)" = "$VERSION"
           INIT='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"ci","version":"0"}}}'
           # Keep stdin open briefly: the server stops on EOF, before a pending reply.
+          # JSON key order varies between runs, so the reply is parsed, not grepped.
           { printf '%s\n' "$INIT"; sleep 3; } | "$APP/Contents/Helpers/voicely" mcp | head -n 1 \
-            | /usr/bin/grep -F "\"version\":\"$VERSION\"" >/dev/null
+            | /usr/bin/plutil -extract result.serverInfo.version raw -o - - >"$RUNNER_TEMP/mcp-version"
+          test "$(cat "$RUNNER_TEMP/mcp-version")" = "$VERSION"
           # Standalone, as in the MCPB bundle (server/voicely, no .app around it).
           mkdir -p "$RUNNER_TEMP/mcpb/server"
           cp "$BIN_PATH/VoicelyCLI" "$RUNNER_TEMP/mcpb/server/voicely"
           test "$("$RUNNER_TEMP/mcpb/server/voicely" --version)" = "$VERSION"
           { printf '%s\n' "$INIT"; sleep 3; } | "$RUNNER_TEMP/mcpb/server/voicely" mcp | head -n 1 \
-            | /usr/bin/grep -F "\"serverInfo\":{\"name\":\"voicely\",\"version\":\"$VERSION\"}" >/dev/null
+            | /usr/bin/plutil -extract result.serverInfo.version raw -o - - >"$RUNNER_TEMP/mcp-version"
+          test "$(cat "$RUNNER_TEMP/mcp-version")" = "$VERSION"
           "$BIN_PATH/VoicelyCLI" --help >/dev/null
