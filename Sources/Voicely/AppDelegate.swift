@@ -315,6 +315,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private let overlay = Overlay()
     private let hotkey = HotkeyManager()
     private let onboarding = Onboarding()
+    private lazy var permissionGate = PermissionGate(system: MacPermissionSystem())
 
     private var dictationSourceApp: String?
     private var dictationInjectionTarget: InjectionTargetToken?
@@ -652,10 +653,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         preloadTask = Task { [weak self] in
             guard let self else { return }
             defer { self.clearPreloadTask(completingOwner: initialPreloadOwner) }
-            let result = await onboarding.runIfNeeded()
+            // Voicely asks macOS itself and waits for the answers; the window
+            // closes on its own once both grants are on.
+            let access = await self.permissionGate.ensure()
 
             // Register hotkey only after accessibility is confirmed
-            if result.accessibilityGranted {
+            if access.accessibility {
                 let registered = hotkey.register { [weak self] in
                     self?.toggleDictation()
                 }
@@ -887,6 +890,22 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         )
     }
 
+    // MARK: - Permissions
+
+    /// Shows the permission window if anything is missing, waits for the
+    /// answers, then brings the hotkey up with the new trust.
+    @discardableResult
+    private func ensurePermissionsAndRearmHotkey() async -> PermissionStatus {
+        let access = await permissionGate.ensure()
+        if access.accessibility {
+            let active = hotkey.retryIfNeeded()
+            handleHotkeyRuntimeState(active ? .active : hotkey.runtimeState)
+        } else {
+            handleHotkeyRuntimeState(.permissionMissing)
+        }
+        return access
+    }
+
     // MARK: - Accessibility Poller
 
     private func handleHotkeyRuntimeState(_ newState: HotkeyRuntimeState) {
@@ -908,7 +927,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         case .permissionMissing:
             applyModelMenuBarTitle()
             if previous == .active {
-                overlay.showError("Accessibility permission lost")
+                // Lost while running: lead the person back instead of
+                // failing every insertion silently.
+                Task { await self.ensurePermissionsAndRearmHotkey() }
             }
             startAccessibilityPoller()
 
@@ -1007,11 +1028,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         case .idle:
             guard ensureCaptureConfiguration() else { return }
             AppDelegate.debugLog("toggleDictation: idle -> recording")
-            // Check mic permission before starting
-            let micStatus = recorder.prepare()
-            AppDelegate.debugLog("Mic status: \(micStatus.rawValue)")
-            guard micStatus == .authorized else {
-                overlay.showError("Mic not authorized")
+            // A dictation that cannot be heard or cannot reach the cursor
+            // does not start: the permission window leads to the fix instead.
+            guard PermissionPlan.canDictate(
+                status: permissionGate.currentStatus(),
+                destination: dictationDestination
+            ) else {
+                Task { await self.ensurePermissionsAndRearmHotkey() }
                 return
             }
 
@@ -2834,15 +2857,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
         Task {
-            let result = await onboarding.runIfNeeded()
-            if result.accessibilityGranted {
-                let active = hotkey.retryIfNeeded()
-                handleHotkeyRuntimeState(active ? .active : hotkey.runtimeState)
-            } else {
-                handleHotkeyRuntimeState(.permissionMissing)
-            }
+            let access = await ensurePermissionsAndRearmHotkey()
             // A check that ends in silence reads as a hang; say the good news.
-            if result.accessibilityGranted, modelState.isReady {
+            if access.isComplete, modelState.isReady {
                 overlay.showInfo("All permissions OK")
             }
             // Restart model preload if the app still has no ready model. The

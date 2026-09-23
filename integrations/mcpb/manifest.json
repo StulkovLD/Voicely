@@ -2,7 +2,7 @@
   "manifest_version": "0.2",
   "name": "voicely",
   "display_name": "Voicely",
-  "version": "1.4.2",
+  "version": "1.4.3",
   "description": "Offline transcription and speaker diarization on your Mac: transcribe audio/video files and read your Voicely dictations and call transcripts.",
   "long_description": "Voicely is free, open-source, offline dictation and transcription for macOS. This bundle runs the Voicely MCP server locally over stdio. It transcribes audio and video files with NVIDIA Parakeet V3 through CoreML (25 languages, optional speaker diarization) and reads the transcripts the Voicely app saves under ~/Documents/Voicely. Nothing leaves the machine. The speech model (~470 MB) downloads once on the first transcription. For live dictation and call recording, install the app: curl -fsSL https://voicely.art/install.sh | sh. Requires macOS 14+ on Apple Silicon.",
   "author": {

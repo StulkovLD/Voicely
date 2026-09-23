@@ -54,15 +54,6 @@ final class Recorder: @unchecked Sendable {
     /// Whether silence callback has already fired for this recording. Protected by bufferLock.
     private var silenceFired: Bool = false
 
-    // MARK: - Permission check
-
-    /// Check microphone permission without requesting it.
-    /// Returns the current authorization status.
-    /// Does NOT trigger a permission prompt — that's Onboarding's job.
-    func prepare() -> AVAuthorizationStatus {
-        return AVCaptureDevice.authorizationStatus(for: .audio)
-    }
-
     // MARK: - Chunk Extraction
 
     /// Extract up to `sampleCount` samples from the front of the buffer without stopping recording.

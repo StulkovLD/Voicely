@@ -37,16 +37,16 @@ One command. There is no DMG to download and nothing to drag into Applications:
 curl -fsSL https://voicely.art/install.sh | sh
 ```
 
-Or through the Homebrew tap: `brew install --cask stulkovld/voicely/voicely` (after `brew upgrade`, run `tccutil reset All art.voicely.app` so macOS asks for permissions again cleanly).
+Or through the Homebrew tap: `brew install --cask stulkovld/voicely/voicely`.
 
-The script downloads the current build, verifies its SHA-256 and code integrity in a private staging directory, installs it transactionally — the previous version stays as a backup until the new one passes every gate, and any failure rolls back cleanly — then launches the app. Re-running it updates in place and keeps your transcripts, model and settings.
+The script downloads the current build, verifies its SHA-256 and its signing certificate in a private staging directory, installs it transactionally — the previous version stays as a backup until the new one passes every gate, and any failure rolls back cleanly — then launches the app. Re-running it updates in place and keeps your transcripts, model and settings.
 
-The public build is ad-hoc signed and not notarized by Apple. Because the code identity changes between releases, the installer resets Voicely's own permission grants, so macOS asks for Microphone and Accessibility again after an update.
+The public build is signed with Voicely's own certificate rather than an Apple Developer ID, and it is not notarized by Apple. The certificate is the same for every release, so macOS keeps your Microphone and Accessibility permissions when you update. If an older copy left permission entries behind, the installer clears them and Voicely asks again by itself.
 
 **First launch**
 
 1. Find the Voicely icon in the menu bar.
-2. Approve **Microphone** and **Accessibility** when macOS asks.
+2. Allow **Microphone**, then switch Voicely on in the **Accessibility** list that opens. Voicely waits for both and continues by itself.
 3. Confirm the speech model download (Parakeet V3, about 470 MB). The first prepare step takes about a minute; later launches are fast.
 4. **Screen Recording** is requested only when you first use **Record Call**.
 
