@@ -1,8 +1,6 @@
 # Voicely
 
-**Your AI, in the loop.**
-
-Voicely turns your voice, calls and files into text — ready for Claude Code, Codex, Cursor or any AI agent on your Mac. Everything runs on-device: no account, no cloud, nothing leaves your machine. Free, forever. Open source.
+**Free, open-source, offline dictation and transcription for macOS — with a local MCP server that gives Claude Code, Codex and Cursor ears.**
 
 <p align="center">
   <a href="https://github.com/StulkovLD/Voicely/actions/workflows/ci.yml"><img src="https://github.com/StulkovLD/Voicely/actions/workflows/ci.yml/badge.svg" /></a>
@@ -11,6 +9,21 @@ Voicely turns your voice, calls and files into text — ready for Claude Code, C
   <img src="https://img.shields.io/badge/license-MIT-green" />
   <img src="https://img.shields.io/badge/engine-Parakeet%20V3%20%2B%20FluidAudio-blue" />
 </p>
+
+<p align="center"><img src=".github/assets/voicely-card.png" alt="Voicely — Speak. It types. Open source, offline, free." width="600" /></p>
+
+- **Dictate anywhere.** Press `Option+Space`, speak, press it again — the text lands wherever your cursor is, terminals and VS Code included.
+- **Calls and files.** Record a call (system audio + mic, no virtual audio device) and get a speaker-separated transcript; turn any audio or video file into text.
+- **Agent-native.** `voicely connect` registers a local MCP server, so your agent can transcribe files and read your calls and dictations.
+- **On-device only.** NVIDIA Parakeet V3 through CoreML, 25 languages. No account, no cloud, no subscription. MIT.
+
+```bash
+curl -fsSL https://voicely.art/install.sh | sh
+# or
+brew install --cask stulkovld/voicely/voicely
+```
+
+macOS 14+ on Apple Silicon. Like Superwhisper, MacWhisper or Wispr Flow — but free and MIT-licensed, 100% on-device, and built to hand text to your AI agent.
 
 ## Free, forever
 
@@ -23,6 +36,8 @@ One command. There is no DMG to download and nothing to drag into Applications:
 ```bash
 curl -fsSL https://voicely.art/install.sh | sh
 ```
+
+Or through the Homebrew tap: `brew install --cask stulkovld/voicely/voicely` (after `brew upgrade`, run `tccutil reset All art.voicely.app` so macOS asks for permissions again cleanly).
 
 The script downloads the current build, verifies its SHA-256 and code integrity in a private staging directory, installs it transactionally — the previous version stays as a backup until the new one passes every gate, and any failure rolls back cleanly — then launches the app. Re-running it updates in place and keeps your transcripts, model and settings.
 
